@@ -39,22 +39,33 @@ Then open:
 - http://localhost:5000/setup
 - then log in at http://localhost:5000/login
 
-## Portainer / Unraid deployment
+## Native Unraid deployment
 
-### 1) Build image locally or in your registry
+This repo includes a native Unraid Docker template at `unraid/templates/ironwail-addons.xml`.
 
-Example local build:
+The current image is published automatically to GitHub Container Registry:
 
-```bash
-docker build -t ironwail-addons:local .
+```text
+ghcr.io/kdmn2/quake-mods-server:latest
 ```
 
-To deploy via Portainer, push the image to a registry the Portainer node can reach, for example:
+### 1) What the template deploys
 
-```bash
-docker tag ironwail-addons:local your-registry.example.com/ironwail-addons:latest
-docker push your-registry.example.com/ironwail-addons:latest
-```
+The app container uses:
+
+- image: `ghcr.io/kdmn2/quake-mods-server:latest`
+- HTTP port: `5000` inside the container
+- host Web UI port: configurable in the template (default `8080`)
+- persistent data:
+  - `/data` for SQLite and metadata
+  - `/public` for generated catalog and downloads
+  - `/uploads` for uploads and staging
+- required env vars:
+  - `APP_SECRET_KEY`
+  - `PUBLIC_BASE_URL`
+  - `PERSIST_ROOT=/data`
+  - `PUBLIC_ROOT=/public`
+  - `UPLOAD_FOLDER=/uploads`
 
 ### 2) Create the persistent data root on Unraid
 
@@ -64,7 +75,7 @@ Example host path:
 /mnt/user/appdata/ironwail-addons
 ```
 
-Create subdirectories:
+Create the subdirectories:
 
 ```bash
 mkdir -p /mnt/user/appdata/ironwail-addons/data
@@ -72,66 +83,65 @@ mkdir -p /mnt/user/appdata/ironwail-addons/public
 mkdir -p /mnt/user/appdata/ironwail-addons/uploads
 ```
 
-Set ownership and permissions appropriate for the container user. The image runs as non-root `appuser`, so it needs write access to the mounted directories. If you run a Docker host without UID/GID mapping, the simplest approach is to set the host directories to a UID/GID that matches the container user, or make them writable to a matching group.
+The image runs as non-root `appuser`, so the host bind paths must be writable by the container user. On Unraid, the simplest safe setup is to make those directories writable for the correct UID/GID, or use a mapping that matches the container runtime user.
 
-Example shell commands on Unraid:
+### 3) Unraid template import
 
-```bash
-chown -R 1000:1000 /mnt/user/appdata/ironwail-addons
-chmod -R 755 /mnt/user/appdata/ironwail-addons
+Use the included native template as a custom template in Unraid:
+
+1. Open Unraid Docker GUI.
+2. Import the XML file from `unraid/templates/ironwail-addons.xml`.
+3. Select the app in the template UI.
+4. Set:
+   - App port (default `8080`)
+   - AppData path
+   - Public catalog path
+   - Upload path
+   - `APP_SECRET_KEY`
+   - `PUBLIC_BASE_URL`
+5. Click Apply.
+
+### 4) First-run setup
+
+After the container starts:
+
+- open the WebUI at `http://<unraid-host>:<port>/login`
+- if no admin exists yet, visit `http://<unraid-host>:<port>/setup`
+- create the initial admin account
+- sign in and manage add-ons
+
+The app does not expose a public signup flow.
+
+### 5) Reverse proxy and HTTPS
+
+If you front the container with a reverse proxy, set `PUBLIC_BASE_URL` to the external HTTPS URL, for example:
+
+```text
+https://addons.example.com
 ```
 
-If your Unraid setup supports custom `user:group` mapping, align those values to the container user. The image does not claim PUID/PGID support, so do not assume automatic user remapping.
+The app itself does not terminate TLS; it expects your reverse proxy to handle it.
 
-### 3) Portainer stack
+### 6) Portainer / Docker Compose compatibility
 
-Use the included `docker-compose.portainer.yml` as a base. Update the image name and public URL, then deploy as a Portainer stack.
+The repo also contains a Portainer-friendly Compose file at `docker-compose.portainer.yml` for manual deployments. It uses the same env vars and bind mounts as the Unraid template.
+
+Example env values:
 
 ```yaml
-version: '3.9'
-services:
-  ironwail-addons:
-    image: your-registry.example.com/ironwail-addons:latest
-    restart: unless-stopped
-    ports:
-      - "8080:5000"
-    environment:
-      APP_SECRET_KEY: "replace-with-long-random-secret"
-      PUBLIC_BASE_URL: "http://your-unraid-host:8080"
-      PERSIST_ROOT: "/data"
-      PUBLIC_ROOT: "/public"
-      UPLOAD_FOLDER: "/uploads"
-      PORT: "5000"
-    volumes:
-      - /mnt/user/appdata/ironwail-addons/data:/data
-      - /mnt/user/appdata/ironwail-addons/public:/public
-      - /mnt/user/appdata/ironwail-addons/uploads:/uploads
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health').read()"]
-      interval: 20s
-      timeout: 5s
-      retries: 5
-      start_period: 15s
+APP_SECRET_KEY: "replace-with-long-random-secret"
+PUBLIC_BASE_URL: "http://your-unraid-host:8080"
+PERSIST_ROOT: "/data"
+PUBLIC_ROOT: "/public"
+UPLOAD_FOLDER: "/uploads"
+PORT: "5000"
 ```
 
-### 4) Reverse proxy and HTTPS
+### 7) Update and rollback
 
-If you already have a reverse proxy in front of Unraid, do the following:
-
-- proxy `https://addons.example.com` to the app port (for example `http://your-unraid-host:8080`)
-- set `PUBLIC_BASE_URL` to the externally reachable https URL, e.g. `https://addons.example.com`
-- the app should be configured behind a trusted proxy if your reverse proxy terminates TLS
-- no TLS certificates are managed by this app
-
-### 5) First-run admin setup
-
-Open the app in a browser.
-
-- first visit: `http://<host>:8080/setup`
-- create the administrator account
-- then sign in at `http://<host>:8080/login`
-
-The application does not expose a public signup flow.
+- Keep the persistent directories unchanged across upgrades.
+- Recreate the container with the newer image while keeping the same bind mounts.
+- For rollback, redeploy the previous image and restore the same data directories.
 
 ## Upload, metadata, and publish workflow
 

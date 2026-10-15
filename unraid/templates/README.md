@@ -7,13 +7,16 @@ Files:
 
 ## Template status
 
-The template is based on the current repository's Dockerfile and app configuration. It is ready for deployment as a custom template, but it assumes you have already built and published the image, or you are installing from a registry that is reachable by the Unraid host.
+The template is based on the current repository's Dockerfile and app configuration. It is ready for deployment as a native Unraid custom template and it uses the GitHub Actions-published image from GHCR:
 
-This repository does not currently include a published Docker Hub or GHCR image; the `Repository` field in the template must be replaced with the actual published registry path before use if the default value is not yet available.
+```text
+ghcr.io/kdmn2/quake-mods-server:latest
+```
+
+This means the image is rebuilt and pushed automatically when the repository changes, rather than requiring a manual local image build before deployment.
 
 ## Required user changes before Apply
 
-- Replace the image repository if it is not published yet.
 - Change `APP_SECRET_KEY` from the placeholder value.
 - Set `PUBLIC_BASE_URL` to the externally reachable URL behind your reverse proxy or direct host access.
 - Confirm the host AppData paths match your actual Unraid `appdata` location.
@@ -21,20 +24,19 @@ This repository does not currently include a published Docker Hub or GHCR image;
 
 ## Installing as a custom template
 
-1. In Unraid, go to Docker > Add Container > Template > Manage Templates.
-2. Choose the local XML or add the repository containing the template.
-3. Import `ironwail-addons.xml`.
-4. Set the image repository and image tag.
-5. Set port mapping and data paths.
-6. Save and apply.
+1. In Unraid, open Docker > Add Container.
+2. Import `unraid/templates/ironwail-addons.xml` as a custom template.
+3. Review the default host port and data paths.
+4. Set the app secret and public base URL.
+5. Click Apply.
 
 ## First-run setup
 
 1. Open the app in the browser via the WebUI URL.
-2. Visit `/setup` if no user exists yet.
+2. Visit `/setup` if no admin account exists yet.
 3. Create the first administrator account.
 4. Sign in and upload mods.
-5. Publish the add-on to generate the public catalog.
+5. Publish a mod to generate the public catalog.
 
 ## Data locations
 
@@ -49,7 +51,7 @@ Persistent data is expected under the host appdata root, for example:
 
 The application binds to:
 - `/data` for the SQLite database and metadata
-- `/public` for generated catalog and package downloads
+- `/public` for the generated catalog and package download folder
 - `/uploads` for staged uploads
 
 ## Notes
@@ -57,3 +59,4 @@ The application binds to:
 - This project does not implement PUID/PGID automatically; the container image runs as non-root `appuser`.
 - Make sure the host directories are writable by the container user.
 - The application does not manage TLS; use an existing reverse proxy if you want HTTPS.
+- The template is for native Unraid deployment; it is not the same as a Community Applications listing.
