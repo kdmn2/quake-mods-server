@@ -152,6 +152,14 @@ class AdminWorkflowTests(unittest.TestCase):
         repack_zip_to_pak(zip_path, pak_path)
         self.assertEqual(pak_path.read_bytes()[:4], b"PACK")
 
+    def test_zip_with_entry_paths_is_preserved(self):
+        from tools.catalog import repack_zip_to_pak
+        zip_path = self.tmp / "paths.zip"
+        pak_path = self.tmp / "paths.pak"
+        self._make_zip(zip_path, {"qbj/copper.def": b"abc"})
+        repack_zip_to_pak(zip_path, pak_path)
+        self.assertEqual(pak_path.read_bytes()[:4], b"PACK")
+
     def test_content_based_detection_not_extension_based(self):
         self._login()
         masquerade = self.tmp / "fake.pak"

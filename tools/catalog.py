@@ -161,10 +161,13 @@ def repack_zip_to_pak(source: Path, target: Path, max_files: int = 5000, max_unc
         for info in infos:
             if info.flag_bits & 0x1:
                 raise ValueError(f"Encrypted ZIP entries are not supported: {info.filename!r}")
-            if info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
-                raise ValueError(f"Unsupported ZIP compression method for {info.filename!r}")
             name = _validate_zip_member_name(info.filename)
-            data = zf.read(info)
+            try:
+                data = zf.read(info)
+            except NotImplementedError as exc:
+                raise ValueError(f"Unsupported ZIP compression method for {info.filename!r}: {exc}") from exc
+            except RuntimeError as exc:
+                raise ValueError(f"Unable to read ZIP entry {info.filename!r}: {exc}") from exc
             total_uncompressed += len(data)
             if total_uncompressed > max_uncompressed_size:
                 raise ValueError(f"ZIP uncompressed data exceeds limit ({total_uncompressed} > {max_uncompressed_size})")

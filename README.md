@@ -299,6 +299,7 @@ pytest -q
 - The client itself does not support automatic update detection beyond what is implemented in its static list.
 - The application does not bundle or redistribute Quake base-game content.
 - Archive compatibility depends on the actual Quake package layout; the app validates the archive but does not silently repack unsupported formats.
+- ZIP uploads are repacked by reading each entry through Python’s ZIP reader; if Python cannot decode a ZIP compression method, the upload is rejected with a clear error.
 - The app’s public side is intentionally static; no database or API is exposed to the public.
 
 ## File ownership and permissions
