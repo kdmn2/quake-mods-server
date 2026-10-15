@@ -1,0 +1,32 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="card">
+  <h2>{{ addon.title }}</h2>
+  <p><strong>ID:</strong> {{ addon.addon_id }}</p>
+  <p><strong>Installation directory:</strong> {{ addon.gamedir }}</p>
+  <p><strong>Author:</strong> {{ addon.author }}</p>
+  <p><strong>Date:</strong> {{ addon.date or 'n/a' }}</p>
+  <p><strong>Status:</strong> {% if addon.published %}Published{% else %}Draft{% endif %}</p>
+  <p><strong>Package:</strong> {{ addon.package_name }} ({{ addon.package_size }} bytes)</p>
+  <p><strong>Catalog URL:</strong> {{ public_base_url }}/content.json</p>
+  <p><strong>Package URL:</strong> {{ public_base_url }}/public/addons/{{ addon.addon_id }}.pak</p>
+  <div class="inline">
+    <a href="{{ url_for('edit_addon', addon_id=addon.id) }}"><button>Edit</button></a>
+    {% if addon.published %}
+    <form method="post" action="{{ url_for('unpublish_addon', addon_id=addon.id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit">Unpublish</button>
+    </form>
+    {% else %}
+    <form method="post" action="{{ url_for('publish_addon', addon_id=addon.id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit">Publish</button>
+    </form>
+    {% endif %}
+    <form method="post" action="{{ url_for('delete_addon', addon_id=addon.id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="danger" type="submit">Delete</button>
+    </form>
+  </div>
+</div>
+{% endblock %}

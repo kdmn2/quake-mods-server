@@ -1,0 +1,26 @@
+version: '3.9'
+
+services:
+  ironwail-addons:
+    image: your-registry.example.com/ironwail-addons:latest
+    container_name: ironwail-addons
+    restart: unless-stopped
+    ports:
+      - "8080:5000"
+    environment:
+      APP_SECRET_KEY: "replace-with-long-random-secret"
+      PUBLIC_BASE_URL: "http://your-unraid-host:8080"
+      PERSIST_ROOT: "/data"
+      PUBLIC_ROOT: "/public"
+      UPLOAD_FOLDER: "/uploads"
+      PORT: "5000"
+    volumes:
+      - /mnt/user/appdata/ironwail-addons/data:/data
+      - /mnt/user/appdata/ironwail-addons/public:/public
+      - /mnt/user/appdata/ironwail-addons/uploads:/uploads
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health').read()"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 15s

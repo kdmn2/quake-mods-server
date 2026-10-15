@@ -1,0 +1,52 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="card">
+  <h2>Published add-ons</h2>
+  <p class="muted">Public add-on URL: <strong>{{ public_base_url }}</strong></p>
+  <p class="muted">Example Ironwail launch command:</p>
+  <pre>ironwail -addons {{ public_base_url }}</pre>
+</div>
+
+<div class="card">
+  <h2>Collection</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Title</th>
+        <th>ID</th>
+        <th>Dir</th>
+        <th>Status</th>
+        <th>Size</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for addon in addons %}
+      <tr>
+        <td>{{ addon.title }}</td>
+        <td>{{ addon.addon_id }}</td>
+        <td>{{ addon.gamedir }}</td>
+        <td>{% if addon.published %}Published{% else %}Draft{% endif %}</td>
+        <td>{% if addon.package_size %}{{ addon.package_size }} bytes{% endif %}</td>
+        <td>
+          <a href="{{ url_for('addon_detail', addon_id=addon.id) }}">View</a>
+          {% if addon.published %}
+          <form style="display:inline" method="post" action="{{ url_for('unpublish_addon', addon_id=addon.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit">Unpublish</button>
+          </form>
+          {% else %}
+          <form style="display:inline" method="post" action="{{ url_for('publish_addon', addon_id=addon.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit">Publish</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6">No add-ons yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

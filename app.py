@@ -1,0 +1,435 @@
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import tempfile
+import uuid
+from pathlib import Path
+from typing import Any, Dict
+
+from flask import Flask, flash, jsonify, redirect, render_template, request, send_from_directory, session, url_for
+from werkzeug.exceptions import Forbidden, NotFound
+from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.utils import secure_filename
+
+from tools.catalog import validate_pak_paths
+
+app = Flask(__name__)
+app.config.update(
+    SECRET_KEY=os.environ.get("APP_SECRET_KEY", "dev-secret-change-me"),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    MAX_CONTENT_LENGTH=128 * 1024 * 1024,
+    UPLOAD_FOLDER=os.environ.get("UPLOAD_FOLDER", "/tmp/quake-addons-upload"),
+    PERSIST_ROOT=os.environ.get("PERSIST_ROOT", "/tmp/quake-addons-data"),
+    PUBLIC_ROOT=os.environ.get("PUBLIC_ROOT", "/tmp/quake-addons-public"),
+    BASE_URL=os.environ.get("PUBLIC_BASE_URL", "http://localhost:8080"),
+)
+
+
+def ensure_dirs() -> None:
+    for p in [
+        app.config["UPLOAD_FOLDER"],
+        app.config["PERSIST_ROOT"],
+        app.config["PUBLIC_ROOT"],
+        Path(app.config["PERSIST_ROOT"]) / "db",
+        Path(app.config["PERSIST_ROOT"]) / "packages",
+        Path(app.config["PERSIST_ROOT"]) / "metadata",
+        Path(app.config["PERSIST_ROOT"]) / "staging",
+        Path(app.config["PUBLIC_ROOT"]) / "addons",
+    ]:
+        Path(p).mkdir(parents=True, exist_ok=True)
+
+
+ensure_dirs()
+
+
+def get_db() -> sqlite3.Connection:
+    ensure_dirs()
+    db_path = Path(app.config["PERSIST_ROOT"]) / "db" / "addons.sqlite3"
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    conn = get_db()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS addons (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            addon_id TEXT UNIQUE NOT NULL,
+            title TEXT NOT NULL,
+            gamedir TEXT NOT NULL,
+            author TEXT NOT NULL DEFAULT 'Unknown',
+            date TEXT,
+            description TEXT,
+            package_name TEXT NOT NULL,
+            package_path TEXT NOT NULL,
+            package_size INTEGER NOT NULL,
+            manifest_path TEXT,
+            sha256 TEXT,
+            published INTEGER NOT NULL DEFAULT 0,
+            draft INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            view_count INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+
+def make_csrf_token() -> str:
+    token = session.get("csrf_token")
+    if not token:
+        token = uuid.uuid4().hex
+        session["csrf_token"] = token
+    return token
+
+
+def check_csrf() -> None:
+    if app.config.get("TESTING"):
+        return
+    if request.method == "POST":
+        form_token = request.form.get("csrf_token")
+        session_token = session.get("csrf_token")
+        if not session_token or not form_token or form_token != session_token:
+            raise Forbidden("Invalid CSRF token")
+
+
+@app.before_request
+def ensure_csrf() -> None:
+    if request.path.startswith("/admin") or request.path.startswith("/dashboard") or request.path.startswith("/addons/"):
+        if request.method == "POST":
+            check_csrf()
+    if request.path.startswith("/admin") or request.path.startswith("/dashboard") or request.path.startswith("/addons/"):
+        make_csrf_token()
+
+
+@app.context_processor
+def inject_globals() -> Dict[str, Any]:
+    return {
+        "public_base_url": app.config["BASE_URL"],
+        "current_user": session.get("username"),
+        "csrf_token": make_csrf_token(),
+    }
+
+
+@app.route("/health")
+def health() -> Any:
+    return jsonify({"ok": True, "status": "healthy"}), 200
+
+
+@app.route("/")
+def index() -> Any:
+    if not session.get("username"):
+        return redirect(url_for("login"))
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login() -> Any:
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        conn = get_db()
+        row = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+        if row and check_password_hash(row["password_hash"], password):
+            session["username"] = username
+            flash("Logged in.", "success")
+            return redirect(url_for("dashboard"))
+        flash("Invalid username or password.", "error")
+    return render_template("login.html")
+
+
+@app.route("/logout")
+def logout() -> Any:
+    session.pop("username", None)
+    flash("Logged out.", "success")
+    return redirect(url_for("login"))
+
+
+@app.route("/setup", methods=["GET", "POST"])
+def setup() -> Any:
+    conn = get_db()
+    row = conn.execute("SELECT COUNT(*) AS count FROM users").fetchone()
+    if row["count"] > 0:
+        return redirect(url_for("login"))
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        if not username or not password:
+            flash("Username and password are required.", "error")
+            return render_template("setup.html")
+        conn.execute(
+            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+            (username, generate_password_hash(password)),
+        )
+        conn.commit()
+        conn.close()
+        flash("Administrator account created.", "success")
+        return redirect(url_for("login"))
+    return render_template("setup.html")
+
+
+def require_auth() -> None:
+    if not session.get("username"):
+        raise Forbidden()
+
+
+@app.route("/dashboard")
+def dashboard() -> Any:
+    require_auth()
+    conn = get_db()
+    addons = conn.execute("SELECT * FROM addons ORDER BY created_at DESC").fetchall()
+    conn.close()
+    return render_template("dashboard.html", addons=addons)
+
+
+@app.route("/addons/new", methods=["GET", "POST"])
+def add_addon() -> Any:
+    require_auth()
+    if request.method == "POST":
+        title = request.form.get("title", "").strip()
+        addon_id = request.form.get("addon_id", "").strip()
+        gamedir = request.form.get("gamedir", "").strip()
+        author = request.form.get("author", "Unknown").strip()
+        date = request.form.get("date", "").strip()
+        description = request.form.get("description", "").strip()
+        package_file = request.files.get("package")
+        if not title or not addon_id or not gamedir or not package_file or not package_file.filename:
+            flash("Title, ID, game dir, and a package upload are required.", "error")
+            return render_template("addon_form.html", mode="new")
+
+        safe_name = secure_filename(package_file.filename)
+        if not safe_name:
+            flash("Invalid package filename.", "error")
+            return render_template("addon_form.html", mode="new")
+
+        storage_dir = Path(app.config["PERSIST_ROOT"]) / "packages"
+        storage_dir.mkdir(parents=True, exist_ok=True)
+        target = storage_dir / f"{addon_id}.pak"
+
+        package_file.save(target)
+        try:
+            validate_pak_paths(target)
+        except Exception as exc:  # noqa: BLE001
+            target.unlink(missing_ok=True)
+            flash(f"Package rejected: {exc}", "error")
+            return render_template("addon_form.html", mode="new")
+
+        conn = get_db()
+        try:
+            conn.execute(
+                """
+                INSERT INTO addons (
+                    addon_id, title, gamedir, author, date, description,
+                    package_name, package_path, package_size, published, draft,
+                    manifest_path, sha256
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, NULL, NULL)
+                """,
+                (addon_id, title, gamedir, author, date, description, safe_name, str(target), target.stat().st_size),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            target.unlink(missing_ok=True)
+            flash("That add-on ID already exists. Choose a unique one.", "error")
+            return render_template("addon_form.html", mode="new")
+        finally:
+            conn.close()
+
+        flash("Add-on saved as a draft. Review and publish when ready.", "success")
+        return redirect(url_for("dashboard"))
+    return render_template("addon_form.html", mode="new")
+
+
+@app.route("/addons/<int:addon_id>")
+def addon_detail(addon_id: int) -> Any:
+    require_auth()
+    conn = get_db()
+    addon = conn.execute("SELECT * FROM addons WHERE id = ?", (addon_id,)).fetchone()
+    conn.close()
+    if not addon:
+        raise NotFound()
+    return render_template("addon_detail.html", addon=addon)
+
+
+@app.route("/addons/<int:addon_id>/edit", methods=["GET", "POST"])
+def edit_addon(addon_id: int) -> Any:
+    require_auth()
+    conn = get_db()
+    addon = conn.execute("SELECT * FROM addons WHERE id = ?", (addon_id,)).fetchone()
+    if not addon:
+        conn.close()
+        raise NotFound()
+    if request.method == "POST":
+        title = request.form.get("title", "").strip()
+        addon_id_value = request.form.get("addon_id", "").strip()
+        gamedir = request.form.get("gamedir", "").strip()
+        author = request.form.get("author", "Unknown").strip()
+        date = request.form.get("date", "").strip()
+        description = request.form.get("description", "").strip()
+        package_file = request.files.get("package")
+        if not title or not addon_id_value or not gamedir:
+            flash("Title, ID, and game dir are required.", "error")
+            return render_template("addon_form.html", mode="edit", addon=dict(addon))
+
+        if package_file and package_file.filename:
+            safe_name = secure_filename(package_file.filename)
+            target = Path(app.config["PERSIST_ROOT"]) / "packages" / f"{addon_id_value}.pak"
+            package_file.save(target)
+            try:
+                validate_pak_paths(target)
+            except Exception as exc:  # noqa: BLE001
+                target.unlink(missing_ok=True)
+                flash(f"Package rejected: {exc}", "error")
+                return render_template("addon_form.html", mode="edit", addon=dict(addon))
+            conn.execute(
+                "UPDATE addons SET package_name = ?, package_path = ?, package_size = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (safe_name, str(target), target.stat().st_size, addon_id),
+            )
+
+        conn.execute(
+            "UPDATE addons SET title = ?, addon_id = ?, gamedir = ?, author = ?, date = ?, description = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (title, addon_id_value, gamedir, author, date, description, addon_id),
+        )
+        conn.commit()
+        conn.close()
+        flash("Add-on updated.", "success")
+        return redirect(url_for("addon_detail", addon_id=addon_id))
+    conn.close()
+    return render_template("addon_form.html", mode="edit", addon=dict(addon))
+
+
+@app.route("/addons/<int:addon_id>/publish", methods=["POST"])
+def publish_addon(addon_id: int) -> Any:
+    require_auth()
+    conn = get_db()
+    addon = conn.execute("SELECT * FROM addons WHERE id = ?", (addon_id,)).fetchone()
+    if not addon:
+        conn.close()
+        raise NotFound()
+    package_path = Path(addon["package_path"])
+    if not package_path.exists():
+        conn.close()
+        flash("Package file is missing; re-upload or re-save the package before publishing.", "error")
+        return redirect(url_for("addon_detail", addon_id=addon_id))
+
+    public_dir = Path(app.config["PUBLIC_ROOT"]) / "addons"
+    public_dir.mkdir(parents=True, exist_ok=True)
+    public_file = public_dir / f"{addon['addon_id']}.pak"
+    with tempfile.NamedTemporaryFile(dir=str(public_dir), delete=False) as tmp:
+        tmp.write(package_path.read_bytes())
+        tmp_path = tmp.name
+    os.replace(tmp_path, public_file)
+
+    conn.execute(
+        "UPDATE addons SET published = 1, draft = 0, manifest_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (str(public_file), addon_id),
+    )
+    conn.commit()
+    conn.close()
+    generate_catalog()
+    flash("Add-on published and catalog regenerated.", "success")
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/addons/<int:addon_id>/unpublish", methods=["POST"])
+def unpublish_addon(addon_id: int) -> Any:
+    require_auth()
+    conn = get_db()
+    conn.execute("UPDATE addons SET published = 0, draft = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (addon_id,))
+    conn.commit()
+    conn.close()
+    generate_catalog()
+    flash("Add-on unpublished; it is no longer in the public catalog.", "success")
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/addons/<int:addon_id>/delete", methods=["POST"])
+def delete_addon(addon_id: int) -> Any:
+    require_auth()
+    conn = get_db()
+    addon = conn.execute("SELECT * FROM addons WHERE id = ?", (addon_id,)).fetchone()
+    if addon:
+        public_file = Path(app.config["PUBLIC_ROOT"]) / "addons" / f"{addon['addon_id']}.pak"
+        if public_file.exists():
+            public_file.unlink(missing_ok=True)
+        package_file = Path(addon["package_path"])
+        if package_file.exists():
+            package_file.unlink(missing_ok=True)
+        conn.execute("DELETE FROM addons WHERE id = ?", (addon_id,))
+        conn.commit()
+    conn.close()
+    generate_catalog()
+    flash("Add-on deleted.", "success")
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/content.json")
+def public_catalog() -> Any:
+    root = Path(app.config["PUBLIC_ROOT"])
+    if not (root / "content.json").exists():
+        generate_catalog()
+    return send_from_directory(str(root), "content.json", mimetype="application/json")
+
+
+@app.route("/addons/<path:filename>")
+def public_addon(filename: str) -> Any:
+    safe_root = Path(app.config["PUBLIC_ROOT"]) / "addons"
+    return send_from_directory(str(safe_root), filename)
+
+
+def generate_catalog() -> None:
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM addons WHERE published = 1 ORDER BY title ASC").fetchall()
+    conn.close()
+    catalog = {"addons": []}
+    for row in rows:
+        entry = {
+            "download": f"addons/{row['addon_id']}.pak",
+            "gamedir": row["gamedir"],
+            "name": row["title"],
+            "author": row["author"],
+            "date": row["date"],
+            "size": row["package_size"],
+        }
+        if row["description"]:
+            entry["description"] = {"en": row["description"]}
+        catalog["addons"].append(entry)
+
+    public_root = Path(app.config["PUBLIC_ROOT"])
+    public_root.mkdir(parents=True, exist_ok=True)
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile("w", dir=str(public_root), delete=False, encoding="utf-8") as fh:
+            tmp = fh.name
+            fh.write(json.dumps(catalog, indent=2, ensure_ascii=False) + "\n")
+        os.replace(tmp, public_root / "content.json")
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+if __name__ == "__main__":
+    os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
+    os.makedirs(app.config["PERSIST_ROOT"], exist_ok=True)
+    os.makedirs(app.config["PUBLIC_ROOT"], exist_ok=True)
+    generate_catalog()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))

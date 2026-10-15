@@ -1,0 +1,38 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="card">
+  <h2>{% if mode == 'edit' %}Edit add-on{% else %}Add a new add-on{% endif %}</h2>
+  <form method="post" enctype="multipart/form-data">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <p>
+      <label>Title</label><br>
+      <input name="title" value="{{ addon.title if addon else '' }}" required>
+    </p>
+    <p>
+      <label>Add-on ID</label><br>
+      <input name="addon_id" value="{{ addon.addon_id if addon else '' }}" required>
+    </p>
+    <p>
+      <label>Installation directory</label><br>
+      <input name="gamedir" value="{{ addon.gamedir if addon else '' }}" required>
+    </p>
+    <p>
+      <label>Author</label><br>
+      <input name="author" value="{{ addon.author if addon else 'Unknown' }}">
+    </p>
+    <p>
+      <label>Date (YYYY/MM/DD)</label><br>
+      <input name="date" value="{{ addon.date if addon else '' }}">
+    </p>
+    <p>
+      <label>Description</label><br>
+      <textarea name="description" rows="5">{{ addon.description if addon else '' }}</textarea>
+    </p>
+    <p>
+      <label>Package file</label><br>
+      <input type="file" name="package">
+    </p>
+    <button type="submit">Save</button>
+  </form>
+</div>
+{% endblock %}
