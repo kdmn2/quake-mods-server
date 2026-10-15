@@ -67,7 +67,7 @@ If GHCR still returns `unauthorized`, the package visibility may still need to b
    - `/mnt/user/appdata/ironwail-addons/uploads`
 5. Set a strong `APP_SECRET_KEY`.
 6. Set `PUBLIC_BASE_URL` to the externally reachable URL for your server, for example `https://addons.example.com`.
-7. Set `DB_PATH` to a writable path inside the mounted persistent volume if possible; the app will fall back to the uploads area when the configured DB path is not writable.
+7. Keep the appdata mount writable by the container user. The database lives under that mount and startup will fail fast with a permissions diagnostic if it is not writable.
 8. Click Apply.
 
 ### Pin a specific release tag
@@ -88,16 +88,16 @@ The app container uses:
 - HTTP port: `5000` inside the container
 - host Web UI port: configurable in the template (default `8080`)
 - persistent data:
-  - `/data` for SQLite and metadata
+  - `/appdata` for SQLite and metadata
   - `/public` for generated catalog and downloads
   - `/uploads` for uploads and staging
 - required env vars:
   - `APP_SECRET_KEY`
   - `PUBLIC_BASE_URL`
-  - `PERSIST_ROOT=/data`
+  - `PERSIST_ROOT=/appdata`
   - `PUBLIC_ROOT=/public`
   - `UPLOAD_FOLDER=/uploads`
-  - `DB_PATH=/data/addons.sqlite3` (recommended for clean first boot)
+  - `DB_PATH=/appdata/addons.sqlite3`
 
 ### 2) Create the persistent data root on Unraid
 
@@ -116,6 +116,8 @@ mkdir -p /mnt/user/appdata/ironwail-addons/uploads
 ```
 
 The image runs as non-root `appuser`, so the host bind paths must be writable by the container user. On Unraid, the simplest safe setup is to make those directories writable for the correct UID/GID, or use a mapping that matches the container runtime user. If first boot still fails because the mounted path is owned by root, fix the host permissions or pre-create the bind-mount directories with writable ownership before starting the container.
+
+If you are using the native template, the appdata mount is exposed in the container as `/appdata`, not `/data`.
 
 ### 3) Unraid template import
 
@@ -154,6 +156,16 @@ python app.py doctor
 
 It reports the resolved database path, runtime UID/GID, and basic read/write readiness checks without modifying data.
 
+### Unraid troubleshooting
+
+If the container fails before the Web UI appears, check the logs:
+
+```bash
+docker logs ironwail-addons
+```
+
+If the error mentions permissions on `/appdata`, confirm the bind mount is mounted read/write and owned by the same user the container runs as. The app will not silently switch to an in-memory database.
+
 ### 5) Reverse proxy and HTTPS
 
 If you front the container with a reverse proxy, set `PUBLIC_BASE_URL` to the external HTTPS URL, for example:
@@ -175,7 +187,7 @@ Example env values:
 ```yaml
 APP_SECRET_KEY: "replace-with-long-random-secret"
 PUBLIC_BASE_URL: "http://your-unraid-host:8080"
-PERSIST_ROOT: "/data"
+PERSIST_ROOT: "/appdata"
 PUBLIC_ROOT: "/public"
 UPLOAD_FOLDER: "/uploads"
 PORT: "5000"

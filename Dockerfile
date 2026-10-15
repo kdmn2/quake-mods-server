@@ -15,8 +15,8 @@ COPY tools ./tools
 COPY templates ./templates
 
 RUN useradd --create-home --shell /bin/bash appuser && \
-    mkdir -p /data /public /uploads /appdata && \
-    chown -R appuser:appuser /app /data /public /uploads
+    mkdir -p /appdata /public /uploads && \
+    chown -R appuser:appuser /app /appdata /public /uploads
 
 USER appuser
 

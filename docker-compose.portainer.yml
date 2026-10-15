@@ -10,13 +10,13 @@ services:
     environment:
       APP_SECRET_KEY: "replace-with-long-random-secret"
       PUBLIC_BASE_URL: "http://your-unraid-host:8080"
-      PERSIST_ROOT: "/data"
+      PERSIST_ROOT: "/appdata"
       PUBLIC_ROOT: "/public"
       UPLOAD_FOLDER: "/uploads"
-      DB_PATH: "/data/addons.sqlite3"
+      DB_PATH: "/appdata/addons.sqlite3"
       PORT: "5000"
     volumes:
-      - /mnt/user/appdata/ironwail-addons/data:/data
+      - /mnt/user/appdata/ironwail-addons/data:/appdata
       - /mnt/user/appdata/ironwail-addons/public:/public
       - /mnt/user/appdata/ironwail-addons/uploads:/uploads
     healthcheck:

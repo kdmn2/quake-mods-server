@@ -230,8 +230,11 @@ class AdminWorkflowTests(unittest.TestCase):
         self.assertIn(b"Package rejected", res.data)
 
     def test_db_path_falls_back_when_unwritable(self):
-        app.config["DB_PATH"] = "/root/forbidden/addons.sqlite3"
-        # Reinitialize against the temp writable root and ensure startup still works.
+        app.config["DB_PATH"] = str(self.tmp / "nope" / "addons.sqlite3")
+        app.config["PERSIST_ROOT"] = str(self.tmp / "data")
+        app.config["UPLOAD_FOLDER"] = str(self.tmp / "upload")
+        os.makedirs(app.config["PERSIST_ROOT"], exist_ok=True)
+        os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
         self.assertTrue(init_db() is None)
         conn = get_db()
         self.assertIsNotNone(conn)

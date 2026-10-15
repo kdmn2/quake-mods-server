@@ -181,7 +181,11 @@ def startup_preflight() -> Tuple[bool, list[str]]:
         conn.execute("SELECT 1")
         conn.close()
     except Exception as exc:
-        issues.append(f"database: {exc}")
+        msg = str(exc)
+        if isinstance(exc, PermissionError) or "Permission denied" in msg:
+            issues.append(f"permissions: the database directory is not writable ({db_path.parent if 'db_path' in locals() else app.config.get('DB_PATH')}). Check the Unraid appdata bind mount ownership and read/write mode.")
+        else:
+            issues.append(f"database: {exc}")
         return False, issues
     return True, issues
 
@@ -603,6 +607,10 @@ def main() -> int:
     generate_catalog()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
     return 0
+
+
+def create_app() -> Flask:
+    return app
 
 
 if __name__ == "__main__":
