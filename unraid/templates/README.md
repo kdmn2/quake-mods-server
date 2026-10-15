@@ -22,6 +22,16 @@ This means the image is rebuilt and pushed automatically when the repository cha
 - Confirm the host AppData paths match your actual Unraid `appdata` location.
 - Ensure the host port is not already in use.
 
+## Pinning a specific release tag
+
+The default template points at the rolling `latest` tag. If you want a fixed version instead, change the template repository value to a specific release tag, for example:
+
+```text
+ghcr.io/kdmn2/quake-mods-server:v1.2.3
+```
+
+This is useful when you want to keep a known-good version stable while evaluating an upgrade.
+
 ## Installing as a custom template
 
 1. In Unraid, open Docker > Add Container.

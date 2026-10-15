@@ -58,7 +58,7 @@ ghcr.io/kdmn2/quake-mods-server:latest
 
 1. Open Unraid and go to Docker > Add Container.
 2. Import `unraid/templates/ironwail-addons.xml` as a custom template.
-3. Leave the repository as `ghcr.io/kdmn2/quake-mods-server:latest` unless you intentionally want a different tag.
+3. Leave the repository as `ghcr.io/kdmn2/quake-mods-server:latest` unless you intentionally want to pin a specific release tag.
 4. Set the host port (default `8080`) and the three persistent data paths:
    - `/mnt/user/appdata/ironwail-addons/data`
    - `/mnt/user/appdata/ironwail-addons/public`
@@ -66,6 +66,16 @@ ghcr.io/kdmn2/quake-mods-server:latest
 5. Set a strong `APP_SECRET_KEY`.
 6. Set `PUBLIC_BASE_URL` to the externally reachable URL for your server, for example `https://addons.example.com`.
 7. Click Apply.
+
+### Pin a specific release tag
+
+If you want a fixed version instead of the rolling `latest` image, change the repository value to a tag like:
+
+```text
+ghcr.io/kdmn2/quake-mods-server:v1.2.3
+```
+
+This is useful for stable deployments and controlled upgrade windows.
 
 ### 1) What the template deploys
 
