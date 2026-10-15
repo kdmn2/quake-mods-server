@@ -35,7 +35,7 @@ This is useful when you want to keep a known-good version stable while evaluatin
 ## Installing as a custom template
 
 1. In Unraid, open Docker > Add Container.
-2. Import `unraid/templates/ironwail-addons.xml` as a custom template.
+2. Import `unraid-template.xml` as a custom template.
 3. Review the default host port and data paths.
 4. Set the app secret and public base URL.
 5. Click Apply.

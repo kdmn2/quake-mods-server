@@ -3,7 +3,7 @@
 This project provides a lightweight self-hosted admin workflow for an Ironwail-compatible Quake add-on catalog. It keeps the public contract compatible with Ironwail’s verified source at `v0.8.2`, while adding a browser-based admin interface for uploads, metadata, publishing, and catalog generation.
 
 Quick deploy to Unraid
-- Native Unraid template: `unraid/templates/ironwail-addons.xml`
+- Native Unraid template: `unraid-template.xml`
 - Auto-published image: `ghcr.io/kdmn2/quake-mods-server:latest`
 - First-run setup: `http://<unraid-host>:<port>/setup`
 
@@ -46,7 +46,7 @@ Then open:
 
 ## Native Unraid deployment
 
-This repo includes a native Unraid Docker template at `unraid/templates/ironwail-addons.xml`.
+This repo includes a native Unraid Docker template at `unraid-template.xml`.
 
 The current image is published automatically to GitHub Container Registry:
 
@@ -57,7 +57,7 @@ ghcr.io/kdmn2/quake-mods-server:latest
 ### Deploy from Unraid Docker GUI
 
 1. Open Unraid and go to Docker > Add Container.
-2. Import `unraid/templates/ironwail-addons.xml` as a custom template.
+2. Import `unraid-template.xml` as a custom template.
 3. Leave the repository as `ghcr.io/kdmn2/quake-mods-server:latest` unless you intentionally want to pin a specific release tag. If you pin, use a version tag such as `ghcr.io/kdmn2/quake-mods-server:v1.2.3`.
 4. Set the host port (default `8080`) and the three persistent data paths:
    - `/mnt/user/appdata/ironwail-addons/data`
@@ -118,7 +118,7 @@ The image runs as non-root `appuser`, so the host bind paths must be writable by
 Use the included native template as a custom template in Unraid:
 
 1. Open Unraid Docker GUI.
-2. Import the XML file from `unraid/templates/ironwail-addons.xml`.
+2. Import the XML file from `unraid-template.xml`.
 3. Select the app in the template UI.
 4. Set:
    - App port (default `8080`)
