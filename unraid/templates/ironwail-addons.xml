@@ -7,13 +7,9 @@
   <MyIP/>
   <Shell>sh</Shell>
   <Privileged>false</Privileged>
-  <Support>https://github.com/kdmn2/quake-mods-server</Support>
-  <Project>https://github.com/kdmn2/quake-mods-server</Project>
   <Overview>Ironwail-compatible Quake add-on catalog manager with a browser admin UI, upload workflow, static public catalog, and package hosting for Ironwail's built-in add-ons menu. This image is published automatically from the GitHub repository.</Overview>
   <Category>Tools: Other;MediaApp: Other;</Category>
   <WebUI>http://[IP]:[PORT:8080]/login</WebUI>
-  <TemplateURL>https://raw.githubusercontent.com/kdmn2/quake-mods-server/master/unraid/templates/ironwail-addons.xml</TemplateURL>
-  <Icon>https://raw.githubusercontent.com/kdmn2/quake-mods-server/master/unraid/icon.png</Icon>
   <ExtraParams/>
   <PostArgs/>
   <DateInstalled>1760560000</DateInstalled>
