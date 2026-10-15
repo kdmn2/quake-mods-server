@@ -61,6 +61,15 @@ def _resolve_db_path(ensure_parent: bool = True) -> Path:
     raise PermissionError("Unable to resolve SQLite database path")
 
 
+def _prime_fallback_db() -> None:
+    fallback = Path(app.config["UPLOAD_FOLDER"]) / "addons.sqlite3"
+    try:
+        fallback.parent.mkdir(parents=True, exist_ok=True)
+        app.config["DB_PATH"] = str(fallback)
+    except Exception:
+        pass
+
+
 def ensure_dirs() -> None:
     persist_root = Path(app.config["PERSIST_ROOT"])
     for p in [
@@ -75,6 +84,7 @@ def ensure_dirs() -> None:
 
 
 ensure_dirs()
+_prime_fallback_db()
 
 
 def get_db() -> sqlite3.Connection:

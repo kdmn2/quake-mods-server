@@ -67,7 +67,7 @@ If GHCR still returns `unauthorized`, the package visibility may still need to b
    - `/mnt/user/appdata/ironwail-addons/uploads`
 5. Set a strong `APP_SECRET_KEY`.
 6. Set `PUBLIC_BASE_URL` to the externally reachable URL for your server, for example `https://addons.example.com`.
-7. Set `DB_PATH` to `/data/addons.sqlite3` (recommended) so the database file lives directly on the mounted persistent volume.
+7. Set `DB_PATH` to a writable path inside the mounted persistent volume if possible; the app will fall back to the uploads area when the configured DB path is not writable.
 8. Click Apply.
 
 ### Pin a specific release tag
