@@ -32,6 +32,16 @@
       <label>Package file</label><br>
       <input type="file" name="package">
     </p>
+    <p>
+      <label>Import mode</label><br>
+      <label><input type="radio" name="import_mode" value="upload" checked> Upload from browser</label><br>
+      <label><input type="radio" name="import_mode" value="local"> Import from server path</label>
+    </p>
+    <p>
+      <label>Local source path</label><br>
+      <input name="local_source" value="" placeholder="/mnt/user/appdata/.../mod.zip">
+      <div class="small muted">Used only when importing from a file already on the server.</div>
+    </p>
     <button type="submit">Save</button>
   </form>
 </div>

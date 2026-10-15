@@ -169,6 +169,28 @@ class AdminWorkflowTests(unittest.TestCase):
         repack_zip_to_pak(zip_path, pak_path)
         self.assertEqual(pak_path.read_bytes()[:4], b"PACK")
 
+    def test_local_path_import_uses_existing_file(self):
+        self._login()
+        zip_path = self.tmp / "local.zip"
+        self._make_zip(zip_path, {"maps/e1m1.bsp": b"abc"})
+        res = self.app.post(
+            "/addons/new",
+            data={
+                "title": "Local Import",
+                "addon_id": "localmod",
+                "gamedir": "localmod",
+                "author": "Tester",
+                "date": "2026/10/15",
+                "description": "Imported from local path",
+                "import_mode": "local",
+                "local_source": str(zip_path),
+                "csrf_token": self._csrf(),
+            },
+            follow_redirects=True,
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertIn(b"Imported local file", res.data)
+
     def test_content_based_detection_not_extension_based(self):
         self._login()
         masquerade = self.tmp / "fake.pak"

@@ -420,14 +420,35 @@ def add_addon() -> Any:
         date = request.form.get("date", "").strip()
         description = request.form.get("description", "").strip()
         package_file = request.files.get("package")
-        if not title or not addon_id or not gamedir or not package_file or not package_file.filename:
-            flash("Title, ID, game dir, and a package upload are required.", "error")
+        local_source = request.form.get("local_source", "").strip()
+        import_mode = request.form.get("import_mode", "upload")
+        if not title or not addon_id or not gamedir:
+            flash("Title, ID, and game dir are required.", "error")
             return render_template("addon_form.html", mode="new")
 
-        safe_name = secure_filename(package_file.filename)
-        if not safe_name:
-            flash("Invalid package filename.", "error")
-            return render_template("addon_form.html", mode="new")
+        if import_mode == "local":
+            if not local_source:
+                flash("Local source path is required for local import.", "error")
+                return render_template("addon_form.html", mode="new")
+            source_path = Path(local_source).expanduser()
+            if not source_path.is_absolute():
+                flash("Local source path must be absolute.", "error")
+                return render_template("addon_form.html", mode="new")
+            if not source_path.exists():
+                flash("Local source file does not exist.", "error")
+                return render_template("addon_form.html", mode="new")
+            if source_path.suffix.lower() not in (".zip", ".pak"):
+                flash("Local source must be a .zip or .pak file.", "error")
+                return render_template("addon_form.html", mode="new")
+            safe_name = source_path.name
+        else:
+            if not package_file or not package_file.filename:
+                flash("Package file is required for upload mode.", "error")
+                return render_template("addon_form.html", mode="new")
+            safe_name = secure_filename(package_file.filename)
+            if not safe_name:
+                flash("Invalid package filename.", "error")
+                return render_template("addon_form.html", mode="new")
 
         storage_dir = _packages_dir()
         target = storage_dir / f"{addon_id}.pak"
@@ -436,7 +457,10 @@ def add_addon() -> Any:
         upload_source = upload_dir / safe_name
 
         try:
-            package_file.save(upload_source)
+            if import_mode == "local":
+                shutil.copy2(source_path, upload_source)
+            else:
+                package_file.save(upload_source)
             detected = detect_package_format(upload_source)
             if detected == "zip":
                 repack_zip_to_pak(upload_source, target)
@@ -470,7 +494,10 @@ def add_addon() -> Any:
         finally:
             shutil.rmtree(upload_dir, ignore_errors=True)
 
-        flash(f"{conversion_msg} Add-on saved as a draft. Review and publish when ready.", "success")
+        if import_mode == "local":
+            flash(f"Imported local file and {conversion_msg.lower()} Add-on saved as a draft. Review and publish when ready.", "success")
+        else:
+            flash(f"{conversion_msg} Add-on saved as a draft. Review and publish when ready.", "success")
         return redirect(url_for("dashboard"))
     return render_template("addon_form.html", mode="new")
 
