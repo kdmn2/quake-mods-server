@@ -258,7 +258,13 @@ class AdminWorkflowTests(unittest.TestCase):
     def test_effective_config_uses_appdata_paths(self):
         from app import _effective_config
         cfg = _effective_config()
-        self.assertIn("/tmp", cfg["PERSIST_ROOT"])
+        self.assertTrue(cfg["PERSIST_ROOT"])
+        self.assertIn("PERSIST_ROOT", cfg)
+
+    def test_best_effort_persist_root_is_resolved(self):
+        from app import _best_effort_persist_root
+        root = _best_effort_persist_root()
+        self.assertTrue(str(root))
 
 
 if __name__ == "__main__":

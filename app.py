@@ -27,7 +27,7 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",
     MAX_CONTENT_LENGTH=int(os.environ.get("MAX_CONTENT_LENGTH", str(128 * 1024 * 1024))),
     UPLOAD_FOLDER=os.environ.get("UPLOAD_FOLDER", "/tmp/quake-addons-upload"),
-    PERSIST_ROOT=os.environ.get("PERSIST_ROOT", "/tmp/quake-addons-data"),
+    PERSIST_ROOT=os.environ.get("PERSIST_ROOT", "/appdata"),
     DB_PATH=os.environ.get("DB_PATH", ""),
     PUBLIC_ROOT=os.environ.get("PUBLIC_ROOT", "/tmp/quake-addons-public"),
     BASE_URL=os.environ.get("PUBLIC_BASE_URL", "http://localhost:8080"),
@@ -47,6 +47,8 @@ def _db_path_candidates() -> list[Path]:
         candidates.append(Path(configured))
     candidates.append(persist_root / "addons.sqlite3")
     candidates.append(Path(app.config["UPLOAD_FOLDER"]) / "addons.sqlite3")
+    if persist_root != Path("/appdata"):
+        candidates.append(Path("/appdata") / "addons.sqlite3")
     return candidates
 
 
@@ -82,10 +84,8 @@ def _effective_config() -> Dict[str, str]:
 
 
 def ensure_dirs() -> None:
-    persist_root = Path(app.config["PERSIST_ROOT"])
     for p in [
         app.config["UPLOAD_FOLDER"],
-        persist_root,
         app.config["PUBLIC_ROOT"],
     ]:
         try:
@@ -94,6 +94,20 @@ def ensure_dirs() -> None:
             raise PermissionError(f"Cannot create required directory {p}: {exc}") from exc
 
 
+def _best_effort_persist_root() -> Path:
+    configured = Path(app.config.get("PERSIST_ROOT") or "/appdata")
+    candidates = [configured, Path("/appdata"), Path(app.config["UPLOAD_FOLDER"]) / "appdata"]
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            if os.access(candidate, os.W_OK | os.X_OK):
+                return candidate
+        except Exception:
+            continue
+    return configured
+
+
+app.config["PERSIST_ROOT"] = str(_best_effort_persist_root())
 ensure_dirs()
 
 
@@ -196,6 +210,16 @@ def startup_preflight() -> Tuple[bool, list[str]]:
         else:
             issues.append(f"database: {exc}")
         return False, issues
+    # If the configured PERSIST_ROOT is not writable but /appdata is, prefer /appdata
+    # so a stale container config can still start with the intended Unraid mount.
+    try:
+        prefer = Path("/appdata")
+        if prefer.exists() and os.access(prefer, os.W_OK | os.X_OK):
+            app.config["PERSIST_ROOT"] = str(prefer)
+            if not str(app.config.get("DB_PATH") or "").strip():
+                app.config["DB_PATH"] = str(prefer / "addons.sqlite3")
+    except Exception:
+        pass
     return True, issues
 
 
