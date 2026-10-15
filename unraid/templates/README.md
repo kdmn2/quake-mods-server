@@ -13,7 +13,7 @@ The template is based on the current repository's Dockerfile and app configurati
 ghcr.io/kdmn2/quake-mods-server:latest
 ```
 
-This means the image is rebuilt and pushed automatically when the repository changes, rather than requiring a manual local image build before deployment.
+This means the image is rebuilt and pushed automatically when the repository changes, and the `latest` tag is refreshed from the default branch build.
 
 ## Required user changes before Apply
 

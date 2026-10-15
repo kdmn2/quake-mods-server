@@ -49,3 +49,10 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           platforms: linux/amd64
+
+      - name: Set latest tag to current default branch build
+        if: github.ref == 'refs/heads/master'
+        run: |
+          docker buildx imagetools create \
+            ghcr.io/${{ github.repository_owner }}/quake-mods-server:sha-${GITHUB_SHA::7} \
+            --tag ghcr.io/${{ github.repository_owner }}/quake-mods-server:latest

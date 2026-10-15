@@ -2,6 +2,11 @@
 
 This project provides a lightweight self-hosted admin workflow for an Ironwail-compatible Quake add-on catalog. It keeps the public contract compatible with Ironwail’s verified source at `v0.8.2`, while adding a browser-based admin interface for uploads, metadata, publishing, and catalog generation.
 
+Quick deploy to Unraid
+- Native Unraid template: `unraid/templates/ironwail-addons.xml`
+- Auto-published image: `ghcr.io/kdmn2/quake-mods-server:latest`
+- First-run setup: `http://<unraid-host>:<port>/setup`
+
 Important protocol summary
 - Ironwail requests `<base>/content.json`
 - Each catalog entry requires `download` and `gamedir`
@@ -48,6 +53,19 @@ The current image is published automatically to GitHub Container Registry:
 ```text
 ghcr.io/kdmn2/quake-mods-server:latest
 ```
+
+### Deploy from Unraid Docker GUI
+
+1. Open Unraid and go to Docker > Add Container.
+2. Import `unraid/templates/ironwail-addons.xml` as a custom template.
+3. Leave the repository as `ghcr.io/kdmn2/quake-mods-server:latest` unless you intentionally want a different tag.
+4. Set the host port (default `8080`) and the three persistent data paths:
+   - `/mnt/user/appdata/ironwail-addons/data`
+   - `/mnt/user/appdata/ironwail-addons/public`
+   - `/mnt/user/appdata/ironwail-addons/uploads`
+5. Set a strong `APP_SECRET_KEY`.
+6. Set `PUBLIC_BASE_URL` to the externally reachable URL for your server, for example `https://addons.example.com`.
+7. Click Apply.
 
 ### 1) What the template deploys
 
