@@ -170,6 +170,8 @@ docker logs ironwail-addons
 
 If the error mentions permissions on `/appdata`, confirm the bind mount is mounted read/write and owned by the same user the container runs as. The app will not silently switch to an in-memory database.
 
+If you see a permissions failure, fix the host directory ownership/mode on the Unraid appdata path. Do not rely on the app to repair permissions automatically.
+
 ### 5) Reverse proxy and HTTPS
 
 If you front the container with a reverse proxy, set `PUBLIC_BASE_URL` to the external HTTPS URL, for example:

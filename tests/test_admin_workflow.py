@@ -255,6 +255,15 @@ class AdminWorkflowTests(unittest.TestCase):
         self.assertEqual(issues, [])
         log_startup_banner()
 
+    def test_preflight_permission_message_is_actionable(self):
+        from app import startup_preflight
+        old = app.config["UPLOAD_FOLDER"]
+        app.config["UPLOAD_FOLDER"] = "/proc/forbidden"
+        ok, issues = startup_preflight()
+        app.config["UPLOAD_FOLDER"] = old
+        self.assertFalse(ok)
+        self.assertTrue(issues)
+
     def test_effective_config_uses_appdata_paths(self):
         from app import _effective_config
         cfg = _effective_config()

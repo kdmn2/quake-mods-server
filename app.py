@@ -206,7 +206,11 @@ def startup_preflight() -> Tuple[bool, list[str]]:
     except Exception as exc:
         msg = str(exc)
         if isinstance(exc, PermissionError) or "Permission denied" in msg:
-            issues.append(f"permissions: the database directory is not writable ({db_path.parent if 'db_path' in locals() else app.config.get('DB_PATH')}). Check the Unraid appdata bind mount ownership and read/write mode.")
+            issues.append(
+                f"permissions: the database directory is not writable ({db_path.parent if 'db_path' in locals() else app.config.get('DB_PATH')}). "
+                f"Container uid/gid {os.getuid() if hasattr(os, 'getuid') else '?'}:{os.getgid() if hasattr(os, 'getgid') else '?'}, "
+                f"check the Unraid appdata bind mount ownership and read/write mode. Existing data was not modified."
+            )
         else:
             issues.append(f"database: {exc}")
         return False, issues
@@ -237,6 +241,7 @@ def log_startup_banner() -> None:
                 "gid": os.getgid() if hasattr(os, "getgid") else None,
                 "config": _effective_config(),
                 "db_path": str(db_path),
+                "note": "If startup preflight fails with permissions, the host mount ownership/mode must be fixed; the app will not chmod or chown existing data.",
             },
             sort_keys=True,
         ),
