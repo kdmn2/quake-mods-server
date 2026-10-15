@@ -255,6 +255,11 @@ class AdminWorkflowTests(unittest.TestCase):
         self.assertEqual(issues, [])
         log_startup_banner()
 
+    def test_effective_config_uses_appdata_paths(self):
+        from app import _effective_config
+        cfg = _effective_config()
+        self.assertIn("/tmp", cfg["PERSIST_ROOT"])
+
 
 if __name__ == "__main__":
     unittest.main()

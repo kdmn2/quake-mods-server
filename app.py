@@ -72,6 +72,15 @@ def _diagnose_path(path: Path) -> Dict[str, Any]:
     return info
 
 
+def _effective_config() -> Dict[str, str]:
+    return {
+        "PERSIST_ROOT": str(app.config["PERSIST_ROOT"]),
+        "DB_PATH": str(app.config.get("DB_PATH") or ""),
+        "PUBLIC_ROOT": str(app.config["PUBLIC_ROOT"]),
+        "UPLOAD_FOLDER": str(app.config["UPLOAD_FOLDER"]),
+    }
+
+
 def ensure_dirs() -> None:
     persist_root = Path(app.config["PERSIST_ROOT"])
     for p in [
@@ -202,9 +211,7 @@ def log_startup_banner() -> None:
                 "version": APP_VERSION,
                 "uid": os.getuid() if hasattr(os, "getuid") else None,
                 "gid": os.getgid() if hasattr(os, "getgid") else None,
-                "persist_root": app.config["PERSIST_ROOT"],
-                "public_root": app.config["PUBLIC_ROOT"],
-                "upload_root": app.config["UPLOAD_FOLDER"],
+                "config": _effective_config(),
                 "db_path": str(db_path),
             },
             sort_keys=True,

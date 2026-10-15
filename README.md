@@ -157,6 +157,7 @@ python app.py doctor
 It reports the resolved database path, runtime UID/GID, and basic read/write readiness checks without modifying data.
 
 On normal startup, the container also prints a single JSON banner to Docker logs with the resolved paths and UID/GID to make Unraid troubleshooting easier.
+If the banner still shows `/data`, that means you are running an older image or an overridden environment/config in the container settings.
 
 ### Unraid troubleshooting
 
