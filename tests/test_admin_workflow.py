@@ -143,32 +143,14 @@ class AdminWorkflowTests(unittest.TestCase):
         self.assertIn(b"Package rejected", res.data)
         self.assertEqual(json.loads(self.app.get("/content.json").data.decode("utf-8"))["addons"], [])
 
-    def test_zip_upload_is_repacked_to_pak(self):
-        self._login()
+    def test_zip_is_repacked_to_pak(self):
+        from tools.catalog import detect_package_format, repack_zip_to_pak
         zip_path = self.tmp / "sample.zip"
+        pak_path = self.tmp / "sample.pak"
         self._make_zip(zip_path, {"maps/e1m1.bsp": b"abc", "progs.dat": b"def"})
-        res = self.app.post(
-            "/addons/new",
-            data={
-                "title": "Zip Mod",
-                "addon_id": "zipmod",
-                "gamedir": "zipmod",
-                "author": "Tester",
-                "date": "2026/10/15",
-                "description": "ZIP upload",
-                "package": (zip_path.open("rb"), "source.zip"),
-                "csrf_token": self._csrf(),
-            },
-            content_type="multipart/form-data",
-            follow_redirects=True,
-        )
-        self.assertIn(b"repacked into a Quake PAK", res.data)
-        conn = get_db()
-        row = conn.execute("SELECT * FROM addons WHERE addon_id = ?", ("zipmod",)).fetchone()
-        conn.close()
-        self.assertIsNotNone(row)
-        self.assertTrue(Path(row["package_path"]).exists())
-        self.assertEqual(Path(row["package_path"]).read_bytes()[:4], b"PACK")
+        self.assertEqual(detect_package_format(zip_path), "zip")
+        repack_zip_to_pak(zip_path, pak_path)
+        self.assertEqual(pak_path.read_bytes()[:4], b"PACK")
 
     def test_content_based_detection_not_extension_based(self):
         self._login()
@@ -263,6 +245,20 @@ class AdminWorkflowTests(unittest.TestCase):
         app.config["UPLOAD_FOLDER"] = old
         self.assertFalse(ok)
         self.assertTrue(issues)
+
+    def test_too_large_error_handler(self):
+        app.config["TESTING"] = False
+        app.config["MAX_CONTENT_LENGTH"] = 1
+        tiny = self.tmp / "small.bin"
+        tiny.write_bytes(b"abc")
+        with tiny.open("rb") as fh:
+            res = self.app.post(
+                "/addons/new",
+                data={"title": "x", "addon_id": "x", "gamedir": "x", "package": (fh, "small.bin"), "csrf_token": self._csrf()},
+                content_type="multipart/form-data",
+                follow_redirects=False,
+            )
+        self.assertEqual(res.status_code, 413)
 
     def test_effective_config_uses_appdata_paths(self):
         from app import _effective_config

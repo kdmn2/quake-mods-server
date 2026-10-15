@@ -182,6 +182,8 @@ https://addons.example.com
 
 The app itself does not terminate TLS; it expects your reverse proxy to handle it.
 
+Upload size is limited by `MAX_CONTENT_LENGTH` (default 512 MiB). If you need larger archives, increase it in the container environment.
+
 ### 6) Portainer / Docker Compose compatibility
 
 The repo also contains a Portainer-friendly Compose file at `docker-compose.portainer.yml` for manual deployments. It uses the same env vars and bind mounts as the Unraid template, but the image field is a placeholder that must be replaced with a real registry path before use.

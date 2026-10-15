@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, Tuple
 
 from flask import Flask, flash, jsonify, redirect, render_template, request, send_from_directory, session, url_for
-from werkzeug.exceptions import BadRequest, Forbidden, NotFound
+from werkzeug.exceptions import BadRequest, Forbidden, NotFound, RequestEntityTooLarge
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
@@ -25,7 +25,7 @@ app.config.update(
     SECRET_KEY=os.environ.get("APP_SECRET_KEY", "dev-secret-change-me"),
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    MAX_CONTENT_LENGTH=int(os.environ.get("MAX_CONTENT_LENGTH", str(128 * 1024 * 1024))),
+    MAX_CONTENT_LENGTH=int(os.environ.get("MAX_CONTENT_LENGTH", str(512 * 1024 * 1024))),
     UPLOAD_FOLDER=os.environ.get("UPLOAD_FOLDER", "/tmp/quake-addons-upload"),
     PERSIST_ROOT=os.environ.get("PERSIST_ROOT", "/appdata"),
     DB_PATH=os.environ.get("DB_PATH", ""),
@@ -325,6 +325,15 @@ def inject_globals() -> Dict[str, Any]:
         "current_user": session.get("username"),
         "csrf_token": make_csrf_token(),
     }
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def handle_too_large(exc: RequestEntityTooLarge):
+    message = "Upload too large. Increase MAX_CONTENT_LENGTH if you need to support bigger ZIP/PAK uploads."
+    if request.path.startswith("/addons/"):
+        flash(message, "error")
+        return render_template("addon_form.html", mode="new"), 413
+    return jsonify({"ok": False, "error": message}), 413
 
 
 @app.route("/health")
