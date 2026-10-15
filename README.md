@@ -182,7 +182,7 @@ https://addons.example.com
 
 The app itself does not terminate TLS; it expects your reverse proxy to handle it.
 
-Upload size is limited by `MAX_CONTENT_LENGTH` (default 512 MiB). If you need larger archives, increase it in the container environment.
+Upload size is limited by `MAX_CONTENT_LENGTH` (default 2 GiB). If you need larger archives, increase it in the container environment.
 
 ### 6) Portainer / Docker Compose compatibility
 

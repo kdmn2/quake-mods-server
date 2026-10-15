@@ -25,7 +25,7 @@ app.config.update(
     SECRET_KEY=os.environ.get("APP_SECRET_KEY", "dev-secret-change-me"),
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    MAX_CONTENT_LENGTH=int(os.environ.get("MAX_CONTENT_LENGTH", str(512 * 1024 * 1024))),
+    MAX_CONTENT_LENGTH=int(os.environ.get("MAX_CONTENT_LENGTH", str(2 * 1024 * 1024 * 1024))),
     UPLOAD_FOLDER=os.environ.get("UPLOAD_FOLDER", "/tmp/quake-addons-upload"),
     PERSIST_ROOT=os.environ.get("PERSIST_ROOT", "/appdata"),
     DB_PATH=os.environ.get("DB_PATH", ""),

@@ -160,6 +160,15 @@ class AdminWorkflowTests(unittest.TestCase):
         repack_zip_to_pak(zip_path, pak_path)
         self.assertEqual(pak_path.read_bytes()[:4], b"PACK")
 
+    def test_large_zip_repack_limit_is_higher(self):
+        from tools.catalog import repack_zip_to_pak
+        zip_path = self.tmp / "large.zip"
+        pak_path = self.tmp / "large.pak"
+        # Simulate a reasonably large but valid archive in chunks, not a huge real file.
+        self._make_zip(zip_path, {"maps/big1.bin": b"a" * (5 * 1024 * 1024), "maps/big2.bin": b"b" * (5 * 1024 * 1024)})
+        repack_zip_to_pak(zip_path, pak_path)
+        self.assertEqual(pak_path.read_bytes()[:4], b"PACK")
+
     def test_content_based_detection_not_extension_based(self):
         self._login()
         masquerade = self.tmp / "fake.pak"

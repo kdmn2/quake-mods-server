@@ -144,7 +144,7 @@ def _validate_zip_member_name(name: str) -> str:
     return name
 
 
-def repack_zip_to_pak(source: Path, target: Path, max_files: int = 5000, max_uncompressed_size: int = 512 * 1024 * 1024) -> Dict[str, Any]:
+def repack_zip_to_pak(source: Path, target: Path, max_files: int = 5000, max_uncompressed_size: int = 2 * 1024 * 1024 * 1024) -> Dict[str, Any]:
     source = Path(source)
     target = Path(target)
     if zipfile.is_zipfile(source) is False:
