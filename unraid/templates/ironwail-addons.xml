@@ -2,7 +2,7 @@
 <Container version="2">
   <Name>ironwail-addons</Name>
   <Repository>ghcr.io/kdmn2/quake-mods-server:latest</Repository>
-  <Registry>https://github.com/features/packages</Registry>
+  <Registry>ghcr.io</Registry>
   <Network>bridge</Network>
   <MyIP/>
   <Shell>sh</Shell>
