@@ -13,6 +13,7 @@ services:
       PERSIST_ROOT: "/data"
       PUBLIC_ROOT: "/public"
       UPLOAD_FOLDER: "/uploads"
+      DB_PATH: "/data/addons.sqlite3"
       PORT: "5000"
     volumes:
       - /mnt/user/appdata/ironwail-addons/data:/data

@@ -26,6 +26,7 @@ app.config.update(
     MAX_CONTENT_LENGTH=int(os.environ.get("MAX_CONTENT_LENGTH", str(128 * 1024 * 1024))),
     UPLOAD_FOLDER=os.environ.get("UPLOAD_FOLDER", "/tmp/quake-addons-upload"),
     PERSIST_ROOT=os.environ.get("PERSIST_ROOT", "/tmp/quake-addons-data"),
+    DB_PATH=os.environ.get("DB_PATH", ""),
     PUBLIC_ROOT=os.environ.get("PUBLIC_ROOT", "/tmp/quake-addons-public"),
     BASE_URL=os.environ.get("PUBLIC_BASE_URL", "http://localhost:8080"),
     ADMIN_PORT=os.environ.get("PORT", "5000"),
@@ -36,14 +37,16 @@ LOCK = threading.RLock()
 
 
 def ensure_dirs() -> None:
+    persist_root = Path(app.config["PERSIST_ROOT"])
+    db_path = Path(app.config["DB_PATH"]) if app.config.get("DB_PATH") else persist_root / "addons.sqlite3"
     for p in [
         app.config["UPLOAD_FOLDER"],
-        app.config["PERSIST_ROOT"],
+        persist_root,
         app.config["PUBLIC_ROOT"],
-        Path(app.config["PERSIST_ROOT"]) / "db",
-        Path(app.config["PERSIST_ROOT"]) / "packages",
-        Path(app.config["PERSIST_ROOT"]) / "metadata",
-        Path(app.config["PERSIST_ROOT"]) / "staging",
+        db_path.parent,
+        persist_root / "packages",
+        persist_root / "metadata",
+        persist_root / "staging",
         Path(app.config["PUBLIC_ROOT"]) / "addons",
     ]:
         try:
@@ -57,7 +60,7 @@ ensure_dirs()
 
 def get_db() -> sqlite3.Connection:
     ensure_dirs()
-    db_path = Path(app.config["PERSIST_ROOT"]) / "db" / "addons.sqlite3"
+    db_path = Path(app.config["DB_PATH"]) if app.config.get("DB_PATH") else Path(app.config["PERSIST_ROOT"]) / "addons.sqlite3"
     conn = sqlite3.connect(db_path, timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")

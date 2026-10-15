@@ -67,7 +67,8 @@ If GHCR still returns `unauthorized`, the package visibility may still need to b
    - `/mnt/user/appdata/ironwail-addons/uploads`
 5. Set a strong `APP_SECRET_KEY`.
 6. Set `PUBLIC_BASE_URL` to the externally reachable URL for your server, for example `https://addons.example.com`.
-7. Click Apply.
+7. Set `DB_PATH` to `/data/addons.sqlite3` (recommended) so the database file lives directly on the mounted persistent volume.
+8. Click Apply.
 
 ### Pin a specific release tag
 
@@ -96,6 +97,7 @@ The app container uses:
   - `PERSIST_ROOT=/data`
   - `PUBLIC_ROOT=/public`
   - `UPLOAD_FOLDER=/uploads`
+  - `DB_PATH=/data/addons.sqlite3` (recommended for clean first boot)
 
 ### 2) Create the persistent data root on Unraid
 
@@ -113,7 +115,7 @@ mkdir -p /mnt/user/appdata/ironwail-addons/public
 mkdir -p /mnt/user/appdata/ironwail-addons/uploads
 ```
 
-The image runs as non-root `appuser`, so the host bind paths must be writable by the container user. On Unraid, the simplest safe setup is to make those directories writable for the correct UID/GID, or use a mapping that matches the container runtime user.
+The image runs as non-root `appuser`, so the host bind paths must be writable by the container user. On Unraid, the simplest safe setup is to make those directories writable for the correct UID/GID, or use a mapping that matches the container runtime user. If first boot still fails because the mounted path is owned by root, fix the host permissions or pre-create the bind-mount directories with writable ownership before starting the container.
 
 ### 3) Unraid template import
 
