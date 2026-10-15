@@ -237,6 +237,14 @@ class AdminWorkflowTests(unittest.TestCase):
         self.assertIsNotNone(conn)
         conn.close()
 
+    def test_health_reports_ready_and_doctor_returns_json(self):
+        res = self.app.get("/health")
+        self.assertEqual(res.status_code, 200)
+        data = json.loads(res.data.decode("utf-8"))
+        self.assertTrue(data["ok"])
+        self._login()
+        self.assertEqual(self.app.get("/doctor").status_code, 200)
+
 
 if __name__ == "__main__":
     unittest.main()

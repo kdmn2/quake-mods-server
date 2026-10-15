@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import shutil
@@ -9,7 +10,7 @@ import threading
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterator
+from typing import Any, Dict, Iterator, Tuple
 
 from flask import Flask, flash, jsonify, redirect, render_template, request, send_from_directory, session, url_for
 from werkzeug.exceptions import BadRequest, Forbidden, NotFound
@@ -34,6 +35,7 @@ app.config.update(
 
 
 LOCK = threading.RLock()
+APP_VERSION = os.environ.get("APP_VERSION", "dev")
 
 
 def _db_path_candidates() -> list[Path]:
@@ -61,13 +63,12 @@ def _resolve_db_path(ensure_parent: bool = True) -> Path:
     raise PermissionError("Unable to resolve SQLite database path")
 
 
-def _prime_fallback_db() -> None:
-    fallback = Path(app.config["UPLOAD_FOLDER"]) / "addons.sqlite3"
-    try:
-        fallback.parent.mkdir(parents=True, exist_ok=True)
-        app.config["DB_PATH"] = str(fallback)
-    except Exception:
-        pass
+def _diagnose_path(path: Path) -> Dict[str, Any]:
+    info: Dict[str, Any] = {"path": str(path), "exists": path.exists(), "is_dir": path.is_dir(), "is_file": path.is_file()}
+    if path.exists():
+        st = path.stat()
+        info.update({"mode": oct(st.st_mode & 0o777), "uid": st.st_uid, "gid": st.st_gid})
+    return info
 
 
 def ensure_dirs() -> None:
@@ -84,7 +85,6 @@ def ensure_dirs() -> None:
 
 
 ensure_dirs()
-_prime_fallback_db()
 
 
 def get_db() -> sqlite3.Connection:
@@ -155,6 +155,57 @@ def init_db() -> None:
     conn.close()
 
 
+def startup_preflight() -> Tuple[bool, list[str]]:
+    issues: list[str] = []
+    try:
+        ensure_dirs()
+    except Exception as exc:
+        issues.append(f"filesystem: {exc}")
+        return False, issues
+    try:
+        db_path = _resolve_db_path()
+        probe_dir = db_path.parent
+        probe_dir.mkdir(parents=True, exist_ok=True)
+        probe = probe_dir / f".probe-{uuid.uuid4().hex}"
+        try:
+            with open(probe, "wb") as fh:
+                fh.write(b"ok")
+        finally:
+            try:
+                probe.unlink(missing_ok=True)
+            except Exception:
+                pass
+        conn = sqlite3.connect(str(db_path), timeout=5, isolation_level=None)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("SELECT 1")
+        conn.close()
+    except Exception as exc:
+        issues.append(f"database: {exc}")
+        return False, issues
+    return True, issues
+
+
+@app.route("/doctor")
+def doctor() -> Any:
+    require_auth()
+    db_path = _resolve_db_path()
+    payload = {
+        "version": APP_VERSION,
+        "uid": os.getuid() if hasattr(os, "getuid") else None,
+        "gid": os.getgid() if hasattr(os, "getgid") else None,
+        "paths": {
+            "persist_root": _diagnose_path(Path(app.config["PERSIST_ROOT"])),
+            "public_root": _diagnose_path(Path(app.config["PUBLIC_ROOT"])),
+            "upload_root": _diagnose_path(Path(app.config["UPLOAD_FOLDER"])),
+            "db_path": _diagnose_path(db_path),
+        },
+    }
+    ok, issues = startup_preflight()
+    payload["ok"] = ok
+    payload["issues"] = issues
+    return jsonify(payload), (200 if ok else 503)
+
+
 def _packages_dir() -> Path:
     path = Path(app.config["PERSIST_ROOT"]) / "packages"
     path.mkdir(parents=True, exist_ok=True)
@@ -217,7 +268,9 @@ def inject_globals() -> Dict[str, Any]:
 
 @app.route("/health")
 def health() -> Any:
-    return jsonify({"ok": True, "status": "healthy"}), 200
+    ok, issues = startup_preflight()
+    status = 200 if ok else 503
+    return jsonify({"ok": ok, "status": "healthy" if ok else "degraded", "issues": issues}), status
 
 
 @app.route("/")
@@ -522,9 +575,32 @@ def generate_catalog() -> None:
             os.unlink(tmp)
 
 
-if __name__ == "__main__":
-    os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
-    os.makedirs(app.config["PERSIST_ROOT"], exist_ok=True)
-    os.makedirs(app.config["PUBLIC_ROOT"], exist_ok=True)
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Ironwail add-on manager")
+    parser.add_argument("command", nargs="?", default="serve", choices=["serve", "doctor"], help="Command to run")
+    args = parser.parse_args()
+    if args.command == "doctor":
+        ok, issues = startup_preflight()
+        report = {
+            "version": APP_VERSION,
+            "uid": os.getuid() if hasattr(os, "getuid") else None,
+            "gid": os.getgid() if hasattr(os, "getgid") else None,
+            "resolved_db_path": str(_resolve_db_path()),
+            "ok": ok,
+            "issues": issues,
+        }
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0 if ok else 1
+    ok, issues = startup_preflight()
+    if not ok:
+        print("Startup preflight failed:", file=sys.stderr)
+        for issue in issues:
+            print(f"- {issue}", file=sys.stderr)
+        return 1
     generate_catalog()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

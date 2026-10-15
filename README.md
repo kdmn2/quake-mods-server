@@ -144,6 +144,16 @@ After the container starts:
 
 The app does not expose a public signup flow.
 
+### Startup diagnostics
+
+If the container fails to start, use the built-in doctor check inside the container:
+
+```bash
+python app.py doctor
+```
+
+It reports the resolved database path, runtime UID/GID, and basic read/write readiness checks without modifying data.
+
 ### 5) Reverse proxy and HTTPS
 
 If you front the container with a reverse proxy, set `PUBLIC_BASE_URL` to the external HTTPS URL, for example:
