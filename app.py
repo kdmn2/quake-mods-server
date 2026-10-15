@@ -230,9 +230,6 @@ def _public_addons_dir() -> Path:
     return path
 
 
-init_db()
-
-
 def make_csrf_token() -> str:
     token = session.get("csrf_token")
     if not token:
@@ -596,6 +593,11 @@ def main() -> int:
         print("Startup preflight failed:", file=sys.stderr)
         for issue in issues:
             print(f"- {issue}", file=sys.stderr)
+        return 1
+    try:
+        init_db()
+    except Exception as exc:
+        print(f"Database initialization failed: {exc}", file=sys.stderr)
         return 1
     generate_catalog()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
