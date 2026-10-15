@@ -1,15 +1,15 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>ironwail-addons</Name>
-  <Repository>your-registry.example.com/ironwail-addons:latest</Repository>
-  <Registry>https://hub.docker.com/</Registry>
+  <Repository>ghcr.io/kdmn2/quake-mods-server:latest</Repository>
+  <Registry>https://github.com/features/packages</Registry>
   <Network>bridge</Network>
   <MyIP/>
   <Shell>sh</Shell>
   <Privileged>false</Privileged>
   <Support>https://github.com/kdmn2/quake-mods-server</Support>
   <Project>https://github.com/kdmn2/quake-mods-server</Project>
-  <Overview>Ironwail-compatible Quake add-on catalog manager with a browser admin UI, upload workflow, static public catalog, and package hosting for Ironwail's built-in Mods menu. Set the image repository/tag to your published registry before installing.</Overview>
+  <Overview>Ironwail-compatible Quake add-on catalog manager with a browser admin UI, upload workflow, static public catalog, and package hosting for Ironwail's built-in add-ons menu. This image is published automatically from the GitHub repository.</Overview>
   <Category>Tools: Other;MediaApp: Other;</Category>
   <WebUI>http://[IP]:[PORT:8080]/login</WebUI>
   <TemplateURL>https://raw.githubusercontent.com/kdmn2/quake-mods-server/master/unraid/templates/ironwail-addons.xml</TemplateURL>
@@ -19,7 +19,7 @@
   <DateInstalled>1760560000</DateInstalled>
   <DonateText/>
   <DonateLink/>
-  <Requires>Docker image must already be built and published to a registry reachable from the Unraid host, or replaced with a local image name before installing.</Requires>
+  <Requires>Image is published automatically to GHCR on repo pushes. No manual image build is required before installation.</Requires>
   <Config Name="Web UI Port" Target="5000" Default="8080" Mode="tcp" Description="Host port mapped to the Flask app HTTP port inside the container." Type="Port" Display="always" Required="true" Mask="false">8080</Config>
   <Config Name="AppData Path" Target="/data" Default="/mnt/user/appdata/ironwail-addons/data" Mode="rw" Description="Persistent application state and SQLite database." Type="Path" Display="advanced" Required="true" Mask="false">/mnt/user/appdata/ironwail-addons/data</Config>
   <Config Name="Public Catalog Path" Target="/public" Default="/mnt/user/appdata/ironwail-addons/public" Mode="rw" Description="Public static catalog and downloadable package directory served by the app." Type="Path" Display="advanced" Required="true" Mask="false">/mnt/user/appdata/ironwail-addons/public</Config>
