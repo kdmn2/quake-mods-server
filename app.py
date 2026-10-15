@@ -44,10 +44,6 @@ def ensure_dirs() -> None:
         persist_root,
         app.config["PUBLIC_ROOT"],
         db_path.parent,
-        persist_root / "packages",
-        persist_root / "metadata",
-        persist_root / "staging",
-        Path(app.config["PUBLIC_ROOT"]) / "addons",
     ]:
         try:
             Path(p).mkdir(parents=True, exist_ok=True)
@@ -124,6 +120,30 @@ def init_db() -> None:
         conn.execute("ALTER TABLE addons ADD COLUMN package_mtime INTEGER")
     conn.commit()
     conn.close()
+
+
+def _packages_dir() -> Path:
+    path = Path(app.config["PERSIST_ROOT"]) / "packages"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _metadata_dir() -> Path:
+    path = Path(app.config["PERSIST_ROOT"]) / "metadata"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _staging_dir() -> Path:
+    path = Path(app.config["PERSIST_ROOT"]) / "staging"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _public_addons_dir() -> Path:
+    path = Path(app.config["PUBLIC_ROOT"]) / "addons"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 init_db()
@@ -253,8 +273,7 @@ def add_addon() -> Any:
             flash("Invalid package filename.", "error")
             return render_template("addon_form.html", mode="new")
 
-        storage_dir = Path(app.config["PERSIST_ROOT"]) / "packages"
-        storage_dir.mkdir(parents=True, exist_ok=True)
+        storage_dir = _packages_dir()
         target = storage_dir / f"{addon_id}.pak"
         upload_dir = Path(app.config["UPLOAD_FOLDER"]) / uuid.uuid4().hex
         upload_dir.mkdir(parents=True, exist_ok=True)
@@ -333,7 +352,7 @@ def edit_addon(addon_id: int) -> Any:
 
         if package_file and package_file.filename:
             safe_name = secure_filename(package_file.filename)
-            target = Path(app.config["PERSIST_ROOT"]) / "packages" / f"{addon_id_value}.pak"
+            target = _packages_dir() / f"{addon_id_value}.pak"
             upload_dir = Path(app.config["UPLOAD_FOLDER"]) / uuid.uuid4().hex
             upload_dir.mkdir(parents=True, exist_ok=True)
             upload_source = upload_dir / safe_name
@@ -382,8 +401,7 @@ def publish_addon(addon_id: int) -> Any:
         if addon["package_sha256"] and addon["package_sha256"] != package_info["sha256"]:
             raise ValueError("Stored package hash does not match the file on disk")
 
-        public_dir = Path(app.config["PUBLIC_ROOT"]) / "addons"
-        public_dir.mkdir(parents=True, exist_ok=True)
+        public_dir = _public_addons_dir()
         public_file = public_dir / f"{addon['addon_id']}.pak"
         tmp_file = public_file.with_name(public_file.name + ".tmp")
         shutil.copyfile(package_path, tmp_file)
@@ -436,7 +454,7 @@ def public_catalog() -> Any:
 
 @app.route("/addons/<path:filename>")
 def public_addon(filename: str) -> Any:
-    safe_root = Path(app.config["PUBLIC_ROOT"]) / "addons"
+    safe_root = _public_addons_dir()
     return send_from_directory(str(safe_root), filename)
 
 
