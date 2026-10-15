@@ -156,6 +156,8 @@ python app.py doctor
 
 It reports the resolved database path, runtime UID/GID, and basic read/write readiness checks without modifying data.
 
+On normal startup, the container also prints a single JSON banner to Docker logs with the resolved paths and UID/GID to make Unraid troubleshooting easier.
+
 ### Unraid troubleshooting
 
 If the container fails before the Web UI appears, check the logs:

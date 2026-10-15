@@ -248,6 +248,13 @@ class AdminWorkflowTests(unittest.TestCase):
         self._login()
         self.assertEqual(self.app.get("/doctor").status_code, 200)
 
+    def test_startup_banner_and_doctor_command(self):
+        from app import log_startup_banner, startup_preflight
+        ok, issues = startup_preflight()
+        self.assertTrue(ok)
+        self.assertEqual(issues, [])
+        log_startup_banner()
+
 
 if __name__ == "__main__":
     unittest.main()

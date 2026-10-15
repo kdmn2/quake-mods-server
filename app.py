@@ -190,6 +190,29 @@ def startup_preflight() -> Tuple[bool, list[str]]:
     return True, issues
 
 
+def log_startup_banner() -> None:
+    try:
+        db_path = _resolve_db_path()
+    except Exception:
+        db_path = Path(app.config["DB_PATH"] or Path(app.config["PERSIST_ROOT"]) / "addons.sqlite3")
+    print(
+        json.dumps(
+            {
+                "event": "startup",
+                "version": APP_VERSION,
+                "uid": os.getuid() if hasattr(os, "getuid") else None,
+                "gid": os.getgid() if hasattr(os, "getgid") else None,
+                "persist_root": app.config["PERSIST_ROOT"],
+                "public_root": app.config["PUBLIC_ROOT"],
+                "upload_root": app.config["UPLOAD_FOLDER"],
+                "db_path": str(db_path),
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+
+
 @app.route("/doctor")
 def doctor() -> Any:
     require_auth()
@@ -594,6 +617,7 @@ def main() -> int:
         print(json.dumps(report, indent=2, sort_keys=True))
         return 0 if ok else 1
     ok, issues = startup_preflight()
+    log_startup_banner()
     if not ok:
         print("Startup preflight failed:", file=sys.stderr)
         for issue in issues:
