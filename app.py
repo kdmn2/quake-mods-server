@@ -36,14 +36,37 @@ app.config.update(
 LOCK = threading.RLock()
 
 
+def _db_path_candidates() -> list[Path]:
+    persist_root = Path(app.config["PERSIST_ROOT"])
+    candidates: list[Path] = []
+    configured = str(app.config.get("DB_PATH") or "").strip()
+    if configured:
+        candidates.append(Path(configured))
+    candidates.append(persist_root / "addons.sqlite3")
+    candidates.append(Path(app.config["UPLOAD_FOLDER"]) / "addons.sqlite3")
+    return candidates
+
+
+def _resolve_db_path(ensure_parent: bool = True) -> Path:
+    last_error: Exception | None = None
+    for candidate in _db_path_candidates():
+        try:
+            if ensure_parent:
+                candidate.parent.mkdir(parents=True, exist_ok=True)
+            return candidate
+        except Exception as exc:
+            last_error = exc
+    if last_error:
+        raise PermissionError(f"Unable to prepare any SQLite database path: {last_error}") from last_error
+    raise PermissionError("Unable to resolve SQLite database path")
+
+
 def ensure_dirs() -> None:
     persist_root = Path(app.config["PERSIST_ROOT"])
-    db_path = Path(app.config["DB_PATH"]) if app.config.get("DB_PATH") else persist_root / "addons.sqlite3"
     for p in [
         app.config["UPLOAD_FOLDER"],
         persist_root,
         app.config["PUBLIC_ROOT"],
-        db_path.parent,
     ]:
         try:
             Path(p).mkdir(parents=True, exist_ok=True)
@@ -56,8 +79,8 @@ ensure_dirs()
 
 def get_db() -> sqlite3.Connection:
     ensure_dirs()
-    db_path = Path(app.config["DB_PATH"]) if app.config.get("DB_PATH") else Path(app.config["PERSIST_ROOT"]) / "addons.sqlite3"
-    conn = sqlite3.connect(db_path, timeout=30, isolation_level=None)
+    db_path = _resolve_db_path()
+    conn = sqlite3.connect(str(db_path), timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
