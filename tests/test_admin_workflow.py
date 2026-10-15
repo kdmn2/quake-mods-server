@@ -52,6 +52,12 @@ class AdminWorkflowTests(unittest.TestCase):
         payload = b"PACK" + struct.pack("<II", 12, len(records)) + bytes(records)
         path.write_bytes(payload)
 
+    def _make_zip(self, path: Path, files: dict[str, bytes]) -> None:
+        import zipfile
+        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for name, data in files.items():
+                zf.writestr(name, data)
+
     def test_admin_login_and_publish(self):
         self._login()
         self.assertEqual(self.app.get("/dashboard").status_code, 200)
@@ -136,6 +142,54 @@ class AdminWorkflowTests(unittest.TestCase):
         )
         self.assertIn(b"Package rejected", res.data)
         self.assertEqual(json.loads(self.app.get("/content.json").data.decode("utf-8"))["addons"], [])
+
+    def test_zip_upload_is_repacked_to_pak(self):
+        self._login()
+        zip_path = self.tmp / "sample.zip"
+        self._make_zip(zip_path, {"maps/e1m1.bsp": b"abc", "progs.dat": b"def"})
+        res = self.app.post(
+            "/addons/new",
+            data={
+                "title": "Zip Mod",
+                "addon_id": "zipmod",
+                "gamedir": "zipmod",
+                "author": "Tester",
+                "date": "2026/10/15",
+                "description": "ZIP upload",
+                "package": (zip_path.open("rb"), "source.zip"),
+                "csrf_token": self._csrf(),
+            },
+            content_type="multipart/form-data",
+            follow_redirects=True,
+        )
+        self.assertIn(b"repacked into a Quake PAK", res.data)
+        conn = get_db()
+        row = conn.execute("SELECT * FROM addons WHERE addon_id = ?", ("zipmod",)).fetchone()
+        conn.close()
+        self.assertIsNotNone(row)
+        self.assertTrue(Path(row["package_path"]).exists())
+        self.assertEqual(Path(row["package_path"]).read_bytes()[:4], b"PACK")
+
+    def test_content_based_detection_not_extension_based(self):
+        self._login()
+        masquerade = self.tmp / "fake.pak"
+        self._make_zip(masquerade, {"maps/e1m1.bsp": b"abc"})
+        res = self.app.post(
+            "/addons/new",
+            data={
+                "title": "Masquerade",
+                "addon_id": "fakezip",
+                "gamedir": "fakezip",
+                "author": "Tester",
+                "date": "2026/10/15",
+                "description": "Looks like pak but is zip",
+                "package": (masquerade.open("rb"), "fake.pak"),
+                "csrf_token": self._csrf(),
+            },
+            content_type="multipart/form-data",
+            follow_redirects=True,
+        )
+        self.assertIn(b"repacked into a Quake PAK", res.data)
 
     def test_unauthorized_admin_actions_rejected(self):
         self.assertEqual(self.app.get("/dashboard").status_code, 403)

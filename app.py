@@ -16,7 +16,7 @@ from werkzeug.exceptions import BadRequest, Forbidden, NotFound
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
-from tools.catalog import validate_package, validate_pak_paths
+from tools.catalog import detect_package_format, repack_zip_to_pak, validate_package, validate_pak_paths
 
 app = Flask(__name__)
 app.config.update(
@@ -256,9 +256,22 @@ def add_addon() -> Any:
         storage_dir = Path(app.config["PERSIST_ROOT"]) / "packages"
         storage_dir.mkdir(parents=True, exist_ok=True)
         target = storage_dir / f"{addon_id}.pak"
+        upload_dir = Path(app.config["UPLOAD_FOLDER"]) / uuid.uuid4().hex
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        upload_source = upload_dir / safe_name
 
         try:
-            package_file.save(target)
+            package_file.save(upload_source)
+            detected = detect_package_format(upload_source)
+            if detected == "zip":
+                repack_zip_to_pak(upload_source, target)
+                conversion_msg = "Uploaded ZIP was repacked into a Quake PAK."
+            elif detected == "pak":
+                shutil.copy2(upload_source, target)
+                conversion_msg = "Uploaded PAK was stored unchanged."
+            else:
+                raise ValueError(f"Unsupported package format for {safe_name!r}; expected a ZIP or Quake PAK")
+
             package_info = validate_package(target)
             with db_txn() as conn:
                 if conn.execute("SELECT 1 FROM addons WHERE addon_id = ?", (addon_id,)).fetchone():
@@ -279,8 +292,10 @@ def add_addon() -> Any:
             target.unlink(missing_ok=True)
             flash(f"Package rejected: {exc}", "error")
             return render_template("addon_form.html", mode="new")
+        finally:
+            shutil.rmtree(upload_dir, ignore_errors=True)
 
-        flash("Add-on saved as a draft. Review and publish when ready.", "success")
+        flash(f"{conversion_msg} Add-on saved as a draft. Review and publish when ready.", "success")
         return redirect(url_for("dashboard"))
     return render_template("addon_form.html", mode="new")
 
@@ -319,16 +334,28 @@ def edit_addon(addon_id: int) -> Any:
         if package_file and package_file.filename:
             safe_name = secure_filename(package_file.filename)
             target = Path(app.config["PERSIST_ROOT"]) / "packages" / f"{addon_id_value}.pak"
+            upload_dir = Path(app.config["UPLOAD_FOLDER"]) / uuid.uuid4().hex
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            upload_source = upload_dir / safe_name
             try:
-                package_file.save(target)
+                package_file.save(upload_source)
+                detected = detect_package_format(upload_source)
+                if detected == "zip":
+                    repack_zip_to_pak(upload_source, target)
+                elif detected == "pak":
+                    shutil.copy2(upload_source, target)
+                else:
+                    raise ValueError(f"Unsupported package format for {safe_name!r}; expected a ZIP or Quake PAK")
                 package_info = validate_package(target)
             except (OSError, ValueError) as exc:
                 target.unlink(missing_ok=True)
                 flash(f"Package rejected: {exc}", "error")
                 return render_template("addon_form.html", mode="edit", addon=dict(addon))
+            finally:
+                shutil.rmtree(upload_dir, ignore_errors=True)
             conn.execute(
                 "UPDATE addons SET package_name = ?, package_path = ?, package_size = ?, package_sha256 = ?, package_mtime = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (safe_name, str(target), package_info["size"], package_info["sha256"], package_info["mtime"], addon_id),
+                (f"{addon_id_value}.pak", str(target), package_info["size"], package_info["sha256"], package_info["mtime"], addon_id),
             )
 
         conn.execute(

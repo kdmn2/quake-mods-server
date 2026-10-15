@@ -181,7 +181,8 @@ PORT: "5000"
 
 1. Sign in to the admin GUI.
 2. Click Upload.
-3. Upload a Quake archive.
+3. Upload a Quake `.pak` archive or a `.zip` mod bundle.
+   - ZIP uploads are safely repacked into a Quake PAK before publication.
 4. Review the metadata:
    - ID
    - title

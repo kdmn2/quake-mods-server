@@ -5,6 +5,8 @@ import hashlib
 import json
 import os
 import re
+import struct
+import zipfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
@@ -119,6 +121,70 @@ def validate_pak_paths(path: Path) -> None:
         pos += 8
     if entries == 0:
         raise ValueError(f"{path.name!r} contains no archive entries")
+
+
+def detect_package_format(path: Path) -> str:
+    with open(path, "rb") as fh:
+        sig = fh.read(4)
+    if sig == b"PACK":
+        return "pak"
+    if sig == b"PK\x03\x04":
+        return "zip"
+    return "unknown"
+
+
+def _validate_zip_member_name(name: str) -> str:
+    name = name.replace("\\", "/")
+    if not name or name.endswith("/"):
+        raise ValueError(f"Invalid ZIP entry name: {name!r}")
+    if name.startswith("/") or name.startswith("../") or "/../" in name or name == ".." or "/.." in name.split("/"):
+        raise ValueError(f"Unsafe ZIP entry path: {name!r}")
+    if any(part in ("", ".", "..") for part in name.split("/")):
+        raise ValueError(f"Unsafe ZIP entry path: {name!r}")
+    return name
+
+
+def repack_zip_to_pak(source: Path, target: Path, max_files: int = 5000, max_uncompressed_size: int = 512 * 1024 * 1024) -> Dict[str, Any]:
+    source = Path(source)
+    target = Path(target)
+    if zipfile.is_zipfile(source) is False:
+        raise ValueError(f"{source.name!r} is not a valid ZIP archive")
+
+    entries: list[tuple[str, bytes]] = []
+    total_uncompressed = 0
+    with zipfile.ZipFile(source, "r") as zf:
+        infos = [info for info in zf.infolist() if not info.is_dir()]
+        if not infos:
+            raise ValueError(f"{source.name!r} does not contain any files")
+        if len(infos) > max_files:
+            raise ValueError(f"ZIP has too many files ({len(infos)} > {max_files})")
+        for info in infos:
+            if info.flag_bits & 0x1:
+                raise ValueError(f"Encrypted ZIP entries are not supported: {info.filename!r}")
+            if info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+                raise ValueError(f"Unsupported ZIP compression method for {info.filename!r}")
+            name = _validate_zip_member_name(info.filename)
+            data = zf.read(info)
+            total_uncompressed += len(data)
+            if total_uncompressed > max_uncompressed_size:
+                raise ValueError(f"ZIP uncompressed data exceeds limit ({total_uncompressed} > {max_uncompressed_size})")
+            entries.append((name, data))
+
+    dir_offset = 12
+    file_blobs = bytearray()
+    dir_records = bytearray()
+    for name, data in entries:
+        file_offset = dir_offset + len(file_blobs)
+        file_blobs.extend(data)
+        name_bytes = name.encode("utf-8")
+        if len(name_bytes) > 56:
+            raise ValueError(f"Entry name too long for PAK: {name!r}")
+        dir_records.extend(name_bytes.ljust(56, b"\0"))
+        dir_records.extend(struct.pack("<II", file_offset, len(data)))
+
+    header = b"PACK" + struct.pack("<II", dir_offset + len(file_blobs), len(dir_records))
+    atomic_write(target, header + file_blobs + dir_records)
+    return {"entries": len(entries), "size": target.stat().st_size, "sha256": _compute_sha256(target)}
 
 
 def validate_package(path: Path) -> Dict[str, Any]:
