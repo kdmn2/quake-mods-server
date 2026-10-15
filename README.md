@@ -21,7 +21,7 @@ This app intentionally matches that contract exactly: administrative metadata is
 
 - Flask app serves admin pages and public catalog/download endpoints.
 - SQLite stores add-on records, metadata, and admin account state.
-- On publish, the app writes a generated `content.json` and copies package files into a public directory.
+- On publish, the app writes a generated `content.json` and copies package files into a public directory atomically.
 - Public catalog/download routes remain separate from admin routes.
 - No database server, Redis, or frontend framework is required.
 
@@ -58,7 +58,7 @@ ghcr.io/kdmn2/quake-mods-server:latest
 
 1. Open Unraid and go to Docker > Add Container.
 2. Import `unraid/templates/ironwail-addons.xml` as a custom template.
-3. Leave the repository as `ghcr.io/kdmn2/quake-mods-server:latest` unless you intentionally want to pin a specific release tag.
+3. Leave the repository as `ghcr.io/kdmn2/quake-mods-server:latest` unless you intentionally want to pin a specific release tag. If you pin, use a version tag such as `ghcr.io/kdmn2/quake-mods-server:v1.2.3`.
 4. Set the host port (default `8080`) and the three persistent data paths:
    - `/mnt/user/appdata/ironwail-addons/data`
    - `/mnt/user/appdata/ironwail-addons/public`
@@ -152,7 +152,7 @@ The app itself does not terminate TLS; it expects your reverse proxy to handle i
 
 ### 6) Portainer / Docker Compose compatibility
 
-The repo also contains a Portainer-friendly Compose file at `docker-compose.portainer.yml` for manual deployments. It uses the same env vars and bind mounts as the Unraid template.
+The repo also contains a Portainer-friendly Compose file at `docker-compose.portainer.yml` for manual deployments. It uses the same env vars and bind mounts as the Unraid template, but the image field is a placeholder that must be replaced with a real registry path before use.
 
 Example env values:
 
@@ -272,7 +272,6 @@ pytest -q
 
 ## Not yet implemented / intentionally out of scope
 
-- full CSRF protection is not yet hardened beyond the base Flask session pattern
 - no SSO or external auth providers
 - no multi-tenant or fine-grained role system
 - no automatic sidecar worker processes for long-running archive validation

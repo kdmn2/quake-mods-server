@@ -2,30 +2,37 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
+import shutil
 import tempfile
+import sqlite3
+import threading
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Iterator
 
 from flask import Flask, flash, jsonify, redirect, render_template, request, send_from_directory, session, url_for
-from werkzeug.exceptions import Forbidden, NotFound
+from werkzeug.exceptions import BadRequest, Forbidden, NotFound
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
-from tools.catalog import validate_pak_paths
+from tools.catalog import validate_package, validate_pak_paths
 
 app = Flask(__name__)
 app.config.update(
     SECRET_KEY=os.environ.get("APP_SECRET_KEY", "dev-secret-change-me"),
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
-    MAX_CONTENT_LENGTH=128 * 1024 * 1024,
+    MAX_CONTENT_LENGTH=int(os.environ.get("MAX_CONTENT_LENGTH", str(128 * 1024 * 1024))),
     UPLOAD_FOLDER=os.environ.get("UPLOAD_FOLDER", "/tmp/quake-addons-upload"),
     PERSIST_ROOT=os.environ.get("PERSIST_ROOT", "/tmp/quake-addons-data"),
     PUBLIC_ROOT=os.environ.get("PUBLIC_ROOT", "/tmp/quake-addons-public"),
     BASE_URL=os.environ.get("PUBLIC_BASE_URL", "http://localhost:8080"),
+    ADMIN_PORT=os.environ.get("PORT", "5000"),
 )
+
+
+LOCK = threading.RLock()
 
 
 def ensure_dirs() -> None:
@@ -39,7 +46,10 @@ def ensure_dirs() -> None:
         Path(app.config["PERSIST_ROOT"]) / "staging",
         Path(app.config["PUBLIC_ROOT"]) / "addons",
     ]:
-        Path(p).mkdir(parents=True, exist_ok=True)
+        try:
+            Path(p).mkdir(parents=True, exist_ok=True)
+        except PermissionError as exc:
+            raise PermissionError(f"Cannot create required directory {p}: {exc}") from exc
 
 
 ensure_dirs()
@@ -48,9 +58,24 @@ ensure_dirs()
 def get_db() -> sqlite3.Connection:
     ensure_dirs()
     db_path = Path(app.config["PERSIST_ROOT"]) / "db" / "addons.sqlite3"
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+@contextmanager
+def db_txn() -> Iterator[sqlite3.Connection]:
+    conn = get_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def init_db() -> None:
@@ -78,8 +103,9 @@ def init_db() -> None:
             package_name TEXT NOT NULL,
             package_path TEXT NOT NULL,
             package_size INTEGER NOT NULL,
+            package_sha256 TEXT,
+            package_mtime INTEGER,
             manifest_path TEXT,
-            sha256 TEXT,
             published INTEGER NOT NULL DEFAULT 0,
             draft INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -88,6 +114,11 @@ def init_db() -> None:
         )
         """
     )
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(addons)").fetchall()}
+    if "package_sha256" not in existing:
+        conn.execute("ALTER TABLE addons ADD COLUMN package_sha256 TEXT")
+    if "package_mtime" not in existing:
+        conn.execute("ALTER TABLE addons ADD COLUMN package_mtime INTEGER")
     conn.commit()
     conn.close()
 
@@ -104,8 +135,6 @@ def make_csrf_token() -> str:
 
 
 def check_csrf() -> None:
-    if app.config.get("TESTING"):
-        return
     if request.method == "POST":
         form_token = request.form.get("csrf_token")
         session_token = session.get("csrf_token")
@@ -116,9 +145,8 @@ def check_csrf() -> None:
 @app.before_request
 def ensure_csrf() -> None:
     if request.path.startswith("/admin") or request.path.startswith("/dashboard") or request.path.startswith("/addons/"):
-        if request.method == "POST":
+        if request.method == "POST" and request.path != "/content.json":
             check_csrf()
-    if request.path.startswith("/admin") or request.path.startswith("/dashboard") or request.path.startswith("/addons/"):
         make_csrf_token()
 
 
@@ -226,33 +254,28 @@ def add_addon() -> Any:
         storage_dir.mkdir(parents=True, exist_ok=True)
         target = storage_dir / f"{addon_id}.pak"
 
-        package_file.save(target)
         try:
-            validate_pak_paths(target)
-        except Exception as exc:  # noqa: BLE001
+            package_file.save(target)
+            package_info = validate_package(target)
+            with db_txn() as conn:
+                if conn.execute("SELECT 1 FROM addons WHERE addon_id = ?", (addon_id,)).fetchone():
+                    raise sqlite3.IntegrityError("duplicate addon id")
+                if conn.execute("SELECT 1 FROM addons WHERE gamedir = ?", (gamedir,)).fetchone():
+                    raise sqlite3.IntegrityError("duplicate gamedir")
+                conn.execute(
+                    """
+                    INSERT INTO addons (
+                        addon_id, title, gamedir, author, date, description,
+                        package_name, package_path, package_size, package_sha256, package_mtime,
+                        published, draft, manifest_path
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, NULL)
+                    """,
+                    (addon_id, title, gamedir, author, date, description, package_info["filename"], str(target), package_info["size"], package_info["sha256"], package_info["mtime"]),
+                )
+        except (sqlite3.IntegrityError, OSError, ValueError) as exc:
             target.unlink(missing_ok=True)
             flash(f"Package rejected: {exc}", "error")
             return render_template("addon_form.html", mode="new")
-
-        conn = get_db()
-        try:
-            conn.execute(
-                """
-                INSERT INTO addons (
-                    addon_id, title, gamedir, author, date, description,
-                    package_name, package_path, package_size, published, draft,
-                    manifest_path, sha256
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, NULL, NULL)
-                """,
-                (addon_id, title, gamedir, author, date, description, safe_name, str(target), target.stat().st_size),
-            )
-            conn.commit()
-        except sqlite3.IntegrityError:
-            target.unlink(missing_ok=True)
-            flash("That add-on ID already exists. Choose a unique one.", "error")
-            return render_template("addon_form.html", mode="new")
-        finally:
-            conn.close()
 
         flash("Add-on saved as a draft. Review and publish when ready.", "success")
         return redirect(url_for("dashboard"))
@@ -293,24 +316,22 @@ def edit_addon(addon_id: int) -> Any:
         if package_file and package_file.filename:
             safe_name = secure_filename(package_file.filename)
             target = Path(app.config["PERSIST_ROOT"]) / "packages" / f"{addon_id_value}.pak"
-            package_file.save(target)
             try:
-                validate_pak_paths(target)
-            except Exception as exc:  # noqa: BLE001
+                package_file.save(target)
+                package_info = validate_package(target)
+            except (OSError, ValueError) as exc:
                 target.unlink(missing_ok=True)
                 flash(f"Package rejected: {exc}", "error")
                 return render_template("addon_form.html", mode="edit", addon=dict(addon))
             conn.execute(
-                "UPDATE addons SET package_name = ?, package_path = ?, package_size = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (safe_name, str(target), target.stat().st_size, addon_id),
+                "UPDATE addons SET package_name = ?, package_path = ?, package_size = ?, package_sha256 = ?, package_mtime = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (safe_name, str(target), package_info["size"], package_info["sha256"], package_info["mtime"], addon_id),
             )
 
         conn.execute(
             "UPDATE addons SET title = ?, addon_id = ?, gamedir = ?, author = ?, date = ?, description = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (title, addon_id_value, gamedir, author, date, description, addon_id),
         )
-        conn.commit()
-        conn.close()
         flash("Add-on updated.", "success")
         return redirect(url_for("addon_detail", addon_id=addon_id))
     conn.close()
@@ -320,31 +341,28 @@ def edit_addon(addon_id: int) -> Any:
 @app.route("/addons/<int:addon_id>/publish", methods=["POST"])
 def publish_addon(addon_id: int) -> Any:
     require_auth()
-    conn = get_db()
-    addon = conn.execute("SELECT * FROM addons WHERE id = ?", (addon_id,)).fetchone()
-    if not addon:
-        conn.close()
-        raise NotFound()
-    package_path = Path(addon["package_path"])
-    if not package_path.exists():
-        conn.close()
-        flash("Package file is missing; re-upload or re-save the package before publishing.", "error")
-        return redirect(url_for("addon_detail", addon_id=addon_id))
+    with db_txn() as conn:
+        addon = conn.execute("SELECT * FROM addons WHERE id = ?", (addon_id,)).fetchone()
+        if not addon:
+            raise NotFound()
+        package_path = Path(addon["package_path"])
+        if not package_path.exists():
+            raise FileNotFoundError("Package file is missing")
+        package_info = validate_package(package_path)
+        if addon["package_sha256"] and addon["package_sha256"] != package_info["sha256"]:
+            raise ValueError("Stored package hash does not match the file on disk")
 
-    public_dir = Path(app.config["PUBLIC_ROOT"]) / "addons"
-    public_dir.mkdir(parents=True, exist_ok=True)
-    public_file = public_dir / f"{addon['addon_id']}.pak"
-    with tempfile.NamedTemporaryFile(dir=str(public_dir), delete=False) as tmp:
-        tmp.write(package_path.read_bytes())
-        tmp_path = tmp.name
-    os.replace(tmp_path, public_file)
+        public_dir = Path(app.config["PUBLIC_ROOT"]) / "addons"
+        public_dir.mkdir(parents=True, exist_ok=True)
+        public_file = public_dir / f"{addon['addon_id']}.pak"
+        tmp_file = public_file.with_name(public_file.name + ".tmp")
+        shutil.copyfile(package_path, tmp_file)
+        os.replace(tmp_file, public_file)
 
-    conn.execute(
-        "UPDATE addons SET published = 1, draft = 0, manifest_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-        (str(public_file), addon_id),
-    )
-    conn.commit()
-    conn.close()
+        conn.execute(
+            "UPDATE addons SET published = 1, draft = 0, package_size = ?, package_sha256 = ?, package_mtime = ?, manifest_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (package_info["size"], package_info["sha256"], package_info["mtime"], str(public_file), addon_id),
+        )
     generate_catalog()
     flash("Add-on published and catalog regenerated.", "success")
     return redirect(url_for("dashboard"))
@@ -353,10 +371,8 @@ def publish_addon(addon_id: int) -> Any:
 @app.route("/addons/<int:addon_id>/unpublish", methods=["POST"])
 def unpublish_addon(addon_id: int) -> Any:
     require_auth()
-    conn = get_db()
-    conn.execute("UPDATE addons SET published = 0, draft = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (addon_id,))
-    conn.commit()
-    conn.close()
+    with db_txn() as conn:
+        conn.execute("UPDATE addons SET published = 0, draft = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (addon_id,))
     generate_catalog()
     flash("Add-on unpublished; it is no longer in the public catalog.", "success")
     return redirect(url_for("dashboard"))
@@ -365,18 +381,16 @@ def unpublish_addon(addon_id: int) -> Any:
 @app.route("/addons/<int:addon_id>/delete", methods=["POST"])
 def delete_addon(addon_id: int) -> Any:
     require_auth()
-    conn = get_db()
-    addon = conn.execute("SELECT * FROM addons WHERE id = ?", (addon_id,)).fetchone()
-    if addon:
-        public_file = Path(app.config["PUBLIC_ROOT"]) / "addons" / f"{addon['addon_id']}.pak"
-        if public_file.exists():
-            public_file.unlink(missing_ok=True)
-        package_file = Path(addon["package_path"])
-        if package_file.exists():
-            package_file.unlink(missing_ok=True)
-        conn.execute("DELETE FROM addons WHERE id = ?", (addon_id,))
-        conn.commit()
-    conn.close()
+    with db_txn() as conn:
+        addon = conn.execute("SELECT * FROM addons WHERE id = ?", (addon_id,)).fetchone()
+        if addon:
+            public_file = Path(app.config["PUBLIC_ROOT"]) / "addons" / f"{addon['addon_id']}.pak"
+            if public_file.exists():
+                public_file.unlink(missing_ok=True)
+            package_file = Path(addon["package_path"])
+            if package_file.exists():
+                package_file.unlink(missing_ok=True)
+            conn.execute("DELETE FROM addons WHERE id = ?", (addon_id,))
     generate_catalog()
     flash("Add-on deleted.", "success")
     return redirect(url_for("dashboard"))

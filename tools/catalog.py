@@ -121,6 +121,20 @@ def validate_pak_paths(path: Path) -> None:
         raise ValueError(f"{path.name!r} contains no archive entries")
 
 
+def validate_package(path: Path) -> Dict[str, Any]:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Package file not found: {path}")
+    info = parse_pak_header(path)
+    validate_pak_paths(path)
+    return {
+        "size": info["size"],
+        "sha256": info["sha256"],
+        "mtime": int(path.stat().st_mtime),
+        "filename": path.name,
+    }
+
+
 def _read_metadata_file(path: Path) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as fh:
         data = json.load(fh)
@@ -246,10 +260,6 @@ def compute_manifest(base_url: str, metadata_dir: Path, public_dir: Path) -> Dic
     addons = collect_metadata(metadata_dir)
     manifest = {"addons": []}
     for addon in addons:
-        if base_url:
-            download_url = f"{base_url}/{addon['download']}"
-        else:
-            download_url = addon["download"]
         entry = {
             "download": addon["download"],
             "gamedir": addon["gamedir"],

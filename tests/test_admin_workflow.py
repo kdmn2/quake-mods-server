@@ -1,11 +1,10 @@
 import json
 import os
 import tempfile
-import time
 import unittest
 from pathlib import Path
 
-from app import app
+from app import app, get_db, generate_password_hash, init_db
 
 
 class AdminWorkflowTests(unittest.TestCase):
@@ -26,27 +25,36 @@ class AdminWorkflowTests(unittest.TestCase):
         self._create_user()
 
     def _create_user(self):
-        from app import get_db, generate_password_hash, init_db
         init_db()
         conn = get_db()
         conn.execute("DELETE FROM users")
+        conn.execute("DELETE FROM addons")
         conn.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", ("admin", generate_password_hash("secret")))
         conn.commit()
         conn.close()
 
-    def _login(self):
-        return self.app.post("/login", data={"username": "admin", "password": "secret"}, follow_redirects=True)
+    def _csrf(self):
+        self.app.get("/login")
+        with self.app.session_transaction() as sess:
+            return sess.get("csrf_token")
 
-    def _make_pak(self, path: Path) -> None:
+    def _login(self):
+        return self.app.post("/login", data={"username": "admin", "password": "secret", "csrf_token": self._csrf()}, follow_redirects=True)
+
+    def _make_pak(self, path: Path, names=None) -> None:
         import struct
-        record = b"maps/e1m1.bsp".ljust(56, b"\0") + struct.pack("<II", 0, 0) + struct.pack("<I", 0)
-        payload = b"PACK" + struct.pack("<II", 12, len(record)) + record
+        names = names or ["maps/e1m1.bsp"]
+        records = bytearray()
+        for name in names:
+            encoded = name.encode("utf-8")
+            record = encoded.ljust(56, b"\0") + struct.pack("<II", 0, 0) + struct.pack("<I", 0)
+            records.extend(record)
+        payload = b"PACK" + struct.pack("<II", 12, len(records)) + bytes(records)
         path.write_bytes(payload)
 
     def test_admin_login_and_publish(self):
         self._login()
-        res = self.app.get("/dashboard")
-        self.assertEqual(res.status_code, 200)
+        self.assertEqual(self.app.get("/dashboard").status_code, 200)
 
         pkg = self.tmp / "sample.pak"
         self._make_pak(pkg)
@@ -60,48 +68,34 @@ class AdminWorkflowTests(unittest.TestCase):
                 "date": "2026/10/15",
                 "description": "Example",
                 "package": (pkg.open("rb"), "samplemod.pak"),
-                "csrf_token": "test-token",
+                "csrf_token": self._csrf(),
             },
             content_type="multipart/form-data",
             follow_redirects=True,
         )
         self.assertIn(b"Add-on saved as a draft", res.data)
 
-        # Add package as a file.
-        res = self.app.post(
-            "/addons/new",
-            data={
-                "title": "Sample Mod 2",
-                "addon_id": "samplemod2",
-                "gamedir": "samplemod2",
-                "author": "Tester",
-                "date": "2026/10/15",
-                "description": "Example",
-                "package": (pkg.open("rb"), "samplemod2.pak"),
-                "csrf_token": "test-token",
-            },
-            content_type="multipart/form-data",
-            follow_redirects=True,
-        )
-        self.assertEqual(res.status_code, 200)
-
-        conn = __import__("app").get_db()
-        row = conn.execute("SELECT * FROM addons WHERE addon_id = ?", ("samplemod2",)).fetchone()
+        conn = get_db()
+        row = conn.execute("SELECT * FROM addons WHERE addon_id = ?", ("samplemod",)).fetchone()
         self.assertIsNotNone(row)
         conn.close()
 
-        res = self.app.post(f"/addons/{row['id']}/publish", follow_redirects=True)
+        res = self.app.post(f"/addons/{row['id']}/publish", data={"csrf_token": self._csrf()}, follow_redirects=True)
         self.assertIn(b"published", res.data.lower())
 
         catalog = self.app.get("/content.json")
         self.assertEqual(catalog.status_code, 200)
         data = json.loads(catalog.data.decode("utf-8"))
-        self.assertEqual(data["addons"][0]["gamedir"], "samplemod2")
+        self.assertEqual(data["addons"][0]["gamedir"], "samplemod")
+
+        download = self.app.get("/addons/samplemod.pak")
+        self.assertEqual(download.status_code, 200)
+        self.assertEqual(download.data, pkg.read_bytes())
 
     def test_unpublished_draft_not_listed(self):
+        self._login()
         pkg = self.tmp / "draft.pak"
         self._make_pak(pkg)
-        self._login()
         self.app.post(
             "/addons/new",
             data={
@@ -112,7 +106,7 @@ class AdminWorkflowTests(unittest.TestCase):
                 "date": "2026/10/15",
                 "description": "Draft only",
                 "package": (pkg.open("rb"), "draftmod.pak"),
-                "csrf_token": "test-token",
+                "csrf_token": self._csrf(),
             },
             content_type="multipart/form-data",
             follow_redirects=True,
@@ -120,6 +114,66 @@ class AdminWorkflowTests(unittest.TestCase):
         catalog = self.app.get("/content.json")
         data = json.loads(catalog.data.decode("utf-8"))
         self.assertEqual(data["addons"], [])
+
+    def test_invalid_archive_rejected(self):
+        self._login()
+        bad = self.tmp / "bad.pak"
+        bad.write_bytes(b"not a pak")
+        res = self.app.post(
+            "/addons/new",
+            data={
+                "title": "Bad Mod",
+                "addon_id": "badmod",
+                "gamedir": "badmod",
+                "author": "Tester",
+                "date": "2026/10/15",
+                "description": "Bad",
+                "package": (bad.open("rb"), "bad.pak"),
+                "csrf_token": self._csrf(),
+            },
+            content_type="multipart/form-data",
+            follow_redirects=True,
+        )
+        self.assertIn(b"Package rejected", res.data)
+        self.assertEqual(json.loads(self.app.get("/content.json").data.decode("utf-8"))["addons"], [])
+
+    def test_unauthorized_admin_actions_rejected(self):
+        self.assertEqual(self.app.get("/dashboard").status_code, 403)
+        self.assertEqual(self.app.post("/addons/new").status_code, 403)
+
+    def test_duplicate_ids_rejected(self):
+        self._login()
+        pkg = self.tmp / "dup.pak"
+        self._make_pak(pkg)
+        payload = {
+            "title": "Duplicate",
+            "addon_id": "dupmod",
+            "gamedir": "dupmod",
+            "author": "Tester",
+            "date": "2026/10/15",
+            "description": "Dup",
+            "package": (pkg.open("rb"), "dup.pak"),
+            "csrf_token": self._csrf(),
+        }
+        self.app.post("/addons/new", data=payload, content_type="multipart/form-data", follow_redirects=True)
+        pkg2 = self.tmp / "dup2.pak"
+        self._make_pak(pkg2)
+        res = self.app.post(
+            "/addons/new",
+            data={
+                "title": "Duplicate2",
+                "addon_id": "dupmod",
+                "gamedir": "dupmod2",
+                "author": "Tester",
+                "date": "2026/10/15",
+                "description": "Dup2",
+                "package": (pkg2.open("rb"), "dup2.pak"),
+                "csrf_token": self._csrf(),
+            },
+            content_type="multipart/form-data",
+            follow_redirects=True,
+        )
+        self.assertIn(b"Package rejected", res.data)
 
 
 if __name__ == "__main__":
