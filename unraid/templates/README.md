@@ -13,7 +13,7 @@ The template is based on the current repository's Dockerfile and app configurati
 ghcr.io/kdmn2/quake-mods-server:latest
 ```
 
-This means the image is rebuilt and pushed automatically when the repository changes, and the `latest` tag is refreshed from the default branch build.
+This means the image is rebuilt and pushed automatically when the repository changes, and the `latest` tag is refreshed from the default branch build. If GHCR still returns `unauthorized`, the package visibility likely still needs to be set to public in GitHub Packages.
 
 ## Required user changes before Apply
 

@@ -54,6 +54,8 @@ The current image is published automatically to GitHub Container Registry:
 ghcr.io/kdmn2/quake-mods-server:latest
 ```
 
+If GHCR still returns `unauthorized`, the package visibility may still need to be switched to public in GitHub Packages settings.
+
 ### Deploy from Unraid Docker GUI
 
 1. Open Unraid and go to Docker > Add Container.
@@ -153,6 +155,8 @@ The app itself does not terminate TLS; it expects your reverse proxy to handle i
 ### 6) Portainer / Docker Compose compatibility
 
 The repo also contains a Portainer-friendly Compose file at `docker-compose.portainer.yml` for manual deployments. It uses the same env vars and bind mounts as the Unraid template, but the image field is a placeholder that must be replaced with a real registry path before use.
+
+If GHCR requires authentication, log in to `ghcr.io` with a GitHub PAT that has `read:packages` or switch the package visibility to public.
 
 Example env values:
 
