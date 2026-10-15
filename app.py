@@ -8,6 +8,7 @@ import tempfile
 import sqlite3
 import threading
 import uuid
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, Tuple
