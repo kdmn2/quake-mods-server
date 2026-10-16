@@ -1,0 +1,81 @@
+{
+  "zip": {
+    "path": "pun.zip",
+    "embedded_pak_path": "pak0.pak",
+    "embedded_pak_sha256": "7b3838322dc860c3ea5dec5e246e9ecac4b0f75182edeff7b719e16f4f33d874"
+  },
+  "comparisons": {
+    "reference_only_supplied_by_loose": [
+      "maps/pun1.bsp",
+      "maps/pun1.lit",
+      "maps/pun1.map",
+      "maps/pun2.bsp",
+      "maps/pun2.lit",
+      "maps/pun2.map",
+      "maps/pun3.bsp",
+      "maps/pun3.lit",
+      "maps/pun3.map",
+      "maps/pun4.bsp",
+      "maps/pun4.lit",
+      "maps/pun4.map",
+      "maps/pun5.bsp",
+      "maps/pun5.lit",
+      "maps/pun5.map",
+      "maps/start.bsp",
+      "maps/start.lit",
+      "maps/start.map",
+      "music/track93.ogg",
+      "music/track94.ogg",
+      "music/track95.ogg",
+      "music/track96.ogg",
+      "music/track97.ogg",
+      "music/track98.ogg",
+      "progs.dat",
+      "sound/ambience/dronehum1.wav",
+      "sound/ambience/dronesewer1.wav",
+      "sound/ambience/dronewind1.wav",
+      "sound/ambience/waterriver1.wav",
+      "sound/misc/energypulse1.wav"
+    ],
+    "same_path_diff_content_explained_by_loose": [],
+    "embedded_only_still_missing": [
+      "progs/shalrath.mdl",
+      "progs/v_axe.mdl"
+    ],
+    "reference_only_unexplained": [
+      "gfx/env/pun_bk.png",
+      "gfx/env/pun_dn.png",
+      "gfx/env/pun_ft.png",
+      "gfx/env/pun_lf.png",
+      "gfx/env/pun_rt.png",
+      "gfx/env/pun_up.png",
+      "mapdb.json",
+      "progs/kelp.mdl",
+      "progs/v_axe2.mdl",
+      "quake.rc",
+      "sound/ambience/guts.wav",
+      "sound/doors/locked5.wav",
+      "sound/misc/w_under.wav",
+      "sound/misc/w_under2.wav",
+      "sound/weapons/axhit1screech.wav",
+      "sound/weapons/axhit2screech.wav"
+    ],
+    "reference_reproducible": false,
+    "loose_only": [
+      "gfx/env/bal_swampn_bk.tga",
+      "gfx/env/bal_swampn_dn.tga",
+      "gfx/env/bal_swampn_ft.tga",
+      "gfx/env/bal_swampn_lf.tga",
+      "gfx/env/bal_swampn_rt.tga",
+      "gfx/env/bal_swampn_up.tga",
+      "gfx/env/purplenebula_bk.tga",
+      "gfx/env/purplenebula_dn.tga",
+      "gfx/env/purplenebula_ft.tga",
+      "gfx/env/purplenebula_lf.tga",
+      "gfx/env/purplenebula_rt.tga",
+      "gfx/env/purplenebula_up.tga",
+      "progs/misc_smoke.mdl",
+      "pun.txt"
+    ]
+  }
+}

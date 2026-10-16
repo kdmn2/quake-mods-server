@@ -18,7 +18,7 @@ from werkzeug.exceptions import BadRequest, Forbidden, NotFound, RequestEntityTo
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
-from tools.catalog import detect_package_format, repack_zip_to_pak, validate_package, validate_pak_paths
+from tools.catalog import build_single_pak_from_zip, detect_package_format, inspect_zip_release, validate_package, validate_pak_paths
 
 app = Flask(__name__)
 app.config.update(
@@ -81,6 +81,20 @@ def _effective_config() -> Dict[str, str]:
         "PUBLIC_ROOT": str(app.config["PUBLIC_ROOT"]),
         "UPLOAD_FOLDER": str(app.config["UPLOAD_FOLDER"]),
     }
+
+
+def _build_release_package_from_zip(source_path: Path, target: Path, staging_dir: Path) -> dict[str, Any]:
+    layout = inspect_zip_release(source_path)
+    if not layout['embedded_paks'] and not layout['loose']:
+        raise ValueError(f"{source_path.name!r} does not contain any representable files")
+    if layout['has_wrapper'] and len(layout['wrapper_dirs']) > 1:
+        raise ValueError(f"ZIP release has multiple top-level wrapper directories: {layout['wrapper_dirs']}")
+    info = build_single_pak_from_zip(source_path, target)
+    print(
+        f"[import] ZIP release consolidated into single PAK with {len(info['paths'])} entries from {len(layout['embedded_paks'])} embedded PAK(s) and {len(layout['loose'])} loose file(s)",
+        flush=True,
+    )
+    return validate_package(target)
 
 
 def ensure_dirs() -> None:
@@ -466,16 +480,15 @@ def add_addon() -> Any:
             detected = detect_package_format(upload_source)
             print(f"[import] detected {detected} for {safe_name}; staging at {upload_source}", flush=True)
             if detected == "zip":
-                repack_zip_to_pak(upload_source, target)
-                conversion_msg = "Uploaded ZIP was repacked into a Quake PAK."
+                package_info = _build_release_package_from_zip(upload_source, target, upload_dir)
+                conversion_msg = "Uploaded ZIP release was inspected and packaged from its embedded PAK."
             elif detected == "pak":
                 shutil.copy2(upload_source, target)
                 print(f"[import] copied PAK unchanged to {target}", flush=True)
                 conversion_msg = "Uploaded PAK was stored unchanged."
+                package_info = validate_package(target)
             else:
                 raise ValueError(f"Unsupported package format for {safe_name!r}; expected a ZIP or Quake PAK")
-
-            package_info = validate_package(target)
             print(f"[import] validated package {target.name}: size={package_info['size']} sha256={package_info['sha256']}", flush=True)
             with db_txn() as conn:
                 if conn.execute("SELECT 1 FROM addons WHERE addon_id = ?", (addon_id,)).fetchone():
@@ -548,14 +561,13 @@ def edit_addon(addon_id: int) -> Any:
                 package_file.save(upload_source)
                 detected = detect_package_format(upload_source)
                 if detected == "zip":
-                    repack_zip_to_pak(upload_source, target)
+                    package_info = _build_release_package_from_zip(upload_source, target, upload_dir)
                 elif detected == "pak":
                     shutil.copy2(upload_source, target)
+                    package_info = validate_package(target)
                 else:
                     raise ValueError(f"Unsupported package format for {safe_name!r}; expected a ZIP or Quake PAK")
-                package_info = validate_package(target)
             except (OSError, ValueError) as exc:
-                target.unlink(missing_ok=True)
                 flash(f"Package rejected: {exc}", "error")
                 return render_template("addon_form.html", mode="edit", addon=dict(addon))
             finally:
