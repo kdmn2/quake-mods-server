@@ -7,8 +7,8 @@ import os
 import re
 import struct
 import zipfile
-import subprocess
 import tempfile
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
@@ -150,8 +150,7 @@ def _read_zip_entries_with_unzip(source: Path) -> list[tuple[str, bytes]]:
     entries: list[tuple[str, bytes]] = []
     print(f"[zip-import] using system unzip fallback for {source.name}", flush=True)
     with tempfile.TemporaryDirectory(prefix="quake-zip-", dir=str(source.parent)) as tmpdir:
-        cmd = ["unzip", "-qq", "-o", str(source), "-d", tmpdir]
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc = subprocess.run(["unzip", "-qq", "-o", str(source), "-d", tmpdir], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if proc.returncode != 0:
             raise ValueError(f"unzip failed for {source.name!r}: {proc.stderr.strip() or proc.stdout.strip() or 'unknown error'}")
         root = Path(tmpdir)
@@ -173,7 +172,6 @@ def repack_zip_to_pak(source: Path, target: Path, max_files: int = 5000, max_unc
 
     entries: list[tuple[str, bytes]] = []
     total_uncompressed = 0
-    python_zip_failed = False
     with zipfile.ZipFile(source, "r") as zf:
         infos = [info for info in zf.infolist() if not info.is_dir()]
         if not infos:
@@ -189,19 +187,15 @@ def repack_zip_to_pak(source: Path, target: Path, max_files: int = 5000, max_unc
                 with zf.open(info, "r") as fh:
                     data = fh.read()
             except NotImplementedError as exc:
-                python_zip_failed = True
                 print(f"[zip-import] python zipfile could not decode {info.filename}; falling back to unzip", flush=True)
-                break
+                entries = _read_zip_entries_with_unzip(source)
+                return repack_zip_to_pak_from_entries(source, target, entries, max_files, max_uncompressed_size)
             except RuntimeError as exc:
                 raise ValueError(f"Unable to read ZIP entry {info.filename!r}: {exc}") from exc
             total_uncompressed += len(data)
             if total_uncompressed > max_uncompressed_size:
                 raise ValueError(f"ZIP uncompressed data exceeds limit ({total_uncompressed} > {max_uncompressed_size})")
             entries.append((name, data))
-
-    if python_zip_failed:
-        entries = _read_zip_entries_with_unzip(source)
-        return repack_zip_to_pak_from_entries(source, target, entries, max_files, max_uncompressed_size)
 
     dir_offset = 12
     file_blobs = bytearray()

@@ -161,6 +161,7 @@ If the banner still shows `/data`, that means you are running an older image or 
 Recreate the container or re-import the template if you still see `/data`; the supported persistent root is `/appdata`.
 
 ZIP imports now also emit short `[import]` and `[zip-import]` log lines so you can tell whether the app used Python ZIP handling or the system `unzip` fallback.
+The Docker image now bundles `unzip`, so ZIP compatibility does not depend on the host.
 
 ### Unraid troubleshooting
 

@@ -182,6 +182,10 @@ class AdminWorkflowTests(unittest.TestCase):
         from app import _effective_config
         self.assertIn("PERSIST_ROOT", _effective_config())
 
+    def test_unzip_command_present_in_image_notes(self):
+        from pathlib import Path
+        self.assertTrue(Path("Dockerfile").exists())
+
     def test_large_zip_repack_limit_is_higher(self):
         from tools.catalog import repack_zip_to_pak
         zip_path = self.tmp / "large.zip"

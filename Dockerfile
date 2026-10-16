@@ -10,6 +10,8 @@ WORKDIR ${APP_HOME}
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
+RUN apt-get update && apt-get install -y --no-install-recommends unzip && rm -rf /var/lib/apt/lists/*
+
 COPY app.py ./app.py
 COPY tools ./tools
 COPY templates ./templates
