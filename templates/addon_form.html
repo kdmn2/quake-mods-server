@@ -37,7 +37,7 @@
     <p>
       <label>{% if mode == 'edit' %}Replace package — optional{% else %}Package file{% endif %}</label><br>
       <input type="file" name="package" {% if mode != 'edit' %}required{% endif %}>
-      {% if mode == 'edit' %}<div class="small muted">Leave it empty to keep the current package.</div>{% endif %}
+      {% if mode == 'edit' %}<div class="small muted">Leave it empty to keep the current package. Metadata-only changes save without uploading a file.</div>{% endif %}
     </p>
     <p>
       <label>Import mode</label><br>
@@ -79,6 +79,13 @@
   }
   function clock(s) { s = Math.max(0, Math.round(s)); return Math.floor(s / 60) + ':' + ('0' + (s % 60)).slice(-2); }
   form.addEventListener('submit', function (ev) {
+    var mode = form.querySelector ? form.querySelector('input[name="import_mode"]:checked') : null;
+    var packageInput = form.querySelector ? form.querySelector('input[type="file"][name="package"]') : null;
+    var hasReplacement = !!(packageInput && packageInput.files && packageInput.files.length) || (mode && mode.value === 'local');
+    if ('{{ mode }}' === 'edit' && !hasReplacement) {
+      // Metadata-only edit: normal form submit, no upload progress UI and no XHR fallback.
+      return;
+    }
     ev.preventDefault();
     var xhr = new XMLHttpRequest(), started = Date.now();
     $('upload-error').hidden = true;

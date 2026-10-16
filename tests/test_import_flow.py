@@ -652,6 +652,8 @@ class EditMetadataTests(FlowBase):
         self.assertIn("Replace package — optional", html)
         self.assertIn("Leave it empty to keep the current package.", html)
         self.assertIn(row["package_name"], html)
+        self.assertIn("Metadata-only changes save without uploading a file.", html)
+        self.assertIn("if ('edit' === 'edit' && !hasReplacement)", html)
 
     def test_published_metadata_only_edit_updates_catalog_without_replacing_the_package(self):
         row = self.make_existing("pubedit")
