@@ -187,6 +187,32 @@ The app itself does not terminate TLS; it expects your reverse proxy to handle i
 
 Upload size is limited by `MAX_CONTENT_LENGTH` (default 2 GiB). If you need larger archives, increase it in the container environment.
 
+#### Large packages behind a reverse proxy (timeouts)
+
+Converting or publishing a large package takes minutes, longer than most proxies keep a request open (nginx closes a request after 60 s of silence by default and answers `504 Gateway Time-out`). The app therefore never does that work inside a request: the upload POST only saves the file and starts a **background job**, and the browser polls a tiny status endpoint (`/jobs/<id>/status`, a few hundred bytes, answered instantly) to show a live progress bar. No single request is ever long-running, so no proxy setting is needed for the conversion, the optional re-encoding or the publish copy. Jobs keep running if you close the page; running jobs are listed on the dashboard.
+
+What can still take long is the **upload itself** (a 500 MB ZIP over a slow link). Raise these limits on the proxy if uploads fail part-way:
+
+```nginx
+location / {
+    proxy_pass http://ironwail-addons:5000;
+    client_max_body_size      2g;        # at least MAX_CONTENT_LENGTH
+    proxy_request_buffering   off;       # stream the upload to the app instead of spooling 2 GB to the proxy's disk first
+    client_body_timeout       3600s;
+    proxy_send_timeout        3600s;
+    proxy_read_timeout        3600s;     # not needed for the conversion any more; harmless for slow uploads
+}
+```
+
+* **Nginx Proxy Manager:** put the same lines (without `location` and `proxy_pass`) under *Advanced → Custom Nginx Configuration*.
+* **Traefik:** raise `readTimeout`/`writeTimeout` of the entrypoint (`entryPoints.<name>.transport.respondingTimeouts`), and the `maxRequestBodyBytes` of the `buffering` middleware if you use it.
+* **Caddy:** no body-size limit by default; `reverse_proxy` has no read timeout unless you set one.
+* **Cloudflare (proxied):** request bodies are capped (100 MB on free plans), so large uploads cannot work through it. Use *Import from server path* on the add-on form (copy the ZIP to the host first), or upload over the LAN address.
+
+The upload form shows real upload progress (percentage, speed, time left). Without JavaScript it still works as a plain form and the job page refreshes itself every few seconds. Set `JOB_MODE=inline` to run jobs inside the request instead (not recommended; it brings the timeout problem back).
+
+If the container is restarted while a job is running, that job is marked failed on the next start and its temporary files are removed; nothing is half-published, because a package is only swapped into place after every step succeeded.
+
 ### 6) Portainer / Docker Compose compatibility
 
 The repo also contains a Portainer-friendly Compose file at `docker-compose.portainer.yml` for manual deployments. It uses the same env vars and bind mounts as the Unraid template, but the image field is a placeholder that must be replaced with a real registry path before use.
@@ -317,6 +343,24 @@ Root inference is decided from the member paths only; file inclusion is decided 
 - `__MACOSX/` resource forks are ignored; symlinks, encrypted members, duplicate member names, `..`/absolute paths and names that differ only by case are rejected.
 
 Which copy of a file wins follows Ironwail's own search order (`common.c`: `COM_AddGameDirectory`, `COM_FindFile`): `pakN ... pak1, pak0`, then loose files. So a higher-numbered PAK beats a lower one, any PAK beats a loose file, and the first of two identical names inside one PAK wins. ZIP member order never matters. Only `pak0.pak`, `pak1.pak`, ... at the release root count as PAKs (Ironwail stops at the first missing number, so gaps are rejected); other `.pak` files are stored as ordinary files. Output entries are sorted by path.
+
+## Conversion options (all opt-in)
+
+Tick **Review the conversion before building** on the upload form (on by default) to see what a ZIP would produce before anything is built: root detection, file count against Ironwail's 2048-entry limit, estimated size, which files would be dropped by each option, and a free-disk-space check. Nothing below is applied unless you switch it on, and every use is recorded with the add-on (see "How this package was built"). With no options the output is byte-for-byte the plain conversion.
+
+* **Root folder.** Pick which top-level folder is the mod when a ZIP holds several (otherwise rejected as ambiguous); everything outside it is left out and listed.
+* **Leave out files Ironwail does not need.** Presets for map/QuakeC sources and editor files, operating-system leftovers, and root-level documentation, plus your own patterns (`*.map`, `mapsrc/`, `/*.txt` for root only; case-insensitive). Applied to loose files and to the contents of embedded PAKs, before duplicate resolution. Useful to get under the 2048-entry limit or to shrink downloads. The preview warns if a pattern would remove file types Ironwail reads.
+* **Lossless TGA → PNG re-encoding** (textures and skybox faces separately). Ironwail loads `.png` before `.tga` and always decodes to RGBA with the same library, so identical pixels are indistinguishable in game. The TGA is decoded by a small decoder written to follow `stb_image` (not Pillow), the PNG is decoded again and compared byte for byte, and anything that cannot be proven identical or would not get smaller stays a TGA. Only 24/32-bit truecolor TGAs (raw or RLE) are converted. On the real packages tested, all 133 converted images decoded identically in Ironwail's own `stb_image`, at about 12% of the original size. Side effects: the package bytes change (and depend on the Pillow/zlib versions, which are recorded); Ironwail's `sky <TAB>` console completion lists only TGA skyboxes, so converted skies are not suggested there (they still load normally).
+* **Add a mapdb.json.** Only if the release has none; contains just the episode name and directory so the installed add-on is listed with the same name.
+* **Keep the uploaded ZIP.** Stored under `/appdata/sources` so the add-on page can offer **Rebuild with different options** without another upload. Removed when the add-on is deleted.
+
+## Package inspection (advisory)
+
+The add-on page shows a read-only analysis of the stored PAK, based on how Ironwail reads it: the maps the add-on menu will list (menu group, worldspawn title, BSP version, skybox, `.lit`, CD track), contents by type, and a record of how a ZIP was converted (source SHA-256, root mapping, wrapper, which copy of any duplicated path was kept). Findings are warnings (Ironwail will visibly ignore or reject something: an invalid `.lit`, a partial skybox, an unsupported BSP version, a `progs.dat` Ironwail refuses, an inert `descript.ion`) or notes. They never block an upload or change the package.
+
+Besides the checks above, model and sprite files are checked for the header Ironwail needs (a wrong version stops the engine with a fatal error when the model loads) and `sound/*.wav` files for a format Ironwail can play (plain 8/16-bit mono or stereo PCM; others are silently skipped by the engine).
+
+Title, author, date and description can be suggested from `mapdb.json` (using Ironwail's own rules, including ignoring an unmodified Copper `mapdb.json`) or from a root text file that starts with a `Title :` field. Nothing is applied until you press Apply for that field.
 
 ## File ownership and permissions
 

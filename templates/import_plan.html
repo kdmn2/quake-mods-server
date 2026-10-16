@@ -1,0 +1,128 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="card">
+  <h2>Review the conversion</h2>
+  <p>
+    <span class="mono">{{ imp.source_name }}</span> for <strong>{{ form.title }}</strong>
+    (ID <span class="mono">{{ form.addon_id }}</span>, directory <span class="mono">{{ form.gamedir }}</span>).
+    Nothing has been built yet. Every option below is off unless you switch it on, and each one is recorded with the add-on.
+  </p>
+  {% if not plan %}
+  <div class="sev warning">No preview is available for this upload. Use “Update preview” below to compute it.</div>
+  {% else %}
+  {% if plan.blockers %}
+  <div class="sev warning">
+    <strong>This package cannot be built as it is:</strong>
+    <ul>{% for b in plan.blockers %}<li>{{ b }}</li>{% endfor %}</ul>
+    {% if plan.top_level_dirs and plan.root_mapping == 'ambiguous' %}Choose which folder is the mod under “Root folder”, then update the preview.{% endif %}
+  </div>
+  {% endif %}
+  <table class="table-sm">
+    <tr><th>Files in the finished package</th>
+      <td class="{{ 'bad' if plan.entries > plan.entry_limit else '' }}">{{ plan.entries }} of {{ plan.entry_limit }} allowed
+        {% if plan.entries > plan.entry_limit %}(Ironwail refuses PAK files with more entries){% endif %}</td></tr>
+    <tr><th>Approximate size</th><td>{{ plan.estimated_pak_bytes|filesize }}</td></tr>
+    <tr><th>Root</th><td>{{ plan.root_mapping }}{% if plan.wrapper %}, wrapper folder <span class="mono">{{ plan.wrapper }}/</span> removed{% endif %}</td></tr>
+    <tr><th>Sources</th><td>{{ plan.loose_files }} loose file(s){% for p in plan.embedded_paks %}; <span class="mono">{{ p.name }}</span> ({{ p.entries }} entries, {{ p.bytes|filesize }}){% endfor %}</td></tr>
+    <tr><th>Duplicated paths</th><td>{{ plan.overrides_total }} (Ironwail's search order decides which copy is kept: higher-numbered PAK, then lower PAK, then loose file)</td></tr>
+    <tr><th>Left out by your options</th><td>{{ plan.excluded.total }} file(s), {{ plan.excluded.bytes|filesize }}</td></tr>
+  </table>
+  {% if space and space.low %}
+  <div class="sev warning"><strong>Low disk space.</strong> Building needs roughly {{ space.need|filesize }} of temporary space (work area has {{ space.free_work|filesize }} free)
+    and room for the finished package (data folder has {{ space.free_data|filesize }} free). The build may fail with “Disk quota exceeded” or “No space left”.
+    Leaving out files, or freeing space on the volumes mapped to <span class="mono">/uploads</span> and <span class="mono">/appdata</span>, helps.</div>
+  {% endif %}
+  {% if plan.excluded.total %}
+  <details>
+    <summary>What is left out ({{ plan.excluded.total }})</summary>
+    {% if plan.excluded_engine_read_types %}
+    <div class="sev warning">These choices remove file types that Ironwail reads: {{ plan.excluded_engine_read_types|join(', ') }}.</div>
+    {% endif %}
+    <table class="table-sm">
+      <tr><th>Rule</th><th>Files</th></tr>
+      {% for rule, n in plan.excluded.by_rule.items() %}<tr><td class="mono">{{ rule }}</td><td>{{ n }}</td></tr>{% endfor %}
+    </table>
+    <div class="small mono">{% for e in plan.excluded.sample %}{{ e.path }}<br>{% endfor %}
+    {% if plan.excluded.total > plan.excluded.sample|length %}… and {{ plan.excluded.total - plan.excluded.sample|length }} more{% endif %}</div>
+  </details>
+  {% endif %}
+  {% endif %}
+</div>
+
+<form method="post" action="{{ url_for('import_replan', token=imp.token) }}" id="plan-form">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <div class="card">
+    <h3>Options (all optional)</h3>
+
+    {% if plan and plan.top_level_dirs %}
+    <div class="opt">
+      <h4>Root folder</h4>
+      <p class="small muted">Normally detected automatically. Choose a folder to treat it as the mod and leave everything outside it out of the package (needed when the ZIP holds several mods).</p>
+      <select name="root">
+        <option value="">Automatic{% if plan.root_mapping and plan.root_mapping != 'selected' %} ({{ plan.root_mapping }}){% endif %}</option>
+        {% for d in plan.top_level_dirs %}<option value="{{ d }}" {% if options.root == d %}selected{% endif %}>{{ d }}/</option>{% endfor %}
+      </select>
+    </div>
+    {% endif %}
+
+    <div class="opt">
+      <h4>Leave out files Ironwail does not need</h4>
+      <p class="small muted">Removes content from the package. The preview lists exactly what goes.</p>
+      {% for key, preset in presets.items() %}
+      {% set stat = plan.preset_stats[key] if plan else None %}
+      <label><input type="checkbox" name="exclude_presets" value="{{ key }}" {% if key in options.exclude_presets %}checked{% endif %}>
+        {{ preset.label }}{% if stat %} — {{ stat.files }} file(s), {{ stat.bytes|filesize }}{% endif %}</label>
+      <div class="small muted" style="margin:0 0 6px 24px">{{ preset.help }}</div>
+      {% endfor %}
+      <label>Custom patterns, one per line</label>
+      <textarea name="exclude_patterns" rows="3" placeholder="*.bak&#10;/notes/&#10;sound/old/*.wav">{{ options.exclude_patterns|join('\n') }}</textarea>
+      <div class="small muted"><code>*.map</code> matches that file name anywhere; <code>mapsrc/</code> matches a folder of that name anywhere; a leading <code>/</code> anchors to the package root (<code>/*.txt</code> = root-level files only). Case is ignored.</div>
+    </div>
+
+    <div class="opt">
+      <h4>Re-encode TGA images as PNG (lossless)</h4>
+      <p class="small muted">
+        Ironwail decodes TGA and PNG with the same library and always to RGBA, so a PNG with identical pixels looks exactly the same in game.
+        Each image is decoded again after conversion and compared byte for byte; anything that cannot be proven identical, or would not get smaller, stays a TGA.
+        The package bytes change (only the image files) and the result depends on the Pillow/zlib versions, which are recorded.
+        Only 24/32-bit uncompressed or RLE TGAs are converted.
+      </p>
+      {% set cand = plan.image_candidates if plan else None %}
+      <label><input type="checkbox" name="reencode_textures" value="1" {% if options.reencode_textures %}checked{% endif %}>
+        Textures and other images{% if cand %} — {{ cand.textures.files }} TGA file(s), {{ cand.textures.bytes|filesize }}{% endif %}</label><br>
+      <label><input type="checkbox" name="reencode_skyboxes" value="1" {% if options.reencode_skyboxes %}checked{% endif %}>
+        Skybox faces (<span class="mono">gfx/env/</span>){% if cand %} — {{ cand.skyboxes.files }} TGA file(s), {{ cand.skyboxes.bytes|filesize }}{% endif %}</label>
+      <div class="small muted" style="margin-left:24px">Maps load PNG skyboxes normally. The only visible difference is that Ironwail's console tab-completion for the <code>sky</code> command lists TGA skyboxes only (host_cmd.c, SkyList_AddFile), so converted skies will not be suggested there.</div>
+    </div>
+
+    <div class="opt">
+      <h4>Add a mapdb.json</h4>
+      {% if plan and plan.mapdb_present %}
+      <p class="small muted">This release already contains a <span class="mono">mapdb.json</span>; it is always kept as it is, so this option has no effect.</p>
+      {% else %}
+      <p class="small muted">Adds a minimal file naming the episode so Ironwail shows the same name after installation. Written only when the release has none; contains no map list.</p>
+      {% endif %}
+      <label><input type="checkbox" name="generate_mapdb" value="1" {% if options.mapdb %}checked{% endif %}> Add it</label><br>
+      <label>Episode name <input name="mapdb_name" value="{{ options.mapdb[0] if options.mapdb else form.title }}"></label>
+      <label>Directory <input name="mapdb_dir" value="{{ options.mapdb[1] if options.mapdb else form.gamedir }}"></label>
+    </div>
+
+    {% if imp.owns_source or imp.kind == 'new' %}
+    <div class="opt">
+      <h4>Keep the uploaded ZIP</h4>
+      <p class="small muted">Stored on the server so the package can be rebuilt later with different options without uploading again. Uses disk space equal to the ZIP ({{ imp.source_name }}). Deleted with the add-on.</p>
+      <label><input type="checkbox" name="keep_source" value="1" {% if imp.keep_source %}checked{% endif %}> Keep a copy</label>
+    </div>
+    {% endif %}
+
+    <div class="inline">
+      <button type="submit">Update preview</button>
+      <button type="submit" formaction="{{ url_for('import_build', token=imp.token) }}" {% if plan and plan.blockers %}disabled title="Fix the problems above first"{% endif %}>Build package</button>
+    </div>
+  </div>
+</form>
+<form method="post" action="{{ url_for('import_cancel', token=imp.token) }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <button class="danger" type="submit">Cancel and discard the upload</button>
+</form>
+{% endblock %}

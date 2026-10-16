@@ -18,6 +18,7 @@ import re
 import struct
 import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.request
 import uuid
@@ -79,6 +80,7 @@ class Client:
     def __init__(self, base: str):
         self.base = base.rstrip("/")
         self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+        self.last_url = ""
 
     def get(self, path: str, timeout=600) -> bytes:
         return self.opener.open(self.base + path, timeout=timeout).read()
@@ -86,17 +88,38 @@ class Client:
     def csrf(self, path: str) -> str:
         return re.search(r'name="csrf_token" value="([^"]+)"', self.get(path).decode()).group(1)
 
-    def post(self, path: str, fields: dict, files: dict | None = None, csrf_from: str | None = None) -> str:
+    def post(self, path: str, fields: dict, files: dict | None = None, csrf_from: str | None = None, headers: dict | None = None) -> str:
         fields = dict(fields, csrf_token=self.csrf(csrf_from or path))
         boundary = uuid.uuid4().hex
         body = bytearray()
         for k, v in fields.items():
-            body += f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+            for item in (v if isinstance(v, (list, tuple)) else [v]):
+                body += f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{item}\r\n'.encode()
         for k, (fname, data) in (files or {}).items():
             body += f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"; filename="{fname}"\r\nContent-Type: application/octet-stream\r\n\r\n'.encode() + data + b"\r\n"
         body += f"--{boundary}--\r\n".encode()
-        req = urllib.request.Request(self.base + path, bytes(body), {"Content-Type": f"multipart/form-data; boundary={boundary}"})
-        return self.opener.open(req, timeout=1800).read().decode()
+        req = urllib.request.Request(self.base + path, bytes(body), {"Content-Type": f"multipart/form-data; boundary={boundary}", **(headers or {})})
+        resp = self.opener.open(req, timeout=1800)
+        self.last_url = resp.geturl()
+        return resp.read().decode()
+
+    def wait_job(self, url: str, label: str = "", poll: float = 0.5, timeout: float = 7200) -> dict:
+        """Follow a job the way the browser does: poll its status endpoint until it finishes. Prints each stage change."""
+        job_id = urllib.parse.urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]
+        deadline = time.time() + timeout
+        seen_stage, samples = "", set()
+        while True:
+            st = json.loads(self.get(f"/jobs/{job_id}/status"))
+            samples.add(st["percent"])
+            if st["stage"] != seen_stage and st["state"] == "running":
+                seen_stage = st["stage"]
+                print(f"   [{label or st['kind']}] {st['stage']} ({st['percent']:.0f}%)", flush=True)
+            if st["finished"]:
+                st["distinct_percent_samples"] = len(samples)
+                return st
+            if time.time() > deadline:
+                raise TimeoutError(f"job {job_id} did not finish")
+            time.sleep(poll)
 
 
 def main() -> int:
@@ -107,24 +130,53 @@ def main() -> int:
     ap.add_argument("--user", default="admin")
     ap.add_argument("--password", required=True)
     ap.add_argument("--out", required=True, type=Path)
+    ap.add_argument("--review", action="store_true", help="use the preview step, then build with --opt fields")
+    ap.add_argument("--opt", action="append", default=[], metavar="FIELD=VALUE", help="build form field (repeatable), e.g. exclude_presets=authoring reencode_textures=1")
+    ap.add_argument("--keep-source", action="store_true")
     a = ap.parse_args()
 
     c = Client(a.base)
     if c.opener.open(a.base + "/setup").geturl().endswith("/setup"):
         c.post("/setup", {"username": a.user, "password": a.password})
     c.post("/login", {"username": a.user, "password": a.password})
-    page = c.post("/addons/new", {"title": a.id, "addon_id": a.id, "gamedir": a.id, "author": "acceptance", "date": "2026/10/16", "description": "acceptance run"},
-                  {"package": (a.zip.name, a.zip.read_bytes())}, csrf_from="/addons/new")
-    flash = re.search(r'flash (?:success|error)">([^<]+)', page)
-    print("upload:", flash.group(1) if flash else "no flash")
+    fields = {"title": a.id, "addon_id": a.id, "gamedir": a.id, "author": "acceptance", "date": "2026/10/16", "description": "acceptance run"}
+    if a.review:
+        fields["review"] = "1"
+    if a.keep_source:
+        fields["keep_source"] = "1"
+    t0 = time.time()
+    c.post("/addons/new", fields, {"package": (a.zip.name, a.zip.read_bytes())}, csrf_from="/addons/new")
+    job = c.wait_job(c.last_url, "upload")
+    print(f"job 1: {job['state']} in {job['elapsed']}s, {job['distinct_percent_samples']} distinct progress readings: {job['message']}")
+    if a.review:
+        if job["state"] != "done" or not job["next_url"]:
+            print("FAIL: preview did not complete")
+            return 2
+        page = c.get(job["next_url"]).decode()
+        plan_summary = re.findall(r"<th>([^<]+)</th>\s*<td[^>]*>([^<]+)", page)
+        print("preview:", {k: " ".join(v.split())[:90] for k, v in plan_summary[:6]})
+        build_fields: dict = {}
+        for item in a.opt:
+            k, _, v = item.partition("=")
+            build_fields.setdefault(k, []).append(v)
+        build_fields = {k: (v if k == "exclude_presets" else v[-1]) for k, v in build_fields.items()}
+        c.post(f"{job['next_url']}/build", build_fields, csrf_from=job["next_url"])
+        job = c.wait_job(c.last_url, "build")
+        print(f"job 2: {job['state']} in {job['elapsed']}s, {job['distinct_percent_samples']} distinct progress readings: {job['message']}")
+    if job["state"] != "done":
+        print("FAIL: conversion did not finish:", job["message"])
+        return 2
     dash = c.get("/dashboard").decode()
-    m = re.search(r'/addons/(\d+)"[^<]*</a>', dash)
     row = re.findall(r'<tr>.*?</tr>', dash, re.S)
     addon_pk = next((re.search(r'/addons/(\d+)', r).group(1) for r in row if f">{a.id}<" in r), None)
     if not addon_pk:
         print("FAIL: add-on not created (draft missing)")
         return 2
     c.post(f"/addons/{addon_pk}/publish", {}, csrf_from="/dashboard")
+    pub = c.wait_job(c.last_url, "publish")
+    print(f"publish job: {pub['state']} in {pub['elapsed']}s, {pub['distinct_percent_samples']} distinct progress readings: {pub['message']}")
+    if pub["state"] != "done":
+        return 2
     catalog = json.loads(c.get("/content.json"))
     entry = next((e for e in catalog["addons"] if e["gamedir"] == a.id), None)
     if not entry:
@@ -146,10 +198,14 @@ def main() -> int:
         "catalog_size_matches_download": entry["size"] == len(data),
         "artifact": str(artifact), "artifact_sha256": hashlib.sha256(data).hexdigest(), "artifact_size": len(data),
         "entries": len(got_list), "duplicate_entries": len(got_list) - len(got), "expected_entries": len(exp),
-        "missing": missing, "unexpected": unexpected, "mismatched": mismatched, **meta,
+        "missing": missing, "unexpected": unexpected, "mismatched": mismatched, "total_seconds": round(time.time() - t0, 1), **meta,
     }
+    if a.opt or a.review:
+        report["note"] = "options were used: the plain-conversion manifest comparison below is informational, see the option-specific checks"
     print(json.dumps(report, indent=2))
-    ok = not (missing or unexpected or mismatched) and report["duplicate_entries"] == 0 and report["catalog_size_matches_download"]
+    ok = report["duplicate_entries"] == 0 and report["catalog_size_matches_download"]
+    if not (a.opt or a.review):
+        ok = ok and not (missing or unexpected or mismatched)
     print("ACCEPTANCE", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 

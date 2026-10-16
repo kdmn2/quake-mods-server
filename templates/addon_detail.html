@@ -9,7 +9,15 @@
   <p><strong>Status:</strong> {% if addon.published %}Published{% else %}Draft{% endif %}</p>
   <p><strong>Package:</strong> {{ addon.package_name }} ({{ addon.package_size }} bytes)</p>
   <p><strong>Catalog URL:</strong> {{ public_base_url }}/content.json</p>
-  <p><strong>Package URL:</strong> {{ public_base_url }}/public/addons/{{ addon.addon_id }}.pak</p>
+  <p><strong>Package URL:</strong> {{ public_base_url }}/addons/{{ addon.addon_id }}.pak</p>
+  <p><strong>Source ZIP:</strong>
+    {% if addon.source_path %}kept on the server ({{ addon.source_name }}) —
+    <form style="display:inline" method="post" action="{{ url_for('rebuild_addon', addon_id=addon.id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button type="submit">Rebuild with different options…</button>
+    </form>
+    {% else %}not kept (choose “Keep the uploaded ZIP” when uploading to be able to rebuild later){% endif %}
+  </p>
   <p class="small muted">You can also import a ZIP from an absolute server path on the add-on form if you prefer not to upload through the browser.</p>
   <div class="inline">
     <a href="{{ url_for('edit_addon', addon_id=addon.id) }}"><button>Edit</button></a>
@@ -29,5 +37,118 @@
       <button class="danger" type="submit">Delete</button>
     </form>
   </div>
+</div>
+{% set rep = inspection.report %}
+{% set conv = inspection.conversion %}
+<div class="card">
+  <h3>Package inspection</h3>
+  <p class="small muted">Read-only analysis of the stored package, based on how Ironwail reads PAK files. Nothing here changes the package, and nothing blocks publishing.</p>
+  {% if inspection.error %}
+    <div class="sev warning">The package could not be inspected: {{ inspection.error }}</div>
+  {% elif rep %}
+    <p><strong>{{ rep.entries }}</strong> files, {{ '%.1f'|format(rep.payload_bytes / 1048576) }} MiB.
+       {% if rep.warning_count %}<span class="error"><strong>{{ rep.warning_count }} warning(s)</strong></span>{% else %}<span class="success">No warnings.</span>{% endif %}</p>
+
+    {% if rep.findings %}
+      {% for f in rep.findings %}
+      <div class="sev {{ f.severity }}">
+        <strong>{{ f.severity|upper }}</strong> <span class="mono small">{{ f.code }}</span><br>
+        {{ f.message }}
+        {% if f.paths %}<div class="small mono">{{ f.paths|join(', ') }}{% if f.more %} … and {{ f.more }} more{% endif %}</div>{% endif %}
+      </div>
+      {% endfor %}
+    {% endif %}
+
+    {% if rep.suggestions %}
+    <h4>Suggested metadata</h4>
+    <p class="small muted">Taken from files inside the package. Nothing is applied until you confirm each field.</p>
+    <table class="table-sm">
+      <tr><th>Field</th><th>Current</th><th>Suggested</th><th>Source</th><th></th></tr>
+      {% for field, s in rep.suggestions.items() %}
+      <tr>
+        <td>{{ field }}</td>
+        <td>{{ addon[field] or '—' }}</td>
+        <td>{{ s.value }}</td>
+        <td class="small">{{ s.source }}</td>
+        <td>
+          <form method="post" action="{{ url_for('apply_suggestion', addon_id=addon.id, field=field) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button type="submit">Apply</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% endif %}
+
+    <details>
+      <summary>Contents by type</summary>
+      <table class="table-sm">
+        <tr><th>Type</th><th>Files</th><th>Size (MiB)</th></tr>
+        {% for key, c in rep.categories.items() %}
+        <tr><td>{{ c.label }}</td><td>{{ c.count }}</td><td>{{ '%.2f'|format(c.bytes / 1048576) }}</td></tr>
+        {% endfor %}
+      </table>
+    </details>
+
+    {% set listed = rep.maps|selectattr('listed')|list %}
+    <details>
+      <summary>Maps Ironwail will list ({{ listed|length }}){% if rep.maps|length > listed|length %} <span class="small muted">— {{ rep.maps|length - listed|length }} smaller BSP file(s) are models, not listed</span>{% endif %}</summary>
+      <table class="table-sm">
+        <tr><th>Map</th><th>Menu group</th><th>Title (worldspawn)</th><th>BSP</th><th>Skybox</th><th>.lit</th><th>CD track</th></tr>
+        {% for m in listed %}
+        <tr>
+          <td class="mono">{{ m.name }}</td><td>{{ m.kind }}</td><td>{{ m.title or '—' }}</td><td>{{ m.bsp or '?' }}</td>
+          <td>{% if m.sky %}{{ m.sky }} ({{ m.sky_sides }}/6){% else %}—{% endif %}</td>
+          <td>{{ m.lit }}</td><td>{{ m.cdtrack or '—' }}</td>
+        </tr>
+        {% endfor %}
+      </table>
+    </details>
+  {% endif %}
+
+  {% if conv %}
+  <details>
+    <summary>How this package was built</summary>
+    {% if conv.kind == 'zip-release' %}
+    <p>From ZIP <span class="mono">{{ conv.source_name }}</span> (SHA-256 <span class="mono">{{ conv.source_sha256 }}</span>).
+       Root: <strong>{{ conv.root_mapping }}</strong>{% if conv.wrapper %}, wrapper <span class="mono">{{ conv.wrapper }}/</span> removed{% endif %}.
+       {{ conv.entries }} entries from {{ conv.embedded_paks|length }} embedded PAK(s) and {{ conv.loose_files }} loose file(s).</p>
+    <p>{{ conv.overrides_total }} path(s) existed in more than one place; Ironwail's search order decided which copy was kept
+       (higher-numbered PAK, then lower PAK, then loose file).</p>
+    {% if conv.overrides %}
+    <table class="table-sm">
+      <tr><th>Path</th><th>Dropped copy</th><th>Kept copy</th></tr>
+      {% for o in conv.overrides %}<tr><td class="mono">{{ o.path }}</td><td>{{ o.overridden }}</td><td>{{ o.by }}</td></tr>{% endfor %}
+    </table>
+    {% if conv.overrides_total > conv.overrides|length %}<p class="small muted">Showing the first {{ conv.overrides|length }}.</p>{% endif %}
+    {% endif %}
+    {% if conv.options %}
+    <p><strong>Options used:</strong>
+      {% if conv.options.root %}root folder <span class="mono">{{ conv.options.root }}</span>; {% endif %}
+      {% if conv.options.exclude_presets %}left out: {{ conv.options.exclude_presets|join(', ') }}; {% endif %}
+      {% if conv.options.exclude_patterns %}custom patterns: <span class="mono">{{ conv.options.exclude_patterns|join(', ') }}</span>; {% endif %}
+      {% if conv.options.reencode_textures %}textures re-encoded to PNG; {% endif %}
+      {% if conv.options.reencode_skyboxes %}skyboxes re-encoded to PNG; {% endif %}
+      {% if conv.options.mapdb %}mapdb.json requested.{% endif %}</p>
+    {% endif %}
+    {% if conv.excluded %}
+    <p>{{ conv.excluded.total }} file(s) ({{ conv.excluded.bytes|filesize }}) were left out by your options.</p>
+    <details><summary>Left out</summary><div class="small mono">{% for e in conv.excluded.sample %}{{ e.path }} <span class="muted">({{ e.reason }})</span><br>{% endfor %}</div></details>
+    {% endif %}
+    {% if conv.reencoded %}
+    <p>{{ conv.reencoded.converted }} image(s) re-encoded TGA → PNG, {{ conv.reencoded.bytes_before|filesize }} → {{ conv.reencoded.bytes_after|filesize }}
+       (each verified identical after decoding; Pillow {{ conv.reencoded.libraries.pillow }}, zlib {{ conv.reencoded.libraries.zlib }}).
+       {% if conv.reencoded.skipped %}Left as TGA: {% for k, v in conv.reencoded.skipped.items() %}{{ v }} × {{ k }}{% if not loop.last %}, {% endif %}{% endfor %}.{% endif %}</p>
+    {% endif %}
+    {% if conv.generated %}<p>Added by option: {% for g in conv.generated %}<span class="mono">{{ g.path }}</span>{% endfor %}.</p>{% endif %}
+    {% else %}
+    <p>Uploaded as a PAK ({{ conv.source_name }}) and stored unchanged.</p>
+    {% endif %}
+    <p class="small muted">Built package: SHA-256 <span class="mono">{{ conv.output_sha256 }}</span>, {{ conv.output_size }} bytes.</p>
+  </details>
+  {% else %}
+  <p class="small muted">No conversion record (uploaded before conversion records were kept).</p>
+  {% endif %}
 </div>
 {% endblock %}

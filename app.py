@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
 import tempfile
 import sqlite3
 import threading
+import time
 import uuid
 import sys
 from contextlib import contextmanager
@@ -18,7 +20,11 @@ from werkzeug.exceptions import BadRequest, Forbidden, NotFound, RequestEntityTo
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
-from tools.catalog import _compute_sha256 as _sha256_file, build_single_pak_from_zip, detect_package_format, inspect_zip_release, validate_package, validate_pak_paths
+from tools.catalog import (_compute_sha256 as _sha256_file, _validate_date, build_single_pak_from_zip, detect_package_format, plan_zip_release,
+                           validate_package, validate_pak_paths)
+from tools.convert_options import PRESETS, ConvertOptions, options_from_form
+from tools.jobs import JobCancelled, JobFailed, JobManager, JobOutcome, Progress
+from tools.pak_report import analyze_pak, summarize_conversion
 
 app = Flask(__name__)
 app.config.update(
@@ -32,6 +38,7 @@ app.config.update(
     PUBLIC_ROOT=os.environ.get("PUBLIC_ROOT", "/tmp/quake-addons-public"),
     BASE_URL=os.environ.get("PUBLIC_BASE_URL", "http://localhost:8080"),
     ADMIN_PORT=os.environ.get("PORT", "5000"),
+    JOB_MODE=os.environ.get("JOB_MODE", ""),            # "thread" (default) runs conversions in the background; "inline" runs them inside the request
 )
 
 
@@ -72,38 +79,334 @@ def _effective_config() -> Dict[str, str]:
     }
 
 
-def _build_release_package_from_zip(source_path: Path, target: Path, staging_dir: Path) -> dict[str, Any]:
-    info = build_single_pak_from_zip(source_path, target)
-    print(
-        f"[import] ZIP release ({info['root_mapping']}{' ' + repr(info['wrapper']) if info['wrapper'] else ''}) consolidated into single PAK with "
-        f"{info['entries']} entries from {len(info['embedded_paks'])} embedded PAK(s) and {info['loose_files']} loose file(s); "
-        f"{len(info['overrides'])} path(s) overridden by engine precedence",
-        flush=True,
-    )
-    return validate_package(target)
-
-
-def _stage_package(upload_source: Path, detected: str, safe_name: str) -> Tuple[Path, dict[str, Any], str]:
-    """Produce a validated package in a staging file next to the final location (same filesystem).
-
-    Nothing at the final package path is touched here; the caller swaps it in with os.replace.
-    """
-    staged = _packages_dir() / f".staging-{uuid.uuid4().hex}.pak"
+def _inspection_warnings(path: Path, gamedir: str) -> int:
     try:
-        if detected == "zip":
-            info = _build_release_package_from_zip(upload_source, staged, upload_source.parent)
-            msg = "Uploaded ZIP release was inspected and packaged from its embedded PAK."
-        elif detected == "pak":
-            shutil.copyfile(upload_source, staged)
-            print(f"[import] staged PAK unchanged at {staged}", flush=True)
-            info = validate_package(staged)
-            msg = "Uploaded PAK was stored unchanged."
+        return analyze_pak(path, gamedir)["warning_count"]
+    except Exception as exc:  # inspection is advisory and must never block an upload
+        print(f"[inspect] could not inspect {path.name}: {exc}", flush=True)
+        return 0
+
+
+# ---- staged imports and background jobs ------------------------------------------------------------------------------
+# A POST only stages the upload and records a job; the heavy work runs in the job worker (tools/jobs.py), so no HTTP request is
+# held open while a large package is converted or published and a reverse proxy has nothing to time out.
+
+IMPORT_MAX_AGE = 24 * 3600
+FORM_FIELDS = ("title", "addon_id", "gamedir", "author", "date", "description")
+
+
+def _workdir() -> Path:
+    path = Path(app.config["UPLOAD_FOLDER"]) / ".work"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _load_import(token: str) -> sqlite3.Row | None:
+    conn = get_db()
+    try:
+        return conn.execute("SELECT * FROM imports WHERE token = ?", (token,)).fetchone()
+    finally:
+        conn.close()
+
+
+def _delete_import(token: str) -> None:
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT * FROM imports WHERE token = ?", (token,)).fetchone()
+        conn.execute("DELETE FROM imports WHERE token = ?", (token,))
+    finally:
+        conn.close()
+    if row and row["owns_source"]:
+        staging = Path(row["source_path"]).parent
+        if staging.name == token and staging.parent == Path(app.config["UPLOAD_FOLDER"]):
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def _save_import(token: str, kind: str, addon_pk: int | None, form: dict[str, str], source: Path, name: str, fmt: str,
+                 owns_source: bool, keep_source: bool, review: bool) -> None:
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO imports (token, kind, addon_pk, form_json, source_path, source_name, source_format, owns_source, keep_source, review, options_json, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (token, kind, addon_pk, json.dumps(form), str(source), name, fmt, int(owns_source), int(keep_source), int(review),
+             json.dumps(ConvertOptions().to_dict()), time.time()),
+        )
+    finally:
+        conn.close()
+
+
+def expire_stale_imports(max_age: float = IMPORT_MAX_AGE) -> int:
+    """Abandoned uploads (nobody pressed Build) are removed after a day; a job running that long would have been interrupted anyway."""
+    conn = get_db()
+    try:
+        tokens = [row["token"] for row in conn.execute("SELECT token FROM imports WHERE created_at < ?", (time.time() - max_age,)).fetchall()]
+    finally:
+        conn.close()
+    for token in tokens:
+        _delete_import(token)
+    return len(tokens)
+
+
+def startup_cleanup() -> None:
+    """Run once at startup, when no job can be running: drop what a killed process left behind."""
+    interrupted = jobs.recover_interrupted()
+    if interrupted:
+        print(f"[startup] marked {interrupted} interrupted job(s) as failed", flush=True)
+    shutil.rmtree(Path(app.config["UPLOAD_FOLDER"]) / ".work", ignore_errors=True)
+    # A direct (no-preview) import exists only to be built at once; if the process died, nothing can resume it, so its staged
+    # upload is discarded. Previewed imports stay available from the dashboard.
+    conn = get_db()
+    try:
+        orphans = [r["token"] for r in conn.execute("SELECT token FROM imports WHERE review = 0").fetchall()]
+    finally:
+        conn.close()
+    for token in orphans:
+        _delete_import(token)
+    for folder, pattern in ((_packages_dir(), ".staging-*.pak"), (_public_addons_dir(), ".publish-*.tmp"), (_public_addons_dir(), "*.pak.tmp")):
+        for leftover in folder.glob(pattern):
+            leftover.unlink(missing_ok=True)
+    expire_stale_imports()
+
+
+def _copy_hashing(src: Path, dst: Path, progress: Progress, stage: str) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    total = src.stat().st_size
+    done = 0
+    progress(stage, 0, total)
+    with open(src, "rb") as fin, open(dst, "wb") as fout:
+        for chunk in iter(lambda: fin.read(1024 * 1024), b""):
+            digest.update(chunk)
+            fout.write(chunk)
+            done += len(chunk)
+            progress(stage, done, total)
+    return digest.hexdigest(), done
+
+
+def _build_stages(fmt: str, options: ConvertOptions, keep_source: bool) -> list[tuple[str, float]]:
+    if fmt == "zip":
+        stages = [("Fingerprinting source", 4), ("Reading archive", 3), ("Reading embedded PAKs", 6), ("Extracting files", 30)]
+        if options.reencode_textures or options.reencode_skyboxes:
+            stages.append(("Re-encoding images", 40))
+        stages += [("Writing package", 12), ("Checking package", 8)]
+    else:
+        stages = [("Copying package", 70), ("Checking package", 25)]
+    if keep_source:
+        stages.append(("Keeping source copy", 8))
+    return stages + [("Installing", 2)]
+
+
+def _run_build(token: str, progress: Progress) -> JobOutcome:
+    imp = _load_import(token)
+    if imp is None:
+        raise JobFailed("This import was cancelled or has expired. Start again from the add-on form.", "add_addon")
+    form = json.loads(imp["form_json"])
+    replace = imp["kind"] == "replace"
+    fmt = imp["source_format"]
+    source = Path(imp["source_path"])
+    options = ConvertOptions.from_dict(json.loads(imp["options_json"] or "{}"))
+    keep_source = bool(imp["keep_source"]) and fmt == "zip"
+    keep_import_on_failure = bool(imp["review"]) and fmt == "zip"
+    if keep_import_on_failure:
+        retry = ("import_plan", {"token": token})
+    elif replace:
+        retry = ("edit_addon", {"addon_id": imp["addon_pk"]})
+    else:
+        retry = ("add_addon", {})
+    staged = _packages_dir() / f".staging-{uuid.uuid4().hex}.pak"
+    kept: Path | None = None
+    installed_target: Path | None = None
+    try:
+        progress.plan(_build_stages(fmt, options, keep_source))
+        if fmt == "zip":
+            source_sha = _sha256_file(source, progress, "Fingerprinting source")
+            info = build_single_pak_from_zip(source, staged, options=options, progress=progress, workdir=_workdir())
+            print(
+                f"[import] ZIP release ({info['root_mapping']}{' ' + repr(info['wrapper']) if info['wrapper'] else ''}) consolidated into single PAK with "
+                f"{info['entries']} entries from {len(info['embedded_paks'])} embedded PAK(s) and {info['loose_files']} loose file(s); "
+                f"{len(info['overrides'])} path(s) overridden by engine precedence"
+                + (f"; {info['excluded']['total']} excluded by option" if info.get("excluded") else "")
+                + (f"; {info['reencoded']['converted']} image(s) re-encoded" if info.get("reencoded") else ""),
+                flush=True,
+            )
+            package = validate_package(staged, sha256=info["sha256"])
+            record = summarize_conversion(info, imp["source_name"], source_sha)
+            message = "Uploaded ZIP release was inspected and packaged from its embedded PAK."
         else:
-            raise ValueError(f"Unsupported package format for {safe_name!r}; expected a ZIP or Quake PAK")
-    except BaseException:
-        staged.unlink(missing_ok=True)
+            sha, _ = _copy_hashing(source, staged, progress, "Copying package")
+            package = validate_package(staged, sha256=sha)
+            record = {"report_version": 1, "kind": "pak-upload", "source_name": imp["source_name"],
+                      "output_sha256": package["sha256"], "output_size": package["size"]}
+            message = "Uploaded PAK was stored unchanged."
+        print(f"[import] validated package for {form['addon_id']}: size={package['size']} sha256={package['sha256']}", flush=True)
+        warning_count = _inspection_warnings(staged, form["gamedir"])
+
+        source_path = source_name = None
+        if keep_source:
+            kept_dir = Path(app.config["PERSIST_ROOT"]) / "sources" / token
+            kept_dir.mkdir(parents=True, exist_ok=True)
+            kept = kept_dir / (secure_filename(imp["source_name"]) or "source.zip")
+            _copy_hashing(source, kept, progress, "Keeping source copy")
+            source_path, source_name = str(kept), imp["source_name"]
+        progress("Installing", 0, 1)
+
+        old_source: str | None = None
+        with db_txn() as conn:
+            if replace:
+                addon = conn.execute("SELECT * FROM addons WHERE id = ?", (imp["addon_pk"],)).fetchone()
+                if not addon:
+                    raise ValueError("The add-on was deleted while its package was being built")
+                if conn.execute("SELECT 1 FROM addons WHERE addon_id = ? AND id != ?", (form["addon_id"], addon["id"])).fetchone():
+                    raise sqlite3.IntegrityError("duplicate addon id")
+                if conn.execute("SELECT 1 FROM addons WHERE gamedir = ? AND id != ?", (form["gamedir"], addon["id"])).fetchone():
+                    raise sqlite3.IntegrityError("duplicate gamedir")
+                target = Path(addon["package_path"])
+                old_source = addon["source_path"] if source_path else None
+                conn.execute(
+                    "UPDATE addons SET title=?, addon_id=?, gamedir=?, author=?, date=?, description=?, package_size=?, package_sha256=?, "
+                    "package_mtime=?, conversion_report=?, source_path=COALESCE(?, source_path), source_name=COALESCE(?, source_name), "
+                    "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (form["title"], form["addon_id"], form["gamedir"], form["author"], form["date"], form["description"], package["size"],
+                     package["sha256"], int(staged.stat().st_mtime), json.dumps(record, sort_keys=True), source_path, source_name, addon["id"]),
+                )
+                addon_pk, published = addon["id"], bool(addon["published"])
+            else:
+                if conn.execute("SELECT 1 FROM addons WHERE addon_id = ?", (form["addon_id"],)).fetchone():
+                    raise sqlite3.IntegrityError("duplicate addon id")
+                if conn.execute("SELECT 1 FROM addons WHERE gamedir = ?", (form["gamedir"],)).fetchone():
+                    raise sqlite3.IntegrityError("duplicate gamedir")
+                target = _packages_dir() / f"{form['addon_id']}.pak"
+                cur = conn.execute(
+                    """
+                    INSERT INTO addons (
+                        addon_id, title, gamedir, author, date, description,
+                        package_name, package_path, package_size, package_sha256, package_mtime,
+                        published, draft, manifest_path, conversion_report, source_path, source_name
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, NULL, ?, ?, ?)
+                    """,
+                    (form["addon_id"], form["title"], form["gamedir"], form["author"], form["date"], form["description"], target.name, str(target),
+                     package["size"], package["sha256"], int(staged.stat().st_mtime), json.dumps(record, sort_keys=True), source_path, source_name),
+                )
+                addon_pk, published = cur.lastrowid, False
+            os.replace(staged, target)                       # last step: only after every database statement succeeded
+            installed_target = target
+        installed_target = None
+        kept = None
+        if old_source:
+            shutil.rmtree(Path(old_source).parent, ignore_errors=True)
+        _delete_import(token)
+        if published:
+            generate_catalog()
+    except JobCancelled:
+        if not keep_import_on_failure:
+            _delete_import(token)
         raise
-    return staged, info, msg
+    except (sqlite3.IntegrityError, OSError, ValueError) as exc:
+        if installed_target is not None and not replace:
+            installed_target.unlink(missing_ok=True)
+        if not keep_import_on_failure:
+            _delete_import(token)
+        raise JobFailed(f"Package rejected: {exc}", *retry) from exc
+    finally:
+        staged.unlink(missing_ok=True)
+        if kept is not None:
+            shutil.rmtree(kept.parent, ignore_errors=True)
+
+    note = f" Inspection found {warning_count} warning(s); see the add-on page." if warning_count else ""
+    if replace:
+        tail = " The public download still serves the previous package until you click Publish again." if published else ""
+        text = f"{message} Add-on updated.{note}{tail}"
+    else:
+        text = f"{message} Add-on saved as a draft.{note} Review and publish when ready."
+    return JobOutcome(text, "warning" if warning_count else "success", "addon_detail", {"addon_id": addon_pk})
+
+
+def _run_plan(token: str, progress: Progress) -> JobOutcome:
+    imp = _load_import(token)
+    if imp is None:
+        raise JobFailed("This import was cancelled or has expired. Start again from the add-on form.", "add_addon")
+    options = ConvertOptions.from_dict(json.loads(imp["options_json"] or "{}"))
+    progress.plan([("Reading archive", 4), ("Reading embedded PAKs", 96)])
+    try:
+        plan = plan_zip_release(Path(imp["source_path"]), options, progress=progress, workdir=_workdir())
+    except (OSError, ValueError) as exc:
+        _delete_import(token)
+        raise JobFailed(f"Package rejected: {exc}", "add_addon") from exc
+    except JobCancelled:
+        _delete_import(token)
+        raise
+    conn = get_db()
+    try:
+        conn.execute("UPDATE imports SET plan_json = ? WHERE token = ?", (json.dumps(plan), token))
+    finally:
+        conn.close()
+    return JobOutcome("The conversion preview is ready.", "success", "import_plan", {"token": token}, auto_redirect=True)
+
+
+def _run_publish(addon_pk: int, progress: Progress) -> JobOutcome:
+    conn = get_db()
+    try:
+        addon = conn.execute("SELECT * FROM addons WHERE id = ?", (addon_pk,)).fetchone()
+    finally:
+        conn.close()
+    if not addon:
+        raise JobFailed("The add-on no longer exists.", "dashboard")
+    package_path = Path(addon["package_path"])
+    if not package_path.exists():
+        raise JobFailed("Publish failed: the package file is missing.", "addon_detail", {"addon_id": addon_pk})
+    progress.plan([("Checking package", 3), ("Copying to the public folder", 97)])
+    progress("Checking package", 0, 1)
+    validate_pak_paths(package_path)
+    progress("Checking package", 1, 1)
+    public_dir = _public_addons_dir()
+    public_file = public_dir / f"{addon['addon_id']}.pak"
+    tmp_file = public_dir / f".publish-{uuid.uuid4().hex}.tmp"
+    try:
+        sha, size = _copy_hashing(package_path, tmp_file, progress, "Copying to the public folder")
+        if addon["package_sha256"] and addon["package_sha256"] != sha:
+            raise ValueError("Stored package hash does not match the file on disk")
+        os.replace(tmp_file, public_file)
+    except (OSError, ValueError) as exc:
+        raise JobFailed(f"Publish failed: {exc}", "addon_detail", {"addon_id": addon_pk}) from exc
+    finally:
+        tmp_file.unlink(missing_ok=True)
+    with db_txn() as conn:
+        conn.execute(
+            "UPDATE addons SET published = 1, draft = 0, package_size = ?, package_sha256 = ?, package_mtime = ?, manifest_path = ?, "
+            "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (size, sha, int(package_path.stat().st_mtime), str(public_file), addon_pk),
+        )
+    generate_catalog()
+    return JobOutcome("Add-on published and catalog regenerated.", "success", "dashboard")
+
+
+def _wants_json() -> bool:
+    return request.headers.get("X-Requested-With") == "XMLHttpRequest"
+
+
+def _job_response(job_id: str) -> Any:
+    target = url_for("job_page", job_id=job_id)
+    return jsonify({"redirect": target}) if _wants_json() else redirect(target)
+
+
+def _form_failure(message: str, template: str = "addon_form.html", **ctx: Any) -> Any:
+    if _wants_json():
+        return jsonify({"error": message}), 400
+    flash(message, "error")
+    return render_template(template, **ctx)
+
+
+@app.template_filter("filesize")
+def filesize_filter(value: Any) -> str:
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return "?"
+    for unit in ("bytes", "KiB", "MiB", "GiB"):
+        if n < 1024 or unit == "GiB":
+            return f"{int(n)} bytes" if unit == "bytes" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GiB"
 
 
 def ensure_dirs() -> None:
@@ -138,6 +441,14 @@ def db_txn() -> Iterator[sqlite3.Connection]:
         raise
     finally:
         conn.close()
+
+
+def _job_mode_inline() -> bool:
+    mode = app.config.get("JOB_MODE") or ("inline" if app.config.get("TESTING") else "thread")
+    return mode == "inline"
+
+
+jobs = JobManager(lambda: get_db(), _job_mode_inline, log=lambda m: print(m, flush=True))
 
 
 def init_db() -> None:
@@ -181,6 +492,32 @@ def init_db() -> None:
         conn.execute("ALTER TABLE addons ADD COLUMN package_sha256 TEXT")
     if "package_mtime" not in existing:
         conn.execute("ALTER TABLE addons ADD COLUMN package_mtime INTEGER")
+    if "conversion_report" not in existing:
+        conn.execute("ALTER TABLE addons ADD COLUMN conversion_report TEXT")
+    if "source_path" not in existing:
+        conn.execute("ALTER TABLE addons ADD COLUMN source_path TEXT")
+    if "source_name" not in existing:
+        conn.execute("ALTER TABLE addons ADD COLUMN source_name TEXT")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS imports (
+            token TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            addon_pk INTEGER,
+            form_json TEXT NOT NULL,
+            source_path TEXT NOT NULL,
+            source_name TEXT NOT NULL,
+            source_format TEXT NOT NULL,
+            owns_source INTEGER NOT NULL DEFAULT 1,
+            keep_source INTEGER NOT NULL DEFAULT 0,
+            review INTEGER NOT NULL DEFAULT 0,
+            options_json TEXT,
+            plan_json TEXT,
+            created_at REAL NOT NULL
+        )
+        """
+    )
+    jobs.init_schema(conn)
     conn.commit()
     conn.close()
 
@@ -484,110 +821,117 @@ def dashboard() -> Any:
     require_auth()
     conn = get_db()
     addons = conn.execute("SELECT * FROM addons ORDER BY created_at DESC").fetchall()
+    pending = conn.execute("SELECT token, kind, source_name, form_json, created_at, plan_json IS NOT NULL AS has_plan FROM imports WHERE review = 1 ORDER BY created_at DESC").fetchall()
     conn.close()
-    return render_template("dashboard.html", addons=addons)
+    pending_imports = [{"token": r["token"], "name": r["source_name"], "kind": r["kind"], "title": json.loads(r["form_json"]).get("title", ""),
+                        "age_minutes": int((time.time() - r["created_at"]) / 60)} for r in pending]
+    return render_template("dashboard.html", addons=addons, active_jobs=jobs.active(), pending_imports=pending_imports)
+
+
+def _read_addon_form() -> dict[str, str]:
+    return {
+        "title": request.form.get("title", "").strip(),
+        "addon_id": request.form.get("addon_id", "").strip(),
+        "gamedir": request.form.get("gamedir", "").strip(),
+        "author": request.form.get("author", "Unknown").strip(),
+        "date": request.form.get("date", "").strip(),
+        "description": request.form.get("description", "").strip(),
+    }
+
+
+def _stage_source(token: str) -> tuple[Path, str, bool]:
+    """Resolve the package the administrator supplied: a browser upload (saved under its own token directory) or a server path
+    (used in place, read-only). Returns (path, display name, owned_by_us). Raises ValueError with a user-facing message."""
+    if request.form.get("import_mode", "upload") == "local":
+        local_source = request.form.get("local_source", "").strip()
+        if not local_source:
+            raise ValueError("Local source path is required for local import.")
+        source_path = Path(local_source).expanduser()
+        if not source_path.is_absolute():
+            raise ValueError("Local source path must be absolute.")
+        if not source_path.exists():
+            raise ValueError("Local source file does not exist.")
+        if source_path.suffix.lower() not in (".zip", ".pak"):
+            raise ValueError("Local source must be a .zip or .pak file.")
+        print(f"[import] local source selected: {source_path}", flush=True)
+        return source_path, source_path.name, False
+    package_file = request.files.get("package")
+    if not package_file or not package_file.filename:
+        raise ValueError("Package file is required for upload mode.")
+    safe_name = secure_filename(package_file.filename)
+    if not safe_name:
+        raise ValueError("Invalid package filename.")
+    staging = Path(app.config["UPLOAD_FOLDER"]) / token
+    staging.mkdir(parents=True, exist_ok=True)
+    dest = staging / safe_name
+    print(f"[import] browser upload selected: {safe_name}", flush=True)
+    package_file.save(dest)
+    return dest, safe_name, True
+
+
+def _start_import(kind: str, addon_pk: int | None, form: dict[str, str], ctx: dict[str, Any]) -> Any:
+    """Shared by 'new' and 'replace': stage the file, record the import, start the plan or build job."""
+    token = uuid.uuid4().hex
+    template = "addon_form.html"
+    owned = False
+    try:
+        try:
+            source, name, owned = _stage_source(token)
+        except OSError as exc:
+            raise ValueError(str(exc)) from exc
+        fmt = detect_package_format(source)
+        print(f"[import] detected {fmt} for {name}; staged at {source}", flush=True)
+        if fmt not in ("zip", "pak"):
+            raise ValueError(f"Unsupported package format for {name!r}; expected a ZIP or Quake PAK")
+        conn = get_db()
+        try:
+            exclude = addon_pk if addon_pk is not None else -1
+            if conn.execute("SELECT 1 FROM addons WHERE addon_id = ? AND id != ?", (form["addon_id"], exclude)).fetchone():
+                raise ValueError("duplicate addon id")
+            if conn.execute("SELECT 1 FROM addons WHERE gamedir = ? AND id != ?", (form["gamedir"], exclude)).fetchone():
+                raise ValueError("duplicate gamedir")
+        finally:
+            conn.close()
+    except ValueError as exc:
+        shutil.rmtree(Path(app.config["UPLOAD_FOLDER"]) / token, ignore_errors=True)    # only ever exists if this request created it
+        message = str(exc)
+        if not message.startswith(("Local source", "Package file", "Invalid package")):
+            message = f"Package rejected: {message}"
+        return _form_failure(message, template, **ctx)
+    expire_stale_imports()
+    review = bool(request.form.get("review")) and fmt == "zip"
+    _save_import(token, kind, addon_pk, form, source, name, fmt, owned, bool(request.form.get("keep_source")) and fmt == "zip", review)
+    if review:
+        job_id = jobs.submit("plan", f"Preview of {name}", lambda progress: _run_plan(token, progress))
+    else:
+        job_id = jobs.submit("build", f"Convert {name}", lambda progress: _run_build(token, progress))
+    return _job_response(job_id)
 
 
 @app.route("/addons/new", methods=["GET", "POST"])
 def add_addon() -> Any:
     require_auth()
     if request.method == "POST":
-        title = request.form.get("title", "").strip()
-        addon_id = request.form.get("addon_id", "").strip()
-        gamedir = request.form.get("gamedir", "").strip()
-        author = request.form.get("author", "Unknown").strip()
-        date = request.form.get("date", "").strip()
-        description = request.form.get("description", "").strip()
-        package_file = request.files.get("package")
-        local_source = request.form.get("local_source", "").strip()
-        import_mode = request.form.get("import_mode", "upload")
-        if not title or not addon_id or not gamedir:
-            flash("Title, ID, and game dir are required.", "error")
-            return render_template("addon_form.html", mode="new")
-
-        if import_mode == "local":
-            if not local_source:
-                flash("Local source path is required for local import.", "error")
-                return render_template("addon_form.html", mode="new")
-            source_path = Path(local_source).expanduser()
-            if not source_path.is_absolute():
-                flash("Local source path must be absolute.", "error")
-                return render_template("addon_form.html", mode="new")
-            if not source_path.exists():
-                flash("Local source file does not exist.", "error")
-                return render_template("addon_form.html", mode="new")
-            if source_path.suffix.lower() not in (".zip", ".pak"):
-                flash("Local source must be a .zip or .pak file.", "error")
-                return render_template("addon_form.html", mode="new")
-            safe_name = source_path.name
-        else:
-            if not package_file or not package_file.filename:
-                flash("Package file is required for upload mode.", "error")
-                return render_template("addon_form.html", mode="new")
-            safe_name = secure_filename(package_file.filename)
-            if not safe_name:
-                flash("Invalid package filename.", "error")
-                return render_template("addon_form.html", mode="new")
-
-        target = _packages_dir() / f"{addon_id}.pak"
-        upload_dir = Path(app.config["UPLOAD_FOLDER"]) / uuid.uuid4().hex
-        upload_dir.mkdir(parents=True, exist_ok=True)
-        upload_source = upload_dir / safe_name
-        staged: Path | None = None
-        installed = False
-
-        try:
-            if import_mode == "local":
-                print(f"[import] local source selected: {source_path}", flush=True)
-                shutil.copy2(source_path, upload_source)
-            else:
-                print(f"[import] browser upload selected: {safe_name}", flush=True)
-                package_file.save(upload_source)
-            detected = detect_package_format(upload_source)
-            print(f"[import] detected {detected} for {safe_name}; staging at {upload_source}", flush=True)
-            conn = get_db()
-            try:
-                if conn.execute("SELECT 1 FROM addons WHERE addon_id = ?", (addon_id,)).fetchone():
-                    raise sqlite3.IntegrityError("duplicate addon id")
-                if conn.execute("SELECT 1 FROM addons WHERE gamedir = ?", (gamedir,)).fetchone():
-                    raise sqlite3.IntegrityError("duplicate gamedir")
-            finally:
-                conn.close()
-            staged, package_info, conversion_msg = _stage_package(upload_source, detected, safe_name)
-            print(f"[import] validated package for {addon_id}: size={package_info['size']} sha256={package_info['sha256']}", flush=True)
-            with db_txn() as conn:
-                if conn.execute("SELECT 1 FROM addons WHERE addon_id = ?", (addon_id,)).fetchone():
-                    raise sqlite3.IntegrityError("duplicate addon id")
-                if conn.execute("SELECT 1 FROM addons WHERE gamedir = ?", (gamedir,)).fetchone():
-                    raise sqlite3.IntegrityError("duplicate gamedir")
-                os.replace(staged, target)
-                installed = True
-                conn.execute(
-                    """
-                    INSERT INTO addons (
-                        addon_id, title, gamedir, author, date, description,
-                        package_name, package_path, package_size, package_sha256, package_mtime,
-                        published, draft, manifest_path
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, NULL)
-                    """,
-                    (addon_id, title, gamedir, author, date, description, target.name, str(target), package_info["size"], package_info["sha256"], int(target.stat().st_mtime)),
-                )
-        except (sqlite3.IntegrityError, OSError, ValueError) as exc:
-            if installed:
-                target.unlink(missing_ok=True)
-            flash(f"Package rejected: {exc}", "error")
-            return render_template("addon_form.html", mode="new")
-        finally:
-            if staged is not None:
-                staged.unlink(missing_ok=True)
-            shutil.rmtree(upload_dir, ignore_errors=True)
-
-        if import_mode == "local":
-            flash(f"Imported local file and {conversion_msg.lower()} Add-on saved as a draft. Review and publish when ready.", "success")
-        else:
-            flash(f"{conversion_msg} Add-on saved as a draft. Review and publish when ready.", "success")
-        return redirect(url_for("dashboard"))
+        form = _read_addon_form()
+        if not form["title"] or not form["addon_id"] or not form["gamedir"]:
+            return _form_failure("Title, ID, and game dir are required.", mode="new")
+        return _start_import("new", None, form, {"mode": "new"})
     return render_template("addon_form.html", mode="new")
+
+
+def _addon_inspection(addon: sqlite3.Row) -> Dict[str, Any]:
+    """Advisory, read-only view of the stored package. Never raises into the page."""
+    current = {k: addon[k] or "" for k in ("title", "author", "date", "description")}
+    result: Dict[str, Any] = {"report": None, "error": None, "conversion": None}
+    try:
+        result["conversion"] = json.loads(addon["conversion_report"]) if addon["conversion_report"] else None
+    except ValueError:
+        result["conversion"] = None
+    try:
+        result["report"] = analyze_pak(Path(addon["package_path"]), addon["gamedir"], current)
+    except (OSError, ValueError) as exc:
+        result["error"] = str(exc)
+    return result
 
 
 @app.route("/addons/<int:addon_id>")
@@ -598,7 +942,40 @@ def addon_detail(addon_id: int) -> Any:
     conn.close()
     if not addon:
         raise NotFound()
-    return render_template("addon_detail.html", addon=addon)
+    return render_template("addon_detail.html", addon=addon, inspection=_addon_inspection(addon))
+
+
+SUGGESTION_FIELDS = ("title", "author", "date", "description")
+
+
+@app.route("/addons/<int:addon_id>/suggestion/<field>", methods=["POST"])
+def apply_suggestion(addon_id: int, field: str) -> Any:
+    """Apply one metadata suggestion. The value is recomputed from the stored package, never taken from the request."""
+    require_auth()
+    if field not in SUGGESTION_FIELDS:
+        raise NotFound()
+    with db_txn() as conn:
+        addon = conn.execute("SELECT * FROM addons WHERE id = ?", (addon_id,)).fetchone()
+        if not addon:
+            raise NotFound()
+        inspection = _addon_inspection(addon)
+        suggestion = (inspection["report"] or {}).get("suggestions", {}).get(field)
+        if not suggestion:
+            flash(f"No {field} suggestion is available for this add-on.", "error")
+            return redirect(url_for("addon_detail", addon_id=addon_id))
+        value = suggestion["value"]
+        try:
+            if field == "date":
+                _validate_date(value)
+        except ValueError as exc:
+            flash(f"Suggested date rejected: {exc}", "error")
+            return redirect(url_for("addon_detail", addon_id=addon_id))
+        conn.execute(f"UPDATE addons SET {field} = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (value, addon_id))
+        published = bool(addon["published"])
+    if published:
+        generate_catalog()
+    flash(f"Set {field} from {suggestion['source']}.", "success")
+    return redirect(url_for("addon_detail", addon_id=addon_id))
 
 
 @app.route("/addons/<int:addon_id>/edit", methods=["GET", "POST"])
@@ -611,106 +988,201 @@ def edit_addon(addon_id: int) -> Any:
         conn.close()
     if not addon:
         raise NotFound()
+    ctx = {"mode": "edit", "addon": dict(addon)}
     if request.method == "POST":
-        title = request.form.get("title", "").strip()
-        addon_id_value = request.form.get("addon_id", "").strip()
-        gamedir = request.form.get("gamedir", "").strip()
-        author = request.form.get("author", "Unknown").strip()
-        date = request.form.get("date", "").strip()
-        description = request.form.get("description", "").strip()
+        form = _read_addon_form()
+        if not form["title"] or not form["addon_id"] or not form["gamedir"]:
+            return _form_failure("Title, ID, and game dir are required.", **ctx)
+        if form["addon_id"] != addon["addon_id"] and addon["published"]:
+            return _form_failure("Unpublish this add-on before changing its ID (the public download path is derived from it).", **ctx)
         package_file = request.files.get("package")
-        if not title or not addon_id_value or not gamedir:
-            flash("Title, ID, and game dir are required.", "error")
-            return render_template("addon_form.html", mode="edit", addon=dict(addon))
-        if addon_id_value != addon["addon_id"] and addon["published"]:
-            flash("Unpublish this add-on before changing its ID (the public download path is derived from it).", "error")
-            return render_template("addon_form.html", mode="edit", addon=dict(addon))
-
-        staged: Path | None = None
-        upload_dir: Path | None = None
-        package_info: dict[str, Any] | None = None
-        replaced_package = False
+        if (package_file and package_file.filename) or request.form.get("import_mode") == "local":
+            return _start_import("replace", addon_id, form, ctx)
         try:
-            if package_file and package_file.filename:
-                safe_name = secure_filename(package_file.filename)
-                if not safe_name:
-                    raise ValueError("Invalid package filename.")
-                upload_dir = Path(app.config["UPLOAD_FOLDER"]) / uuid.uuid4().hex
-                upload_dir.mkdir(parents=True, exist_ok=True)
-                upload_source = upload_dir / safe_name
-                package_file.save(upload_source)
-                detected = detect_package_format(upload_source)
-                staged, package_info, _msg = _stage_package(upload_source, detected, safe_name)
-            current_path = Path(addon["package_path"])
             with db_txn() as conn:
-                if conn.execute("SELECT 1 FROM addons WHERE addon_id = ? AND id != ?", (addon_id_value, addon_id)).fetchone():
+                if conn.execute("SELECT 1 FROM addons WHERE addon_id = ? AND id != ?", (form["addon_id"], addon_id)).fetchone():
                     raise sqlite3.IntegrityError("duplicate addon id")
-                if conn.execute("SELECT 1 FROM addons WHERE gamedir = ? AND id != ?", (gamedir, addon_id)).fetchone():
+                if conn.execute("SELECT 1 FROM addons WHERE gamedir = ? AND id != ?", (form["gamedir"], addon_id)).fetchone():
                     raise sqlite3.IntegrityError("duplicate gamedir")
-                if package_info is not None:
-                    conn.execute(
-                        "UPDATE addons SET package_size = ?, package_sha256 = ?, package_mtime = ? WHERE id = ?",
-                        (package_info["size"], package_info["sha256"], package_info["mtime"], addon_id),
-                    )
                 conn.execute(
                     "UPDATE addons SET title = ?, addon_id = ?, gamedir = ?, author = ?, date = ?, description = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                    (title, addon_id_value, gamedir, author, date, description, addon_id),
+                    (form["title"], form["addon_id"], form["gamedir"], form["author"], form["date"], form["description"], addon_id),
                 )
-                if staged is not None:
-                    os.replace(staged, current_path)
-                    replaced_package = True
-        except (sqlite3.IntegrityError, OSError, ValueError) as exc:
-            flash(f"Package rejected: {exc}" if package_info is not None or upload_dir is not None else f"Update rejected: {exc}", "error")
-            return render_template("addon_form.html", mode="edit", addon=dict(addon))
-        finally:
-            if staged is not None:
-                staged.unlink(missing_ok=True)
-            if upload_dir is not None:
-                shutil.rmtree(upload_dir, ignore_errors=True)
+        except sqlite3.IntegrityError as exc:
+            return _form_failure(f"Update rejected: {exc}", **ctx)
         if addon["published"]:
             generate_catalog()
-            if replaced_package:
-                flash("Add-on updated. The public download still serves the previous package until you click Publish again.", "success")
-            else:
-                flash("Add-on updated.", "success")
-        else:
-            flash("Add-on updated.", "success")
+        flash("Add-on updated.", "success")
         return redirect(url_for("addon_detail", addon_id=addon_id))
-    return render_template("addon_form.html", mode="edit", addon=dict(addon))
+    return render_template("addon_form.html", **ctx)
+
+
+@app.route("/addons/<int:addon_id>/rebuild", methods=["POST"])
+def rebuild_addon(addon_id: int) -> Any:
+    """Re-run the conversion from the source ZIP that was kept at upload time, with options chosen on the preview page."""
+    require_auth()
+    conn = get_db()
+    try:
+        addon = conn.execute("SELECT * FROM addons WHERE id = ?", (addon_id,)).fetchone()
+    finally:
+        conn.close()
+    if not addon:
+        raise NotFound()
+    source = Path(addon["source_path"]) if addon["source_path"] else None
+    if source is None or not source.is_file():
+        flash("No source ZIP was kept for this add-on, so it cannot be rebuilt. Upload the ZIP again from Edit.", "error")
+        return redirect(url_for("addon_detail", addon_id=addon_id))
+    fmt = detect_package_format(source)
+    if fmt != "zip":
+        flash("The kept source is not a ZIP file.", "error")
+        return redirect(url_for("addon_detail", addon_id=addon_id))
+    token = uuid.uuid4().hex
+    form = {k: (addon[k] or "") for k in FORM_FIELDS}
+    _save_import(token, "replace", addon_id, form, source, addon["source_name"] or source.name, fmt, owns_source=False, keep_source=False, review=True)
+    job_id = jobs.submit("plan", f"Preview of {source.name}", lambda progress: _run_plan(token, progress))
+    return _job_response(job_id)
+
+
+@app.route("/imports/<token>")
+def import_plan(token: str) -> Any:
+    require_auth()
+    imp = _load_import(token)
+    if imp is None:
+        flash("This import was cancelled or has expired.", "error")
+        return redirect(url_for("add_addon"))
+    plan = json.loads(imp["plan_json"]) if imp["plan_json"] else None
+    options = ConvertOptions.from_dict(json.loads(imp["options_json"] or "{}"))
+    return render_template("import_plan.html", imp=imp, plan=plan, options=options, form=json.loads(imp["form_json"]), presets=PRESETS,
+                           space=_space_estimate(plan, imp))
+
+
+def _space_estimate(plan: dict[str, Any] | None, imp: sqlite3.Row) -> dict[str, Any] | None:
+    """Rough free-space check for the conversion: extracted files + the new package in the work area, plus a kept copy of the source."""
+    if not plan:
+        return None
+    need = 2 * plan["payload_bytes"] + sum(p["bytes"] for p in plan["embedded_paks"])
+    if imp["keep_source"]:
+        try:
+            need += Path(imp["source_path"]).stat().st_size
+        except OSError:
+            pass
+    try:
+        free_work = shutil.disk_usage(_workdir()).free
+        free_data = shutil.disk_usage(_packages_dir()).free
+    except OSError:
+        return None
+    return {"need": need, "free_work": free_work, "free_data": free_data,
+            "low": free_work < need or free_data < plan["payload_bytes"] + 64 * plan["entries"]}
+
+
+def _import_or_404(token: str) -> sqlite3.Row:
+    imp = _load_import(token)
+    if imp is None:
+        raise NotFound()
+    return imp
+
+
+def _store_options(token: str, imp: sqlite3.Row) -> ConvertOptions | None:
+    try:
+        options = options_from_form(request.form)
+    except ValueError as exc:
+        flash(f"Options rejected: {exc}", "error")
+        return None
+    conn = get_db()
+    try:
+        keep = 1 if request.form.get("keep_source") else 0
+        conn.execute("UPDATE imports SET options_json = ?, keep_source = ? WHERE token = ?", (json.dumps(options.to_dict()), keep, token))
+    finally:
+        conn.close()
+    return options
+
+
+@app.route("/imports/<token>/plan", methods=["POST"])
+def import_replan(token: str) -> Any:
+    require_auth()
+    imp = _import_or_404(token)
+    if _store_options(token, imp) is None:
+        return redirect(url_for("import_plan", token=token))
+    return _job_response(jobs.submit("plan", f"Preview of {imp['source_name']}", lambda progress: _run_plan(token, progress)))
+
+
+@app.route("/imports/<token>/build", methods=["POST"])
+def import_build(token: str) -> Any:
+    require_auth()
+    imp = _import_or_404(token)
+    if _store_options(token, imp) is None:
+        return redirect(url_for("import_plan", token=token))
+    return _job_response(jobs.submit("build", f"Convert {imp['source_name']}", lambda progress: _run_build(token, progress)))
+
+
+@app.route("/imports/<token>/cancel", methods=["POST"])
+def import_cancel(token: str) -> Any:
+    require_auth()
+    imp = _import_or_404(token)
+    _delete_import(token)
+    flash("Import cancelled; the uploaded file was removed.", "success")
+    return redirect(url_for("edit_addon", addon_id=imp["addon_pk"]) if imp["addon_pk"] else url_for("dashboard"))
+
+
+@app.route("/jobs/<job_id>")
+def job_page(job_id: str) -> Any:
+    require_auth()
+    job = jobs.get(job_id)
+    if job is None:
+        raise NotFound()
+    return render_template("job.html", job=job, next_url=_job_next_url(job))
+
+
+def _job_next_url(job: dict[str, Any]) -> str | None:
+    if not job.get("next_endpoint"):
+        return None
+    try:
+        return url_for(job["next_endpoint"], **job["next_values"])
+    except Exception:
+        return None
+
+
+@app.route("/jobs/<job_id>/status")
+def job_status(job_id: str) -> Any:
+    require_auth()
+    job = jobs.get(job_id)
+    if job is None:
+        raise NotFound()
+    now = time.time()
+    finished = job["state"] in ("done", "failed", "cancelled")
+    response = jsonify({
+        "id": job["id"], "kind": job["kind"], "title": job["title"], "state": job["state"], "stage": job["stage"],
+        "done": job["done"], "total": job["total"], "percent": job["percent"], "message": job["message"], "level": job["level"],
+        "finished": finished, "next_url": _job_next_url(job) if finished else None, "auto_redirect": bool(job["next_auto"]) and job["state"] == "done",
+        "elapsed": round((job["finished_at"] or now) - (job["started_at"] or job["created_at"]), 1),
+        "seconds_since_update": round(now - job["updated_at"], 1),
+    })
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.route("/jobs/<job_id>/cancel", methods=["POST"])
+def job_cancel(job_id: str) -> Any:
+    require_auth()
+    if jobs.get(job_id) is None:
+        raise NotFound()
+    jobs.request_cancel(job_id)
+    if _wants_json():
+        return jsonify({"ok": True})
+    return redirect(url_for("job_page", job_id=job_id))
 
 
 @app.route("/addons/<int:addon_id>/publish", methods=["POST"])
 def publish_addon(addon_id: int) -> Any:
     require_auth()
-    with db_txn() as conn:
-        addon = conn.execute("SELECT * FROM addons WHERE id = ?", (addon_id,)).fetchone()
-        if not addon:
-            raise NotFound()
-        package_path = Path(addon["package_path"])
-        if not package_path.exists():
-            raise FileNotFoundError("Package file is missing")
-        package_info = validate_package(package_path)
-        if addon["package_sha256"] and addon["package_sha256"] != package_info["sha256"]:
-            raise ValueError("Stored package hash does not match the file on disk")
-
-        public_dir = _public_addons_dir()
-        public_file = public_dir / f"{addon['addon_id']}.pak"
-        tmp_file = public_dir / f".publish-{uuid.uuid4().hex}.tmp"
-        try:
-            shutil.copyfile(package_path, tmp_file)
-            if _sha256_file(tmp_file) != package_info["sha256"]:
-                raise ValueError("Published copy does not match the validated package; publication aborted")
-            os.replace(tmp_file, public_file)
-        finally:
-            tmp_file.unlink(missing_ok=True)
-
-        conn.execute(
-            "UPDATE addons SET published = 1, draft = 0, package_size = ?, package_sha256 = ?, package_mtime = ?, manifest_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (package_info["size"], package_info["sha256"], package_info["mtime"], str(public_file), addon_id),
-        )
-    generate_catalog()
-    flash("Add-on published and catalog regenerated.", "success")
-    return redirect(url_for("dashboard"))
+    conn = get_db()
+    try:
+        addon = conn.execute("SELECT title FROM addons WHERE id = ?", (addon_id,)).fetchone()
+    finally:
+        conn.close()
+    if not addon:
+        raise NotFound()
+    return _job_response(jobs.submit("publish", f"Publish {addon['title']}", lambda progress: _run_publish(addon_id, progress)))
 
 
 @app.route("/addons/<int:addon_id>/unpublish", methods=["POST"])
@@ -735,6 +1207,10 @@ def delete_addon(addon_id: int) -> Any:
             package_file = Path(addon["package_path"])
             if package_file.exists():
                 package_file.unlink(missing_ok=True)
+            if addon["source_path"]:
+                kept_dir = Path(addon["source_path"]).parent
+                if kept_dir.parent == Path(app.config["PERSIST_ROOT"]) / "sources":
+                    shutil.rmtree(kept_dir, ignore_errors=True)
             conn.execute("DELETE FROM addons WHERE id = ?", (addon_id,))
     generate_catalog()
     flash("Add-on deleted.", "success")
@@ -819,8 +1295,9 @@ def main() -> int:
     except Exception as exc:
         print(f"Database initialization failed: {exc}", file=sys.stderr)
         return 1
+    startup_cleanup()
     generate_catalog()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), threaded=True)
     return 0
 
 

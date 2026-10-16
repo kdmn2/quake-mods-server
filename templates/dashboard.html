@@ -7,6 +7,35 @@
   <pre>ironwail -addons {{ public_base_url }}</pre>
 </div>
 
+{% if active_jobs %}
+<div class="card">
+  <h2>Running jobs</h2>
+  <table class="table-sm">
+    {% for j in active_jobs %}
+    <tr><td>{{ j.title }}</td><td>{{ j.stage or j.state }}</td><td>{{ j.percent|round|int }}%</td><td><a href="{{ url_for('job_page', job_id=j.id) }}">Watch</a></td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+
+{% if pending_imports %}
+<div class="card">
+  <h2>Pending uploads</h2>
+  <p class="small muted">Uploaded and waiting for you to review and build. Discarded automatically after 24 hours.</p>
+  <table class="table-sm">
+    {% for p in pending_imports %}
+    <tr>
+      <td>{{ p.title or p.name }} <span class="small muted">({{ p.name }}{% if p.kind == 'replace' %}, replaces an existing package{% endif %})</span></td>
+      <td>{{ p.age_minutes }} min ago</td>
+      <td><a href="{{ url_for('import_plan', token=p.token) }}">Review</a></td>
+      <td><form style="display:inline" method="post" action="{{ url_for('import_cancel', token=p.token) }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="danger" type="submit">Discard</button></form></td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+
 <div class="card">
   <h2>Collection</h2>
   <table>

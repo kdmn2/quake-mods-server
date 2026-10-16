@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Ironwail Add-on Admin</title>
+  {% block head %}{% endblock %}
   <style>
     body { font-family: Arial, sans-serif; margin: 0; background: #f5f7fb; color: #1a1a1a; }
     .topbar { background: #152238; color: white; padding: 16px 24px; display: flex; justify-content: space-between; }
@@ -24,6 +25,22 @@
     .flash.error { background: #fbeaea; }
     .inline { display: flex; gap: 10px; align-items: center; }
     .small { font-size: 12px; }
+    .sev { padding: 8px 10px; margin: 6px 0; border-radius: 6px; border-left: 4px solid #8a94a6; background: #f3f5f9; }
+    .sev.warning { border-left-color: #b42318; background: #fbeaea; }
+    .sev.info { border-left-color: #1c6fe5; }
+    .progress { background: #e3e8ef; border-radius: 8px; height: 20px; overflow: hidden; margin: 12px 0; }
+    .progress > div { background: #1c6fe5; height: 100%; width: 0; transition: width .3s ease; }
+    .progress.failed > div { background: #b42318; }
+    .progress.done > div { background: #127c47; }
+    .flash.warning { background: #fff6e0; }
+    .flash.info { background: #eef3fb; }
+    .opt { padding: 10px 12px; margin: 8px 0; border: 1px solid #e3e8ef; border-radius: 8px; }
+    .opt h4 { margin: 0 0 6px; }
+    .bad { color: #b42318; font-weight: bold; }
+    button[disabled] { background: #9aa4b5; cursor: not-allowed; }
+    details summary { cursor: pointer; font-weight: bold; margin: 8px 0; }
+    code, .mono { font-family: monospace; word-break: break-all; }
+    .table-sm td, .table-sm th { padding: 5px 8px; font-size: 13px; }
   </style>
 </head>
 <body>

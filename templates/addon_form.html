@@ -2,7 +2,7 @@
 {% block content %}
 <div class="card">
   <h2>{% if mode == 'edit' %}Edit add-on{% else %}Add a new add-on{% endif %}</h2>
-  <form method="post" enctype="multipart/form-data">
+  <form method="post" enctype="multipart/form-data" id="addon-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <p>
       <label>Title</label><br>
@@ -42,7 +42,69 @@
       <input name="local_source" value="" placeholder="/mnt/user/appdata/.../mod.zip">
       <div class="small muted">Used only when importing from a file already on the server.</div>
     </p>
-    <button type="submit">Save</button>
+    <p>
+      <label><input type="checkbox" name="review" value="1" checked> Review the conversion before building (recommended for ZIP releases)</label>
+      <div class="small muted">Shows what the package will contain and offers optional clean-ups (leaving out sources, lossless image re-encoding, root selection). Ignored for plain PAK files.</div>
+    </p>
+    <p>
+      <label><input type="checkbox" name="keep_source" value="1"> Keep the uploaded ZIP on the server (lets you rebuild with different options later)</label>
+    </p>
+    <button type="submit" id="submit-btn">{% if mode == 'edit' %}Save{% else %}Upload{% endif %}</button>
+    <div id="upload-box" hidden>
+      <div class="progress"><div id="upload-bar"></div></div>
+      <p id="upload-text" class="small"></p>
+      <p class="small muted">Keep this page open until the upload reaches 100%. Conversion then continues in the background and you can leave the page.</p>
+      <button type="button" class="danger" id="upload-abort">Cancel upload</button>
+    </div>
+    <div id="upload-error" class="flash error" hidden></div>
   </form>
 </div>
+<script>
+(function () {
+  var form = document.getElementById('addon-form');
+  if (!form || !window.XMLHttpRequest || !window.FormData) return;     // without JavaScript the form still posts normally
+  var $ = function (id) { return document.getElementById(id); };
+  function bytes(n) {
+    var u = ['B', 'KiB', 'MiB', 'GiB'], i = 0;
+    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return n.toFixed(i && n < 100 ? 1 : 0) + ' ' + u[i];
+  }
+  function clock(s) { s = Math.max(0, Math.round(s)); return Math.floor(s / 60) + ':' + ('0' + (s % 60)).slice(-2); }
+  form.addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var xhr = new XMLHttpRequest(), started = Date.now();
+    $('upload-error').hidden = true;
+    $('submit-btn').disabled = true;
+    $('upload-box').hidden = false;
+    $('upload-bar').style.width = '0%';
+    $('upload-text').textContent = 'Starting upload…';
+    xhr.open('POST', form.getAttribute('action') || window.location.href);
+    xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+    xhr.setRequestHeader('Accept', 'application/json');
+    xhr.upload.onprogress = function (e) {
+      if (!e.lengthComputable) { $('upload-text').textContent = bytes(e.loaded) + ' sent'; return; }
+      var secs = (Date.now() - started) / 1000, rate = secs > 0 ? e.loaded / secs : 0;
+      $('upload-bar').style.width = (100 * e.loaded / e.total) + '%';
+      $('upload-text').textContent = bytes(e.loaded) + ' of ' + bytes(e.total) + ' (' + Math.round(100 * e.loaded / e.total) + '%)' +
+        (rate > 0 ? ' · ' + bytes(rate) + '/s · about ' + clock((e.total - e.loaded) / rate) + ' left' : '');
+    };
+    xhr.upload.onload = function () { $('upload-bar').style.width = '100%'; $('upload-text').textContent = 'Upload complete. Starting the job…'; };
+    function fail(msg) {
+      $('upload-box').hidden = true; $('submit-btn').disabled = false;
+      var box = $('upload-error'); box.textContent = msg; box.hidden = false;
+    }
+    xhr.onload = function () {
+      var data = null;
+      try { data = JSON.parse(xhr.responseText); } catch (e) { /* not JSON */ }
+      if (xhr.status >= 200 && xhr.status < 300 && data && data.redirect) { window.location.href = data.redirect; return; }
+      if (data && data.error) { fail(data.error); return; }
+      fail('The server rejected the upload (HTTP ' + xhr.status + (xhr.status === 413 ? ': the file is larger than the configured limit' : '') + ').');
+    };
+    xhr.onerror = function () { fail('The connection was interrupted. Nothing was saved; please try again.'); };
+    xhr.onabort = function () { fail('Upload cancelled.'); };
+    $('upload-abort').onclick = function () { xhr.abort(); };
+    xhr.send(new FormData(form));
+  });
+})();
+</script>
 {% endblock %}

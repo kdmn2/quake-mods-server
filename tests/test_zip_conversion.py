@@ -173,6 +173,12 @@ class ZipConversionTests(unittest.TestCase):
         got, info, _ = self.convert([("pak0.pak", make_pak_bytes([("a", b"a")])), ("docs/readme.txt", b"r")])
         self.assertEqual((info["root_mapping"], got), ("rooted", {"a": b"a", "docs/readme.txt": b"r"}))
 
+    def test_localization_and_map_source_folders_do_not_make_a_second_root(self):
+        # Ironwail reads localization/loc_<lang>.txt (common.c); mapsrc/ holds map sources. Neither is a mod root.
+        members = [("pak0.pak", make_pak_bytes([("a", b"a")])), ("localization/loc_english.txt", b"l"), ("mapsrc/a.map", b"m"), ("maps/b.bsp", b"b")]
+        got, info, _, = self.convert(members)
+        self.assertEqual((info["root_mapping"], sorted(got)), ("rooted", ["a", "localization/loc_english.txt", "maps/b.bsp", "mapsrc/a.map"]))
+
     def test_single_wrapper_is_stripped_only_when_common(self):
         members = [("qbj/pak0.pak", make_pak_bytes([("a", b"a")])), ("qbj/maps/m.bsp", b"m"), ("qbj/quake.rc", b"rc")]
         got, info, _ = self.convert(members)
