@@ -18,7 +18,7 @@ from werkzeug.exceptions import BadRequest, Forbidden, NotFound, RequestEntityTo
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
-from tools.catalog import build_single_pak_from_zip, detect_package_format, inspect_zip_release, validate_package, validate_pak_paths
+from tools.catalog import _compute_sha256 as _sha256_file, build_single_pak_from_zip, detect_package_format, inspect_zip_release, validate_package, validate_pak_paths
 
 app = Flask(__name__)
 app.config.update(
@@ -39,31 +39,20 @@ LOCK = threading.RLock()
 APP_VERSION = os.environ.get("APP_VERSION", "dev")
 
 
-def _db_path_candidates() -> list[Path]:
-    persist_root = Path(app.config["PERSIST_ROOT"])
-    candidates: list[Path] = []
+def _db_path() -> Path:
     configured = str(app.config.get("DB_PATH") or "").strip()
-    if configured:
-        candidates.append(Path(configured))
-    candidates.append(persist_root / "addons.sqlite3")
-    candidates.append(Path(app.config["UPLOAD_FOLDER"]) / "addons.sqlite3")
-    if persist_root != Path("/appdata"):
-        candidates.append(Path("/appdata") / "addons.sqlite3")
-    return candidates
+    return Path(configured) if configured else Path(app.config["PERSIST_ROOT"]) / "addons.sqlite3"
 
 
 def _resolve_db_path(ensure_parent: bool = True) -> Path:
-    last_error: Exception | None = None
-    for candidate in _db_path_candidates():
+    """The one configured database path. There is deliberately no fallback location."""
+    path = _db_path()
+    if ensure_parent:
         try:
-            if ensure_parent:
-                candidate.parent.mkdir(parents=True, exist_ok=True)
-            return candidate
-        except Exception as exc:
-            last_error = exc
-    if last_error:
-        raise PermissionError(f"Unable to prepare any SQLite database path: {last_error}") from last_error
-    raise PermissionError("Unable to resolve SQLite database path")
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise PermissionError(f"Cannot create database directory {path.parent}: {exc}") from exc
+    return path
 
 
 def _diagnose_path(path: Path) -> Dict[str, Any]:
@@ -84,17 +73,37 @@ def _effective_config() -> Dict[str, str]:
 
 
 def _build_release_package_from_zip(source_path: Path, target: Path, staging_dir: Path) -> dict[str, Any]:
-    layout = inspect_zip_release(source_path)
-    if not layout['embedded_paks'] and not layout['loose']:
-        raise ValueError(f"{source_path.name!r} does not contain any representable files")
-    if layout['has_wrapper'] and len(layout['wrapper_dirs']) > 1:
-        raise ValueError(f"ZIP release has multiple top-level wrapper directories: {layout['wrapper_dirs']}")
     info = build_single_pak_from_zip(source_path, target)
     print(
-        f"[import] ZIP release consolidated into single PAK with {len(info['paths'])} entries from {len(layout['embedded_paks'])} embedded PAK(s) and {len(layout['loose'])} loose file(s)",
+        f"[import] ZIP release ({info['root_mapping']}{' ' + repr(info['wrapper']) if info['wrapper'] else ''}) consolidated into single PAK with "
+        f"{info['entries']} entries from {len(info['embedded_paks'])} embedded PAK(s) and {info['loose_files']} loose file(s); "
+        f"{len(info['overrides'])} path(s) overridden by engine precedence",
         flush=True,
     )
     return validate_package(target)
+
+
+def _stage_package(upload_source: Path, detected: str, safe_name: str) -> Tuple[Path, dict[str, Any], str]:
+    """Produce a validated package in a staging file next to the final location (same filesystem).
+
+    Nothing at the final package path is touched here; the caller swaps it in with os.replace.
+    """
+    staged = _packages_dir() / f".staging-{uuid.uuid4().hex}.pak"
+    try:
+        if detected == "zip":
+            info = _build_release_package_from_zip(upload_source, staged, upload_source.parent)
+            msg = "Uploaded ZIP release was inspected and packaged from its embedded PAK."
+        elif detected == "pak":
+            shutil.copyfile(upload_source, staged)
+            print(f"[import] staged PAK unchanged at {staged}", flush=True)
+            info = validate_package(staged)
+            msg = "Uploaded PAK was stored unchanged."
+        else:
+            raise ValueError(f"Unsupported package format for {safe_name!r}; expected a ZIP or Quake PAK")
+    except BaseException:
+        staged.unlink(missing_ok=True)
+        raise
+    return staged, info, msg
 
 
 def ensure_dirs() -> None:
@@ -106,23 +115,6 @@ def ensure_dirs() -> None:
             Path(p).mkdir(parents=True, exist_ok=True)
         except PermissionError as exc:
             raise PermissionError(f"Cannot create required directory {p}: {exc}") from exc
-
-
-def _best_effort_persist_root() -> Path:
-    configured = Path(app.config.get("PERSIST_ROOT") or "/appdata")
-    candidates = [configured, Path("/appdata"), Path(app.config["UPLOAD_FOLDER"]) / "appdata"]
-    for candidate in candidates:
-        try:
-            candidate.mkdir(parents=True, exist_ok=True)
-            if os.access(candidate, os.W_OK | os.X_OK):
-                return candidate
-        except Exception:
-            continue
-    return configured
-
-
-app.config["PERSIST_ROOT"] = str(_best_effort_persist_root())
-ensure_dirs()
 
 
 def get_db() -> sqlite3.Connection:
@@ -193,59 +185,130 @@ def init_db() -> None:
     conn.close()
 
 
-def startup_preflight() -> Tuple[bool, list[str]]:
+def _owner_hint(path: Path) -> str:
+    probe = path
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    try:
+        st = probe.stat()
+        owner = f"{probe} is owned by uid:gid {st.st_uid}:{st.st_gid} mode {oct(st.st_mode & 0o777)}"
+    except OSError:
+        owner = f"{probe} could not be inspected"
+    return (f"{owner}; the container runs as uid:gid {os.getuid() if hasattr(os, 'getuid') else '?'}:{os.getgid() if hasattr(os, 'getgid') else '?'}. "
+            "Fix the host directory ownership/mode (or run the container with --user matching the owner). Existing data was not modified.")
+
+
+def _check_dir_writable(path: Path, label: str) -> str | None:
+    """Prove a directory is usable by creating and removing a real file. Never changes ownership or modes."""
+    try:
+        if path.exists() and not path.is_dir():
+            return f"{label}: {path} exists but is not a directory"
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / f".probe-{uuid.uuid4().hex}"
+        with open(probe, "wb") as fh:
+            fh.write(b"ok")
+        probe.unlink()
+    except OSError as exc:
+        import errno
+        if exc.errno == errno.EROFS:
+            return f"{label}: {path} is on a read-only filesystem/mount (mount it read-write)"
+        if exc.errno in (errno.EACCES, errno.EPERM):
+            return f"{label}: permission denied writing to {path}. {_owner_hint(path)}"
+        if exc.errno in (errno.ENOSPC, errno.EDQUOT):
+            return f"{label}: no space or quota left for {path} ({exc})"
+        if exc.errno == errno.ENOENT:
+            return f"{label}: {path} is missing and could not be created ({exc})"
+        return f"{label}: {path} is not usable: {exc}"
+    return None
+
+
+def _check_database(db_path: Path, lock_timeout: float = 5.0) -> str | None:
+    if db_path.exists():
+        if not db_path.is_file():
+            return f"database: {db_path} exists but is not a regular file"
+        if not os.access(db_path, os.R_OK | os.W_OK):
+            return f"database: permission denied on existing file {db_path}. {_owner_hint(db_path)}"
+    conn = None
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=lock_timeout, isolation_level=None)
+        conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("ROLLBACK")
+    except sqlite3.DatabaseError as exc:
+        msg = str(exc).lower()
+        if "locked" in msg or "busy" in msg:
+            return f"database: {db_path} is locked by another process ({exc}); stop the other instance or fix the network/FUSE share locking"
+        if "readonly" in msg or "read-only" in msg:
+            return f"database: {db_path} is read-only ({exc}). {_owner_hint(db_path)}"
+        if "not a database" in msg or "malformed" in msg:
+            return f"database: {db_path} is not a valid SQLite database ({exc}); it was left untouched, restore it from backup"
+        if "unable to open" in msg:
+            return f"database: cannot open {db_path} ({exc}). {_owner_hint(db_path)}"
+        return f"database: {db_path}: {exc}"
+    finally:
+        if conn is not None:
+            conn.close()
+    return None
+
+
+def _mountinfo_points(text: str) -> set[str]:
+    points = set()
+    for line in text.splitlines():
+        fields = line.split(" ")
+        if len(fields) > 4:
+            points.add(fields[4].replace("\\040", " "))
+    return points
+
+
+def persistence_warnings(mountinfo: str | None = None) -> list[str]:
+    """Non-fatal: warn when PERSIST_ROOT/PUBLIC_ROOT are not mounts, i.e. data would live in the container layer."""
+    try:
+        text = mountinfo if mountinfo is not None else Path("/proc/self/mountinfo").read_text()
+    except OSError:
+        return []
+    points = _mountinfo_points(text)
+    warnings = []
+    for key in ("PERSIST_ROOT", "PUBLIC_ROOT"):
+        root = os.path.realpath(str(app.config[key]))
+        if root not in points:
+            warnings.append(f"{key} {root} is not a mount point; if this is a container, its data lives in the container layer and will be LOST when it is recreated. Map a host directory to {root}.")
+    return warnings
+
+
+def startup_preflight(lock_timeout: float = 5.0) -> Tuple[bool, list[str]]:
+    """Diagnose the configured locations only. Never relocates data, never changes config, never chmods."""
     issues: list[str] = []
-    try:
-        ensure_dirs()
-    except Exception as exc:
-        issues.append(f"filesystem: {exc}")
-        return False, issues
-    try:
-        db_path = _resolve_db_path()
-        probe_dir = db_path.parent
-        probe_dir.mkdir(parents=True, exist_ok=True)
-        probe = probe_dir / f".probe-{uuid.uuid4().hex}"
-        try:
-            with open(probe, "wb") as fh:
-                fh.write(b"ok")
-        finally:
-            try:
-                probe.unlink(missing_ok=True)
-            except Exception:
-                pass
-        conn = sqlite3.connect(str(db_path), timeout=5, isolation_level=None)
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("SELECT 1")
-        conn.close()
-    except Exception as exc:
-        msg = str(exc)
-        if isinstance(exc, PermissionError) or "Permission denied" in msg:
-            issues.append(
-                f"permissions: the database directory is not writable ({db_path.parent if 'db_path' in locals() else app.config.get('DB_PATH')}). "
-                f"Container uid/gid {os.getuid() if hasattr(os, 'getuid') else '?'}:{os.getgid() if hasattr(os, 'getgid') else '?'}, "
-                f"check the Unraid appdata bind mount ownership and read/write mode. Existing data was not modified."
-            )
-        else:
-            issues.append(f"database: {exc}")
-        return False, issues
-    # If the configured PERSIST_ROOT is not writable but /appdata is, prefer /appdata
-    # so a stale container config can still start with the intended Unraid mount.
-    try:
-        prefer = Path("/appdata")
-        if prefer.exists() and os.access(prefer, os.W_OK | os.X_OK):
-            app.config["PERSIST_ROOT"] = str(prefer)
-            if not str(app.config.get("DB_PATH") or "").strip():
-                app.config["DB_PATH"] = str(prefer / "addons.sqlite3")
-    except Exception:
-        pass
-    return True, issues
+    db_path = _db_path()
+    checked: set[str] = set()
+    for label, path in (
+        ("persist root", Path(app.config["PERSIST_ROOT"])),
+        ("database directory", db_path.parent),
+        ("public root", Path(app.config["PUBLIC_ROOT"])),
+        ("upload folder", Path(app.config["UPLOAD_FOLDER"])),
+    ):
+        if str(path) in checked:
+            continue
+        checked.add(str(path))
+        problem = _check_dir_writable(path, label)
+        if problem:
+            issues.append(problem)
+    if not issues:
+        for sub in ("packages", "metadata"):
+            problem = _check_dir_writable(Path(app.config["PERSIST_ROOT"]) / sub, f"persist root/{sub}")
+            if problem:
+                issues.append(problem)
+        public_addons = _check_dir_writable(Path(app.config["PUBLIC_ROOT"]) / "addons", "public root/addons")
+        if public_addons:
+            issues.append(public_addons)
+    if not issues:
+        problem = _check_database(db_path, lock_timeout)
+        if problem:
+            issues.append(problem)
+    return (not issues), issues
 
 
 def log_startup_banner() -> None:
-    try:
-        db_path = _resolve_db_path()
-    except Exception:
-        db_path = Path(app.config["DB_PATH"] or Path(app.config["PERSIST_ROOT"]) / "addons.sqlite3")
+    db_path = _db_path()
     print(
         json.dumps(
             {
@@ -255,6 +318,7 @@ def log_startup_banner() -> None:
                 "gid": os.getgid() if hasattr(os, "getgid") else None,
                 "config": _effective_config(),
                 "db_path": str(db_path),
+                "warnings": persistence_warnings(),
                 "note": "If startup preflight fails with permissions, the host mount ownership/mode must be fixed; the app will not chmod or chown existing data.",
             },
             sort_keys=True,
@@ -266,7 +330,7 @@ def log_startup_banner() -> None:
 @app.route("/doctor")
 def doctor() -> Any:
     require_auth()
-    db_path = _resolve_db_path()
+    db_path = _db_path()
     payload = {
         "version": APP_VERSION,
         "uid": os.getuid() if hasattr(os, "getuid") else None,
@@ -281,6 +345,7 @@ def doctor() -> Any:
     ok, issues = startup_preflight()
     payload["ok"] = ok
     payload["issues"] = issues
+    payload["warnings"] = persistence_warnings()
     return jsonify(payload), (200 if ok else 503)
 
 
@@ -464,11 +529,12 @@ def add_addon() -> Any:
                 flash("Invalid package filename.", "error")
                 return render_template("addon_form.html", mode="new")
 
-        storage_dir = _packages_dir()
-        target = storage_dir / f"{addon_id}.pak"
+        target = _packages_dir() / f"{addon_id}.pak"
         upload_dir = Path(app.config["UPLOAD_FOLDER"]) / uuid.uuid4().hex
         upload_dir.mkdir(parents=True, exist_ok=True)
         upload_source = upload_dir / safe_name
+        staged: Path | None = None
+        installed = False
 
         try:
             if import_mode == "local":
@@ -479,22 +545,23 @@ def add_addon() -> Any:
                 package_file.save(upload_source)
             detected = detect_package_format(upload_source)
             print(f"[import] detected {detected} for {safe_name}; staging at {upload_source}", flush=True)
-            if detected == "zip":
-                package_info = _build_release_package_from_zip(upload_source, target, upload_dir)
-                conversion_msg = "Uploaded ZIP release was inspected and packaged from its embedded PAK."
-            elif detected == "pak":
-                shutil.copy2(upload_source, target)
-                print(f"[import] copied PAK unchanged to {target}", flush=True)
-                conversion_msg = "Uploaded PAK was stored unchanged."
-                package_info = validate_package(target)
-            else:
-                raise ValueError(f"Unsupported package format for {safe_name!r}; expected a ZIP or Quake PAK")
-            print(f"[import] validated package {target.name}: size={package_info['size']} sha256={package_info['sha256']}", flush=True)
+            conn = get_db()
+            try:
+                if conn.execute("SELECT 1 FROM addons WHERE addon_id = ?", (addon_id,)).fetchone():
+                    raise sqlite3.IntegrityError("duplicate addon id")
+                if conn.execute("SELECT 1 FROM addons WHERE gamedir = ?", (gamedir,)).fetchone():
+                    raise sqlite3.IntegrityError("duplicate gamedir")
+            finally:
+                conn.close()
+            staged, package_info, conversion_msg = _stage_package(upload_source, detected, safe_name)
+            print(f"[import] validated package for {addon_id}: size={package_info['size']} sha256={package_info['sha256']}", flush=True)
             with db_txn() as conn:
                 if conn.execute("SELECT 1 FROM addons WHERE addon_id = ?", (addon_id,)).fetchone():
                     raise sqlite3.IntegrityError("duplicate addon id")
                 if conn.execute("SELECT 1 FROM addons WHERE gamedir = ?", (gamedir,)).fetchone():
                     raise sqlite3.IntegrityError("duplicate gamedir")
+                os.replace(staged, target)
+                installed = True
                 conn.execute(
                     """
                     INSERT INTO addons (
@@ -503,13 +570,16 @@ def add_addon() -> Any:
                         published, draft, manifest_path
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, NULL)
                     """,
-                    (addon_id, title, gamedir, author, date, description, package_info["filename"], str(target), package_info["size"], package_info["sha256"], package_info["mtime"]),
+                    (addon_id, title, gamedir, author, date, description, target.name, str(target), package_info["size"], package_info["sha256"], int(target.stat().st_mtime)),
                 )
         except (sqlite3.IntegrityError, OSError, ValueError) as exc:
-            target.unlink(missing_ok=True)
+            if installed:
+                target.unlink(missing_ok=True)
             flash(f"Package rejected: {exc}", "error")
             return render_template("addon_form.html", mode="new")
         finally:
+            if staged is not None:
+                staged.unlink(missing_ok=True)
             shutil.rmtree(upload_dir, ignore_errors=True)
 
         if import_mode == "local":
@@ -535,9 +605,11 @@ def addon_detail(addon_id: int) -> Any:
 def edit_addon(addon_id: int) -> Any:
     require_auth()
     conn = get_db()
-    addon = conn.execute("SELECT * FROM addons WHERE id = ?", (addon_id,)).fetchone()
-    if not addon:
+    try:
+        addon = conn.execute("SELECT * FROM addons WHERE id = ?", (addon_id,)).fetchone()
+    finally:
         conn.close()
+    if not addon:
         raise NotFound()
     if request.method == "POST":
         title = request.form.get("title", "").strip()
@@ -550,40 +622,60 @@ def edit_addon(addon_id: int) -> Any:
         if not title or not addon_id_value or not gamedir:
             flash("Title, ID, and game dir are required.", "error")
             return render_template("addon_form.html", mode="edit", addon=dict(addon))
+        if addon_id_value != addon["addon_id"] and addon["published"]:
+            flash("Unpublish this add-on before changing its ID (the public download path is derived from it).", "error")
+            return render_template("addon_form.html", mode="edit", addon=dict(addon))
 
-        if package_file and package_file.filename:
-            safe_name = secure_filename(package_file.filename)
-            target = _packages_dir() / f"{addon_id_value}.pak"
-            upload_dir = Path(app.config["UPLOAD_FOLDER"]) / uuid.uuid4().hex
-            upload_dir.mkdir(parents=True, exist_ok=True)
-            upload_source = upload_dir / safe_name
-            try:
+        staged: Path | None = None
+        upload_dir: Path | None = None
+        package_info: dict[str, Any] | None = None
+        replaced_package = False
+        try:
+            if package_file and package_file.filename:
+                safe_name = secure_filename(package_file.filename)
+                if not safe_name:
+                    raise ValueError("Invalid package filename.")
+                upload_dir = Path(app.config["UPLOAD_FOLDER"]) / uuid.uuid4().hex
+                upload_dir.mkdir(parents=True, exist_ok=True)
+                upload_source = upload_dir / safe_name
                 package_file.save(upload_source)
                 detected = detect_package_format(upload_source)
-                if detected == "zip":
-                    package_info = _build_release_package_from_zip(upload_source, target, upload_dir)
-                elif detected == "pak":
-                    shutil.copy2(upload_source, target)
-                    package_info = validate_package(target)
-                else:
-                    raise ValueError(f"Unsupported package format for {safe_name!r}; expected a ZIP or Quake PAK")
-            except (OSError, ValueError) as exc:
-                flash(f"Package rejected: {exc}", "error")
-                return render_template("addon_form.html", mode="edit", addon=dict(addon))
-            finally:
+                staged, package_info, _msg = _stage_package(upload_source, detected, safe_name)
+            current_path = Path(addon["package_path"])
+            with db_txn() as conn:
+                if conn.execute("SELECT 1 FROM addons WHERE addon_id = ? AND id != ?", (addon_id_value, addon_id)).fetchone():
+                    raise sqlite3.IntegrityError("duplicate addon id")
+                if conn.execute("SELECT 1 FROM addons WHERE gamedir = ? AND id != ?", (gamedir, addon_id)).fetchone():
+                    raise sqlite3.IntegrityError("duplicate gamedir")
+                if package_info is not None:
+                    conn.execute(
+                        "UPDATE addons SET package_size = ?, package_sha256 = ?, package_mtime = ? WHERE id = ?",
+                        (package_info["size"], package_info["sha256"], package_info["mtime"], addon_id),
+                    )
+                conn.execute(
+                    "UPDATE addons SET title = ?, addon_id = ?, gamedir = ?, author = ?, date = ?, description = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (title, addon_id_value, gamedir, author, date, description, addon_id),
+                )
+                if staged is not None:
+                    os.replace(staged, current_path)
+                    replaced_package = True
+        except (sqlite3.IntegrityError, OSError, ValueError) as exc:
+            flash(f"Package rejected: {exc}" if package_info is not None or upload_dir is not None else f"Update rejected: {exc}", "error")
+            return render_template("addon_form.html", mode="edit", addon=dict(addon))
+        finally:
+            if staged is not None:
+                staged.unlink(missing_ok=True)
+            if upload_dir is not None:
                 shutil.rmtree(upload_dir, ignore_errors=True)
-            conn.execute(
-                "UPDATE addons SET package_name = ?, package_path = ?, package_size = ?, package_sha256 = ?, package_mtime = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (f"{addon_id_value}.pak", str(target), package_info["size"], package_info["sha256"], package_info["mtime"], addon_id),
-            )
-
-        conn.execute(
-            "UPDATE addons SET title = ?, addon_id = ?, gamedir = ?, author = ?, date = ?, description = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (title, addon_id_value, gamedir, author, date, description, addon_id),
-        )
-        flash("Add-on updated.", "success")
+        if addon["published"]:
+            generate_catalog()
+            if replaced_package:
+                flash("Add-on updated. The public download still serves the previous package until you click Publish again.", "success")
+            else:
+                flash("Add-on updated.", "success")
+        else:
+            flash("Add-on updated.", "success")
         return redirect(url_for("addon_detail", addon_id=addon_id))
-    conn.close()
     return render_template("addon_form.html", mode="edit", addon=dict(addon))
 
 
@@ -603,9 +695,14 @@ def publish_addon(addon_id: int) -> Any:
 
         public_dir = _public_addons_dir()
         public_file = public_dir / f"{addon['addon_id']}.pak"
-        tmp_file = public_file.with_name(public_file.name + ".tmp")
-        shutil.copyfile(package_path, tmp_file)
-        os.replace(tmp_file, public_file)
+        tmp_file = public_dir / f".publish-{uuid.uuid4().hex}.tmp"
+        try:
+            shutil.copyfile(package_path, tmp_file)
+            if _sha256_file(tmp_file) != package_info["sha256"]:
+                raise ValueError("Published copy does not match the validated package; publication aborted")
+            os.replace(tmp_file, public_file)
+        finally:
+            tmp_file.unlink(missing_ok=True)
 
         conn.execute(
             "UPDATE addons SET published = 1, draft = 0, package_size = ?, package_sha256 = ?, package_mtime = ?, manifest_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -664,13 +761,17 @@ def generate_catalog() -> None:
     conn.close()
     catalog = {"addons": []}
     for row in rows:
+        served = Path(app.config["PUBLIC_ROOT"]) / "addons" / f"{row['addon_id']}.pak"
+        if not served.is_file():
+            print(f"[catalog] skipping {row['addon_id']}: published file missing at {served}", flush=True)
+            continue
         entry = {
             "download": f"addons/{row['addon_id']}.pak",
             "gamedir": row["gamedir"],
             "name": row["title"],
             "author": row["author"],
             "date": row["date"],
-            "size": row["package_size"],
+            "size": served.stat().st_size,
         }
         if row["description"]:
             entry["description"] = {"en": row["description"]}
@@ -699,7 +800,8 @@ def main() -> int:
             "version": APP_VERSION,
             "uid": os.getuid() if hasattr(os, "getuid") else None,
             "gid": os.getgid() if hasattr(os, "getgid") else None,
-            "resolved_db_path": str(_resolve_db_path()),
+            "resolved_db_path": str(_db_path()),
+            "warnings": persistence_warnings(),
             "ok": ok,
             "issues": issues,
         }

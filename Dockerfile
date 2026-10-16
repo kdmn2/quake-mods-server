@@ -3,7 +3,11 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     APP_HOME=/app \
-    PORT=5000
+    PORT=5000 \
+    PERSIST_ROOT=/appdata \
+    DB_PATH=/appdata/addons.sqlite3 \
+    PUBLIC_ROOT=/public \
+    UPLOAD_FOLDER=/uploads
 
 WORKDIR ${APP_HOME}
 

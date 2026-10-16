@@ -86,43 +86,68 @@ def parse_pak_header(path: Path) -> Dict[str, Any]:
     return {"size": path.stat().st_size, "sha256": _compute_sha256(path), "dir_offset": dir_offset, "dir_size": dir_size}
 
 
-def validate_pak_paths(path: Path) -> None:
+# --- PAK directory parsing (Ironwail: common.c COM_LoadPackFile) -------------
+MAX_PAK_ENTRIES = 2048          # MAX_FILES_IN_PACK: engine calls Sys_Error above this
+MAX_PAK_NAME_BYTES = 55         # dpackfile_t.name is char[56]; q_strlcpy keeps 55 + NUL
+MAX_PAK_BYTES = 2**31 - 1       # filepos/filelen are signed 32-bit in the engine
+CONTENT_DIRS = frozenset({
+    "maps", "progs", "sound", "music", "gfx", "models", "textures", "sprites", "env",
+    "demos", "demo", "video", "glsl", "particles", "skins", "cdtracks", "locs",
+})
+AUX_DIRS = frozenset({"doc", "docs", "documentation", "source", "src", "extras", "screenshots", "images"})
+NUMBERED_PAK_RE = re.compile(r"^pak(0|[1-9][0-9]*)\.pak$", re.IGNORECASE)
+_COPY_CHUNK = 1024 * 1024
+
+
+def _check_pak_entry_name(name: str, context: str = "PAK") -> None:
+    if not name:
+        raise ValueError(f"{context} contains an entry with an empty name")
+    if name.startswith(("/", "\\")) or "\\" in name:
+        raise ValueError(f"Unsafe archive path in {context}: {name!r}")
+    if any(part in ("", ".", "..") for part in name.split("/")):
+        raise ValueError(f"Archive path traversal detected in {context}: {name!r}")
+    if len(name.encode("utf-8")) > MAX_PAK_NAME_BYTES:
+        raise ValueError(f"Entry name too long for PAK ({len(name.encode('utf-8'))} > {MAX_PAK_NAME_BYTES} bytes): {name!r}")
+
+
+def read_pak_directory(path: Path) -> list[dict[str, Any]]:
+    """Parse and validate a PAK directory. Returns entries in directory order (duplicates preserved)."""
+    path = Path(path)
+    size = path.stat().st_size
     with open(path, "rb") as fh:
-        sig = fh.read(4)
-        if sig != b"PACK":
+        header = fh.read(12)
+        if len(header) < 12 or header[:4] != b"PACK":
             raise ValueError(f"{path.name!r} is not a valid Quake PAK file")
-        dir_offset = int.from_bytes(fh.read(4), "little")
-        dir_size = int.from_bytes(fh.read(4), "little")
-        if dir_offset < 12 or dir_size < 0:
+        dir_offset, dir_size = struct.unpack("<II", header[4:12])
+        if dir_offset < 12 or dir_offset + dir_size > size or dir_size % 64 != 0:
             raise ValueError(f"{path.name!r} has an invalid PAK structure")
+        count = dir_size // 64
+        if count == 0:
+            raise ValueError(f"{path.name!r} has an empty directory table")
+        if count > MAX_PAK_ENTRIES:
+            raise ValueError(f"{path.name!r} has {count} entries; Ironwail refuses PAKs with more than {MAX_PAK_ENTRIES}")
         fh.seek(dir_offset)
-        data = fh.read(dir_size)
-    if not data:
-        # Empty PAKs are not useful as a real add-on, but the protocol does not forbid them.
-        # We reject them to avoid broken installs.
-        raise ValueError(f"{path.name!r} has an empty directory table")
-    # Walk the directory table as a sequence of 64-byte filename records; stop gracefully on trailing zeros.
-    pos = 0
-    entries = 0
-    while pos + 64 <= len(data):
-        chunk = data[pos:pos + 64]
-        name = chunk[:56].split(b"\0", 1)[0].decode("utf-8", errors="strict")
-        if not name:
-            break
-        if name.startswith("/") or name.startswith("\\"):
-            raise ValueError(f"Unsafe archive path in PAK: {name!r}")
-        if "/../" in name or name.startswith("../") or name.startswith("..\\"):
-            raise ValueError(f"Archive path traversal detected in PAK: {name!r}")
-        if ".." in name.split("/") or ".." in name.split("\\"):
-            raise ValueError(f"Archive path traversal detected in PAK: {name!r}")
-        entries += 1
-        pos += 64
-        # The directory table format stores a 4-byte offset and 4-byte size after the filename; we ignore them.
-        if pos + 8 > len(data):
-            break
-        pos += 8
-    if entries == 0:
-        raise ValueError(f"{path.name!r} contains no archive entries")
+        table = fh.read(dir_size)
+    entries: list[dict[str, Any]] = []
+    for idx in range(count):
+        rec = table[idx * 64:(idx + 1) * 64]
+        raw = rec[:56]
+        if b"\0" not in raw:
+            raise ValueError(f"{path.name!r} entry {idx} has an unterminated name")
+        try:
+            name = raw.split(b"\0", 1)[0].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"{path.name!r} entry {idx} has a non-UTF-8 name") from exc
+        _check_pak_entry_name(name, f"PAK {path.name!r}")
+        offset, length = struct.unpack("<II", rec[56:64])
+        if offset < 12 or offset + length > size:
+            raise ValueError(f"PAK entry out of bounds: {name!r}")
+        entries.append({"path": name, "offset": offset, "size": length})
+    return entries
+
+
+def validate_pak_paths(path: Path) -> None:
+    read_pak_directory(Path(path))
 
 
 def detect_package_format(path: Path) -> str:
@@ -135,297 +160,264 @@ def detect_package_format(path: Path) -> str:
     return "unknown"
 
 
-def _validate_zip_member_name(name: str) -> str:
-    name = name.replace("\\", "/")
-    if not name or name.endswith("/"):
-        raise ValueError(f"Invalid ZIP entry name: {name!r}")
-    if name.startswith("/") or name.startswith("../") or "/../" in name or name == ".." or "/.." in name.split("/"):
-        raise ValueError(f"Unsafe ZIP entry path: {name!r}")
-    if any(part in ("", ".", "..") for part in name.split("/")):
-        raise ValueError(f"Unsafe ZIP entry path: {name!r}")
-    return name
-
-
 def _normalize_zip_member_path(name: str) -> str:
-    name = name.replace("\\", "/")
-    if name.endswith("/"):
-        raise ValueError(f"Invalid ZIP entry name: {name!r}")
-    parts = [part for part in name.split("/") if part not in ("", ".")]
-    if any(part == ".." for part in parts):
+    raw = name.replace("\\", "/")
+    if raw.startswith("/") or re.match(r"^[A-Za-z]:", raw) or "\0" in raw:
+        raise ValueError(f"Unsafe ZIP entry path: {name!r}")
+    parts = [part for part in raw.split("/") if part not in ("", ".")]
+    if not parts or any(part == ".." for part in parts):
         raise ValueError(f"Unsafe ZIP entry path: {name!r}")
     return "/".join(parts)
 
 
-def _pak_manifest_bytes(data: bytes) -> list[dict[str, Any]]:
-    if data[:4] != b"PACK":
-        raise ValueError("not a PAK")
-    d_off, d_size = struct.unpack("<II", data[4:12])
-    if d_off < 12 or d_size < 0 or d_off + d_size > len(data):
-        raise ValueError("invalid PAK directory")
-    entries: list[dict[str, Any]] = []
-    for idx in range(d_size // 64):
-        entry = data[d_off + idx * 64 : d_off + (idx + 1) * 64]
-        name = entry[:56].split(b"\0", 1)[0].decode("utf-8", errors="strict")
-        off, size = struct.unpack("<II", entry[56:64])
-        if off + size > len(data):
-            raise ValueError(f"PAK entry out of bounds: {name!r}")
-        entries.append({"path": name, "offset": off, "size": size, "sha256": hashlib.sha256(data[off:off+size]).hexdigest()})
-    return entries
+def classify_release_layout(paths: Iterable[str]) -> dict[str, Any]:
+    """Infer the release root from member paths only. File inclusion is decided elsewhere.
 
-
-def inspect_zip_release(source: Path) -> dict[str, Any]:
-    source = Path(source)
-    if not zipfile.is_zipfile(source):
-        raise ValueError(f"{source.name!r} is not a valid ZIP archive")
-    result: dict[str, Any] = {"embedded_paks": [], "loose": [], "wrapper_dirs": [], "has_wrapper": False, "root_mapping": "unknown", "root_level_files": []}
-    with zipfile.ZipFile(source, "r") as zf:
-        infos = [i for i in zf.infolist() if not i.is_dir()]
-        result["entry_count"] = len(infos)
-        top_levels = set()
-        embedded = []
-        loose = []
-        for info in infos:
-            norm = _normalize_zip_member_path(info.filename)
-            top_levels.add(norm.split("/", 1)[0])
-            if info.filename.lower().endswith(".pak"):
-                try:
-                    payload = zf.read(info)
-                except NotImplementedError:
-                    payload = None
-                if payload is None:
-                    break
-                embedded.append({"path": norm, "size": info.file_size, "sha256": hashlib.sha256(payload).hexdigest()})
-            else:
-                try:
-                    payload = zf.read(info)
-                except NotImplementedError:
-                    payload = None
-                if payload is None:
-                    break
-                loose.append({"path": norm, "size": info.file_size, "sha256": hashlib.sha256(payload).hexdigest()})
-                if "/" not in norm:
-                    result["root_level_files"].append(norm)
-        if len(embedded) + len(loose) != len(infos):
-            # Fall back to the system unzip path for unsupported compression methods.
-            return _inspect_zip_release_via_unzip(source)
-        content_dirs = {"maps", "progs", "sound", "music", "gfx"}
-        non_content = sorted([p for p in top_levels if p not in content_dirs and not any(x["path"] == p or x["path"].startswith(p + "/") for x in embedded)])
-        content_only = all((x["path"].split("/", 1)[0] in content_dirs) or x["path"].lower().endswith(".pak") or "/" not in x["path"] for x in loose)
-        # Already-rooted game content can legitimately span many top-level content directories.
-        if content_only and not [p for p in non_content if p not in result["root_level_files"]]:
-            result["root_mapping"] = "rooted"
-        elif len(non_content) == 1 and all((x["path"].split("/", 1)[0] not in content_dirs) for x in loose):
-            result["root_mapping"] = "wrapper"
-        else:
-            result["root_mapping"] = "ambiguous"
-        result["embedded_paks"] = embedded
-        result["loose"] = loose
-        result["wrapper_dirs"] = non_content if result["root_mapping"] == "wrapper" else []
-        result["has_wrapper"] = result["root_mapping"] == "wrapper"
+    Top-level directories are content (maps/, sound/, ...), auxiliary (docs/, src/, ...) or other.
+    rooted    - no "other" directory; content, auxiliary dirs and root-level files are kept as they are.
+    wrapper   - exactly one "other" directory and no root-level game files/content dirs; it is stripped.
+    ambiguous - several "other" directories, or one "other" directory mixed with game content beside it.
+    """
+    paths = list(paths)
+    root_files = sorted(p for p in paths if "/" not in p)
+    top_dirs = sorted({p.split("/", 1)[0] for p in paths if "/" in p})
+    other = [d for d in top_dirs if d.lower() not in CONTENT_DIRS and d.lower() not in AUX_DIRS]
+    has_game_root = any(d.lower() in CONTENT_DIRS for d in top_dirs) or any(
+        NUMBERED_PAK_RE.match(f) or f.lower() == "progs.dat" for f in root_files)
+    result: dict[str, Any] = {"root_mapping": "ambiguous", "wrapper_dirs": [], "has_wrapper": False,
+                              "root_level_files": root_files, "top_level_dirs": top_dirs}
+    if not paths:
+        return result
+    if not other:
+        result["root_mapping"] = "rooted"
+    elif len(other) == 1 and not has_game_root:
+        result.update(root_mapping="wrapper", wrapper_dirs=other, has_wrapper=True)
     return result
 
 
-def _inspect_zip_release_via_unzip(source: Path) -> dict[str, Any]:
-    import tempfile
-    result: dict[str, Any] = {"embedded_paks": [], "loose": [], "wrapper_dirs": [], "has_wrapper": False, "root_mapping": "unknown", "root_level_files": []}
-    with tempfile.TemporaryDirectory(prefix="quake-zip-inspect-", dir=str(source.parent)) as tmpdir:
-        proc = subprocess.run(["unzip", "-qq", "-o", str(source), "-d", tmpdir], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if proc.returncode != 0:
-            raise ValueError(f"unzip failed for {source.name!r}: {proc.stderr.strip() or proc.stdout.strip() or 'unknown error'}")
-        root = Path(tmpdir)
-        infos = [p for p in sorted(root.rglob("*")) if p.is_file()]
-        top_levels = set()
-        embedded = []
-        loose = []
-        for path in infos:
-            rel = path.relative_to(root).as_posix()
-            _validate_zip_member_name(rel)
-            top_levels.add(rel.split("/", 1)[0])
-            data = path.read_bytes()
-            if rel.lower().endswith(".pak"):
-                embedded.append({"path": rel, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
-            else:
-                loose.append({"path": rel, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
-                if "/" not in rel:
-                    result["root_level_files"].append(rel)
-        result["embedded_paks"] = embedded
-        result["loose"] = loose
-        result["root_mapping"] = "rooted" if not any(p not in {"maps", "progs", "sound", "music", "gfx"} for p in top_levels) else "ambiguous"
-        return result
+def _strip_wrapper(layout: dict[str, Any], members: list[tuple[zipfile.ZipInfo, str]]) -> list[tuple[zipfile.ZipInfo, str]]:
+    prefix = layout["wrapper_dirs"][0] + "/" if layout["has_wrapper"] else ""
+    result: list[tuple[zipfile.ZipInfo, str]] = []
+    seen: dict[str, str] = {}
+    for info, name in members:
+        new = name[len(prefix):] if prefix and name.startswith(prefix) else name
+        if new in seen:
+            raise ValueError(f"Paths collide after removing wrapper directory {prefix!r}: {seen[new]!r} and {name!r}")
+        seen[new] = name
+        result.append((info, new))
+    return result
+
+
+def _zip_release_members(zf: zipfile.ZipFile, max_files: int, max_total: int) -> list[tuple[zipfile.ZipInfo, str]]:
+    members: list[tuple[zipfile.ZipInfo, str]] = []
+    seen: set[str] = set()
+    total = 0
+    for info in zf.infolist():
+        if info.is_dir():
+            continue
+        name = _normalize_zip_member_path(info.filename)
+        if name.split("/", 1)[0] == "__MACOSX":
+            continue
+        if info.flag_bits & 0x1:
+            raise ValueError(f"Encrypted ZIP entries are not supported: {info.filename!r}")
+        if (info.external_attr >> 16) & 0o170000 == 0o120000:
+            raise ValueError(f"ZIP symlink entries are not supported: {info.filename!r}")
+        if name in seen:
+            raise ValueError(f"ZIP contains duplicate path: {name!r}")
+        seen.add(name)
+        total += info.file_size
+        members.append((info, name))
+        if len(members) > max_files:
+            raise ValueError(f"ZIP has too many files ({len(members)} > {max_files})")
+        if total > max_total:
+            raise ValueError(f"ZIP uncompressed data exceeds limit ({total} > {max_total})")
+    return members
+
+
+def inspect_zip_release(source: Path, max_files: int = 5000, max_uncompressed_size: int = 2 * 1024 * 1024 * 1024) -> dict[str, Any]:
+    """Describe a release ZIP from its central directory (no decompression, so any method is inspectable)."""
+    source = Path(source)
+    if not zipfile.is_zipfile(source):
+        raise ValueError(f"{source.name!r} is not a valid ZIP archive")
+    with zipfile.ZipFile(source, "r") as zf:
+        members = _zip_release_members(zf, max_files, max_uncompressed_size)
+    layout = classify_release_layout(name for _, name in members)
+    effective = _strip_wrapper(layout, members) if layout["root_mapping"] != "ambiguous" else [(i, n) for i, n in members]
+    layout["entry_count"] = len(members)
+    layout["embedded_paks"] = [{"path": n, "size": i.file_size} for i, n in effective if NUMBERED_PAK_RE.match(n)]
+    layout["loose"] = [{"path": n, "size": i.file_size} for i, n in effective if not NUMBERED_PAK_RE.match(n)]
+    layout["root_level_files"] = sorted(n for _, n in effective if "/" not in n)
+    return layout
+
+
+def _copy_limited(reader, out, expected: int, label: str) -> str:
+    digest = hashlib.sha256()
+    written = 0
+    while True:
+        chunk = reader.read(_COPY_CHUNK)
+        if not chunk:
+            break
+        written += len(chunk)
+        if written > expected:
+            raise ValueError(f"ZIP entry {label!r} is larger than its declared size")
+        digest.update(chunk)
+        out.write(chunk)
+    if written != expected:
+        raise ValueError(f"ZIP entry {label!r} is truncated ({written} of {expected} bytes)")
+    return digest.hexdigest()
+
+
+def _extract_member(zf: zipfile.ZipFile, source: Path, info: zipfile.ZipInfo, dest: Path) -> str:
+    """Stream one member to dest. Falls back to system unzip for methods Python cannot decode (e.g. Deflate64)."""
+    try:
+        with zf.open(info, "r") as reader, open(dest, "wb") as out:
+            return _copy_limited(reader, out, info.file_size, info.filename)
+    except NotImplementedError:
+        pass
+    except (zipfile.BadZipFile, RuntimeError) as exc:
+        raise ValueError(f"Unable to read ZIP entry {info.filename!r}: {exc}") from exc
+    escaped = re.sub(r"([\\*?\[\]])", r"\\\1", info.filename)
+    try:
+        proc = subprocess.Popen(["unzip", "-p", str(source), escaped], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError as exc:
+        raise ValueError(f"ZIP entry {info.filename!r} uses a compression method Python cannot read and 'unzip' is not installed") from exc
+    try:
+        with open(dest, "wb") as out:
+            digest = _copy_limited(proc.stdout, out, info.file_size, info.filename)
+    except ValueError:
+        proc.kill()
+        raise
+    finally:
+        proc.stdout.close()
+        err = proc.stderr.read().decode("utf-8", "replace").strip()
+        proc.stderr.close()
+        rc = proc.wait()
+    if rc != 0:
+        raise ValueError(f"unzip failed for {info.filename!r}: {err or f'exit code {rc}'}")
+    return digest
 
 
 def build_single_pak_from_zip(source: Path, target: Path, max_files: int = 5000, max_uncompressed_size: int = 2 * 1024 * 1024 * 1024) -> dict[str, Any]:
+    """Convert a release ZIP into one PAK holding the effective game assets.
+
+    Precedence mirrors Ironwail's search path (common.c: COM_AddGameDirectory/COM_FindFile): the game
+    directory (loose files) is searched LAST, pak0..pakN are pushed on the front in order, so the
+    highest-numbered PAK wins, any PAK beats a loose file, and within one PAK the first entry wins.
+    Nothing depends on ZIP member order.
+    """
     source = Path(source)
     target = Path(target)
-    if zipfile.is_zipfile(source) is False:
+    if not zipfile.is_zipfile(source):
         raise ValueError(f"{source.name!r} is not a valid ZIP archive")
-    entries: dict[str, tuple[int, int, bytes]] = {}
-    total_uncompressed = 0
-    with zipfile.ZipFile(source, "r") as zf:
-        infos = [info for info in zf.infolist() if not info.is_dir()]
-        if len(infos) > max_files:
-            raise ValueError(f"ZIP has too many files ({len(infos)} > {max_files})")
-        release = inspect_zip_release(source)
-        root_mode = release.get("root_mapping")
-        if root_mode == "ambiguous":
+    with tempfile.TemporaryDirectory(prefix="quake-zip-", dir=str(source.parent)) as tmp, zipfile.ZipFile(source, "r") as zf:
+        tmpdir = Path(tmp)
+        members = _zip_release_members(zf, max_files, max_uncompressed_size)
+        if not members:
+            raise ValueError(f"{source.name!r} does not contain any representable files")
+        layout = classify_release_layout(name for _, name in members)
+        if layout["root_mapping"] == "ambiguous":
             raise ValueError("ZIP release has ambiguous root mapping; provide a single wrapper directory or already-rooted game content")
-        wrapper = None
-        if root_mode == "wrapper":
-            wrapper = release["wrapper_dirs"][0]
-        seen_zip_paths: set[str] = set()
-        for info in infos:
-            raw_name = _normalize_zip_member_path(info.filename)
-            if raw_name in seen_zip_paths:
-                raise ValueError(f"ZIP contains duplicate path: {raw_name!r}")
-            seen_zip_paths.add(raw_name)
-            data = zf.read(info)
-            total_uncompressed += len(data)
-            if total_uncompressed > max_uncompressed_size:
-                raise ValueError(f"ZIP uncompressed data exceeds limit ({total_uncompressed} > {max_uncompressed_size})")
-            name = raw_name
-            if wrapper and name.startswith(wrapper + "/"):
-                name = name[len(wrapper) + 1 :]
-            elif wrapper and name == wrapper:
-                continue
-            if name.lower().endswith('.pak'):
-                pak_entries = _pak_manifest_bytes(data)
-                if name.lower().startswith('pak') and name.lower().endswith('.pak') and name[3:-4].isdigit():
-                    pak_index = int(name[3:-4])
-                else:
-                    # embedded pak inside a release zip is treated as the base source package
-                    pak_index = 0
-                for entry in pak_entries:
-                    payload = data[entry['offset']:entry['offset'] + entry['size']]
-                    prev = entries.get(entry['path'])
-                    candidate = (0, pak_index, payload)
-                    if prev is None or candidate[:2] >= prev[:2]:
-                        entries[entry['path']] = candidate
+        effective = _strip_wrapper(layout, members)
+        eff_names = [n for _, n in effective]
+        inner_dirs = {n.split("/", 1)[0] for n in eff_names if "/" in n}
+        if layout["has_wrapper"] and len(inner_dirs) == 1 and not any("/" not in n for n in eff_names) \
+                and next(iter(inner_dirs)).lower() not in CONTENT_DIRS | AUX_DIRS:
+            raise ValueError(f"ZIP release has nested wrapper directories ({layout['wrapper_dirs'][0]}/{next(iter(inner_dirs))}/); ambiguous root mapping")
+
+        stored: dict[str, Path] = {}
+        total = 0
+        for idx, (info, name) in enumerate(effective):
+            total += info.file_size
+            dest = tmpdir / f"member-{idx}.bin"
+            _extract_member(zf, source, info, dest)
+            stored[name] = dest
+
+        pak_files: dict[int, Path] = {}
+        loose: dict[str, Path] = {}
+        for name, path in stored.items():
+            m = NUMBERED_PAK_RE.match(name)
+            if m:
+                pak_files[int(m.group(1))] = path
             else:
-                prev = entries.get(name)
-                candidate = (1, 0, data)
-                if prev is None or candidate[:2] >= prev[:2]:
-                    entries[name] = candidate
-    if not entries:
-        raise ValueError(f"{source.name!r} does not contain any representable files")
-    order = sorted(entries.keys())
-    if len(order) > max_files:
-        raise ValueError(f"Resulting PAK would have too many files ({len(order)} > {max_files})")
-    dir_offset = 12
-    file_blobs = bytearray()
-    dir_records = bytearray()
-    written = set()
-    for name in order:
-        if name in written:
-            continue
-        written.add(name)
-        data = entries[name][2]
-        file_offset = dir_offset + len(file_blobs)
-        file_blobs.extend(data)
-        name_bytes = name.encode('utf-8')
-        if len(name_bytes) > 56:
-            raise ValueError(f"Entry name too long for PAK: {name!r}")
-        dir_records.extend(name_bytes.ljust(56, b'\0'))
-        dir_records.extend(struct.pack('<II', file_offset, len(data)))
-    header = b'PACK' + struct.pack('<II', dir_offset + len(file_blobs), len(dir_records))
-    atomic_write(target, header + file_blobs + dir_records)
-    return {"entries": len(written), "size": target.stat().st_size, "sha256": _compute_sha256(target), "paths": list(written)}
+                loose[name] = path
+        if pak_files and sorted(pak_files) != list(range(len(pak_files))):
+            raise ValueError(f"Numbered PAKs must be contiguous from pak0.pak (found {sorted(pak_files)}); Ironwail stops loading at the first gap")
+
+        # winner[path] = (source label, file path, offset, length); ascending priority so later assignments override
+        winner: dict[str, tuple[str, Path, int, int]] = {}
+        overrides: list[dict[str, str]] = []
+
+        def assign(path_name: str, candidate: tuple[str, Path, int, int]) -> None:
+            if path_name in winner:
+                overrides.append({"path": path_name, "overridden": winner[path_name][0], "by": candidate[0]})
+            winner[path_name] = candidate
+
+        for name, path in loose.items():
+            assign(name, (f"loose:{name}", path, 0, path.stat().st_size))
+        for index in sorted(pak_files):
+            label = f"pak{index}.pak"
+            seen_here: set[str] = set()
+            for entry in read_pak_directory(pak_files[index]):
+                if entry["path"] in seen_here:
+                    continue  # engine scans linearly and takes the first match within a PAK
+                seen_here.add(entry["path"])
+                assign(entry["path"], (label, pak_files[index], entry["offset"], entry["size"]))
+
+        if not winner:
+            raise ValueError(f"{source.name!r} does not contain any representable files")
+        folded: dict[str, str] = {}
+        for name in winner:
+            _check_pak_entry_name(name, "release")
+            if name.lower() in folded:
+                raise ValueError(f"Paths differ only by letter case: {folded[name.lower()]!r} and {name!r}")
+            folded[name.lower()] = name
+        if len(winner) > MAX_PAK_ENTRIES:
+            raise ValueError(f"Release resolves to {len(winner)} files; a single PAK may hold at most {MAX_PAK_ENTRIES} (Ironwail limit)")
+
+        order = sorted(winner)
+        manifest: list[dict[str, Any]] = []
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp_out = target.with_name(target.name + ".tmp")
+        try:
+            with open(tmp_out, "wb") as out:
+                out.write(b"PACK" + b"\0" * 8)
+                records = bytearray()
+                for name in order:
+                    label, path, offset, length = winner[name]
+                    file_pos = out.tell()
+                    digest = hashlib.sha256()
+                    with open(path, "rb") as fh:
+                        fh.seek(offset)
+                        remaining = length
+                        while remaining:
+                            chunk = fh.read(min(_COPY_CHUNK, remaining))
+                            if not chunk:
+                                raise ValueError(f"Source for {name!r} is truncated")
+                            digest.update(chunk)
+                            out.write(chunk)
+                            remaining -= len(chunk)
+                    if out.tell() > MAX_PAK_BYTES:
+                        raise ValueError(f"Resulting PAK exceeds {MAX_PAK_BYTES} bytes (32-bit PAK offsets)")
+                    records += name.encode("utf-8").ljust(56, b"\0") + struct.pack("<II", file_pos, length)
+                    manifest.append({"path": name, "size": length, "sha256": digest.hexdigest(), "source": label})
+                dir_offset = out.tell()
+                out.write(records)
+                if out.tell() > MAX_PAK_BYTES:
+                    raise ValueError(f"Resulting PAK exceeds {MAX_PAK_BYTES} bytes (32-bit PAK offsets)")
+                out.seek(4)
+                out.write(struct.pack("<II", dir_offset, len(records)))
+            os.replace(tmp_out, target)
+        finally:
+            tmp_out.unlink(missing_ok=True)
+    return {
+        "entries": len(order), "size": target.stat().st_size, "sha256": _compute_sha256(target), "paths": order,
+        "manifest": manifest, "overrides": overrides, "root_mapping": layout["root_mapping"],
+        "wrapper": layout["wrapper_dirs"][0] if layout["has_wrapper"] else None,
+        "embedded_paks": [f"pak{i}.pak" for i in sorted(pak_files)], "loose_files": len(loose),
+    }
 
 
-def _read_zip_entries_with_unzip(source: Path) -> list[tuple[str, bytes]]:
-    entries: list[tuple[str, bytes]] = []
-    print(f"[zip-import] using system unzip fallback for {source.name}", flush=True)
-    with tempfile.TemporaryDirectory(prefix="quake-zip-", dir=str(source.parent)) as tmpdir:
-        proc = subprocess.run(["unzip", "-qq", "-o", str(source), "-d", tmpdir], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if proc.returncode != 0:
-            raise ValueError(f"unzip failed for {source.name!r}: {proc.stderr.strip() or proc.stdout.strip() or 'unknown error'}")
-        root = Path(tmpdir)
-        for path in sorted(root.rglob("*")):
-            if path.is_dir():
-                continue
-            rel = path.relative_to(root).as_posix()
-            _validate_zip_member_name(rel)
-            entries.append((rel, path.read_bytes()))
-    print(f"[zip-import] unzip fallback extracted {len(entries)} files from {source.name}", flush=True)
-    return entries
-
-
-def repack_zip_to_pak(source: Path, target: Path, max_files: int = 5000, max_uncompressed_size: int = 2 * 1024 * 1024 * 1024) -> Dict[str, Any]:
-    source = Path(source)
-    target = Path(target)
-    if zipfile.is_zipfile(source) is False:
-        raise ValueError(f"{source.name!r} is not a valid ZIP archive")
-
-    entries: list[tuple[str, bytes]] = []
-    total_uncompressed = 0
-    with zipfile.ZipFile(source, "r") as zf:
-        infos = [info for info in zf.infolist() if not info.is_dir()]
-        if not infos:
-            raise ValueError(f"{source.name!r} does not contain any files")
-        if len(infos) > max_files:
-            raise ValueError(f"ZIP has too many files ({len(infos)} > {max_files})")
-        print(f"[zip-import] python zipfile saw {len(infos)} files in {source.name}", flush=True)
-        for info in infos:
-            if info.flag_bits & 0x1:
-                raise ValueError(f"Encrypted ZIP entries are not supported: {info.filename!r}")
-            name = _validate_zip_member_name(info.filename)
-            try:
-                with zf.open(info, "r") as fh:
-                    data = fh.read()
-            except NotImplementedError as exc:
-                print(f"[zip-import] python zipfile could not decode {info.filename}; falling back to unzip", flush=True)
-                entries = _read_zip_entries_with_unzip(source)
-                return repack_zip_to_pak_from_entries(source, target, entries, max_files, max_uncompressed_size)
-            except RuntimeError as exc:
-                raise ValueError(f"Unable to read ZIP entry {info.filename!r}: {exc}") from exc
-            total_uncompressed += len(data)
-            if total_uncompressed > max_uncompressed_size:
-                raise ValueError(f"ZIP uncompressed data exceeds limit ({total_uncompressed} > {max_uncompressed_size})")
-            entries.append((name, data))
-
-    dir_offset = 12
-    file_blobs = bytearray()
-    dir_records = bytearray()
-    for name, data in entries:
-        file_offset = dir_offset + len(file_blobs)
-        file_blobs.extend(data)
-        name_bytes = name.encode("utf-8")
-        if len(name_bytes) > 56:
-            raise ValueError(f"Entry name too long for PAK: {name!r}")
-        dir_records.extend(name_bytes.ljust(56, b"\0"))
-        dir_records.extend(struct.pack("<II", file_offset, len(data)))
-
-    header = b"PACK" + struct.pack("<II", dir_offset + len(file_blobs), len(dir_records))
-    atomic_write(target, header + file_blobs + dir_records)
-    print(f"[zip-import] repacked {len(entries)} files from {source.name} into {target.name} ({target.stat().st_size} bytes)", flush=True)
-    return {"entries": len(entries), "size": target.stat().st_size, "sha256": _compute_sha256(target)}
-
-
-def repack_zip_to_pak_from_entries(source: Path, target: Path, entries: list[tuple[str, bytes]], max_files: int, max_uncompressed_size: int) -> Dict[str, Any]:
-    if len(entries) > max_files:
-        raise ValueError(f"ZIP has too many files ({len(entries)} > {max_files})")
-    total_uncompressed = 0
-    cleaned: list[tuple[str, bytes]] = []
-    for name, data in entries:
-        name = _validate_zip_member_name(name)
-        total_uncompressed += len(data)
-        if total_uncompressed > max_uncompressed_size:
-            raise ValueError(f"ZIP uncompressed data exceeds limit ({total_uncompressed} > {max_uncompressed_size})")
-        cleaned.append((name, data))
-    dir_offset = 12
-    file_blobs = bytearray()
-    dir_records = bytearray()
-    for name, data in cleaned:
-        file_offset = dir_offset + len(file_blobs)
-        file_blobs.extend(data)
-        name_bytes = name.encode("utf-8")
-        if len(name_bytes) > 56:
-            raise ValueError(f"Entry name too long for PAK: {name!r}")
-        dir_records.extend(name_bytes.ljust(56, b"\0"))
-        dir_records.extend(struct.pack("<II", file_offset, len(data)))
-    header = b"PACK" + struct.pack("<II", dir_offset + len(file_blobs), len(dir_records))
-    atomic_write(target, header + file_blobs + dir_records)
-    print(f"[zip-import] repacked {len(cleaned)} files from {source.name} via unzip into {target.name} ({target.stat().st_size} bytes)", flush=True)
-    return {"entries": len(cleaned), "size": target.stat().st_size, "sha256": _compute_sha256(target)}
+repack_zip_to_pak = build_single_pak_from_zip
 
 
 def validate_package(path: Path) -> Dict[str, Any]:

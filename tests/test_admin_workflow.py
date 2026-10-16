@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,9 @@ from app import app, get_db, generate_password_hash, init_db
 class AdminWorkflowTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="quake-admin-tests-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        saved_config = dict(app.config)
+        self.addCleanup(lambda: (app.config.clear(), app.config.update(saved_config)))
         app.config.update(
             TESTING=True,
             SECRET_KEY="test-secret",
@@ -657,17 +661,6 @@ class AdminWorkflowTests(unittest.TestCase):
         )
         self.assertIn(b"Package rejected", res.data)
 
-    def test_db_path_falls_back_when_unwritable(self):
-        app.config["DB_PATH"] = str(self.tmp / "nope" / "addons.sqlite3")
-        app.config["PERSIST_ROOT"] = str(self.tmp / "data")
-        app.config["UPLOAD_FOLDER"] = str(self.tmp / "upload")
-        os.makedirs(app.config["PERSIST_ROOT"], exist_ok=True)
-        os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
-        self.assertTrue(init_db() is None)
-        conn = get_db()
-        self.assertIsNotNone(conn)
-        conn.close()
-
     def test_health_reports_ready_and_doctor_returns_json(self):
         res = self.app.get("/health")
         self.assertEqual(res.status_code, 200)
@@ -717,11 +710,6 @@ class AdminWorkflowTests(unittest.TestCase):
         cfg = _effective_config()
         self.assertTrue(cfg["PERSIST_ROOT"])
         self.assertIn("PERSIST_ROOT", cfg)
-
-    def test_best_effort_persist_root_is_resolved(self):
-        from app import _best_effort_persist_root
-        root = _best_effort_persist_root()
-        self.assertTrue(str(root))
 
 
 if __name__ == "__main__":

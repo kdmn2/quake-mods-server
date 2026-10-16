@@ -13,22 +13,20 @@ from tools.catalog import build_catalog, collect_metadata, validate_catalog
 
 
 def make_pak(path: Path, entries: list[str]) -> None:
-    dir_records = bytearray()
+    """Write a structurally valid PAK: 12-byte header, file data, then 64-byte directory records."""
+    body = bytearray()
+    records = bytearray()
     for name in entries:
-        encoded = name.encode("utf-8")
-        if len(encoded) > 56:
-            raise ValueError(f"Entry name too long: {name!r}")
-        record = encoded.ljust(56, b"\0") + struct.pack("<II", 0, 0) + struct.pack("<I", 0)
-        dir_records.extend(record)
-    dir_offset = 12 + 0
-    header = b"PACK" + struct.pack("<II", dir_offset, len(dir_records))
-    payload = header + dir_records
-    path.write_bytes(payload)
+        payload = name.encode("utf-8")
+        records.extend(payload.ljust(56, b"\0") + struct.pack("<II", 12 + len(body), len(payload)))
+        body.extend(payload)
+    path.write_bytes(b"PACK" + struct.pack("<II", 12 + len(body), len(records)) + bytes(body) + bytes(records))
 
 
 class CatalogTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="quake-addon-tests-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.store = self.tmp / "store"
         self.public = self.tmp / "public"
         self.store.mkdir()

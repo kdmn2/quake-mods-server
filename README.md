@@ -115,7 +115,7 @@ mkdir -p /mnt/user/appdata/ironwail-addons/public
 mkdir -p /mnt/user/appdata/ironwail-addons/uploads
 ```
 
-The image runs as non-root `appuser`, so the host bind paths must be writable by the container user. On Unraid, the simplest safe setup is to make those directories writable for the correct UID/GID, or use a mapping that matches the container runtime user. If first boot still fails because the mounted path is owned by root, fix the host permissions or pre-create the bind-mount directories with writable ownership before starting the container.
+The image runs as non-root `appuser` (uid/gid 1000 unless you override it), so the host bind paths must be writable by that user. Unraid creates shares as `nobody:users` (`99:100`); either `chown -R 99:100 /mnt/user/appdata/ironwail-addons` and add `--user 99:100` under Extra Parameters, or `chown` the directories to the uid/gid shown in the startup log. If first boot fails, the container exits with a message naming the directory, its owner and the container uid:gid; it never falls back to another location.
 
 If you are using the native template, the appdata mount is exposed in the container as `/appdata`, not `/data`.
 
@@ -215,7 +215,7 @@ PORT: "5000"
 1. Sign in to the admin GUI.
 2. Click Upload.
 3. Upload a Quake `.pak` archive or a `.zip` mod bundle.
-   - ZIP uploads are safely repacked into a Quake PAK before publication.
+   - ZIP releases are converted into one Quake PAK holding the effective game assets (see "ZIP release conversion" below).
 4. Review the metadata:
    - ID
    - title
@@ -302,13 +302,29 @@ pytest -q
 - The client itself does not support automatic update detection beyond what is implemented in its static list.
 - The application does not bundle or redistribute Quake base-game content.
 - Archive compatibility depends on the actual Quake package layout; the app validates the archive but does not silently repack unsupported formats.
-- ZIP uploads are repacked by reading each entry through Python’s ZIP reader; if Python cannot decode a ZIP compression method, the upload is rejected with a clear error.
+- ZIP members that Python's `zipfile` cannot decode (for example Deflate64, which many Windows archivers use for large archives) are read through the bundled system `unzip`, one member at a time, with size checks. If `unzip` is missing the upload is rejected with a clear error.
+- A single PAK holds at most 2048 entries and entry names are limited to 55 bytes (Ironwail `MAX_FILES_IN_PACK` / `dpackfile_t.name`). Releases that resolve to more files, or longer names, are rejected rather than truncated. The PAK is also limited to just under 2 GiB (32-bit offsets).
+- A converted release contains everything that is in the ZIP (sources, images and documentation included); nothing is silently dropped. Large releases therefore produce large downloads.
 - The app’s public side is intentionally static; no database or API is exposed to the public.
+
+## ZIP release conversion
+
+Root inference is decided from the member paths only; file inclusion is decided separately.
+
+- **rooted**: every top-level directory is a Quake content directory (`maps`, `progs`, `sound`, `music`, `gfx`, `models`, ...) or an auxiliary one (`docs`, `src`, `images`, ...). Paths are kept as they are. Root-level files such as `pun.txt` are kept.
+- **wrapper**: exactly one other top-level directory and no root-level `pakN.pak`/`progs.dat`/content directory. That directory is stripped. Root-level documentation beside it is kept.
+- **ambiguous** (rejected): several candidate mod roots, or a mod root mixed with game content beside it, or a wrapper inside a wrapper.
+- `__MACOSX/` resource forks are ignored; symlinks, encrypted members, duplicate member names, `..`/absolute paths and names that differ only by case are rejected.
+
+Which copy of a file wins follows Ironwail's own search order (`common.c`: `COM_AddGameDirectory`, `COM_FindFile`): `pakN ... pak1, pak0`, then loose files. So a higher-numbered PAK beats a lower one, any PAK beats a loose file, and the first of two identical names inside one PAK wins. ZIP member order never matters. Only `pak0.pak`, `pak1.pak`, ... at the release root count as PAKs (Ironwail stops at the first missing number, so gaps are rejected); other `.pak` files are stored as ordinary files. Output entries are sorted by path.
 
 ## File ownership and permissions
 
-- The application runs as non-root `appuser` in the image.
-- The mounted data directories must be writable by the container user.
+- The application runs as non-root `appuser` (uid/gid are printed in the startup log) and never chmods, chowns, relocates or recreates existing data.
+- The image defaults to `PERSIST_ROOT=/appdata`, `DB_PATH=/appdata/addons.sqlite3`, `PUBLIC_ROOT=/public`, `UPLOAD_FOLDER=/uploads`; map host directories onto those three paths.
+- Startup probes each location by creating a real file and reports missing path, not-a-directory, read-only mount, permission denied (with the directory's owner and the container uid:gid), no space/quota, locked database and corrupt database as separate messages, then exits non-zero. There is no fallback database location. `docker run ... python app.py doctor` prints the same diagnosis.
+- A warning is logged if `PERSIST_ROOT` or `PUBLIC_ROOT` is not a mount point, because data would then be lost when the container is recreated.
+- Unraid shares are normally owned by `nobody:users` (`99:100`). Either `chown 99:100` the three host directories, or run the container as that user (`--user 99:100`, in the Unraid template under Extra Parameters; `user: "99:100"` in Compose). Do not use `chmod 777` or `--privileged`.
 - Do not expose the full host filesystem or the working directory as a public web root.
 
 ## Not yet implemented / intentionally out of scope

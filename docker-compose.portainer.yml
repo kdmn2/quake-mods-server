@@ -2,9 +2,12 @@ version: '3.9'
 
 services:
   ironwail-addons:
-    image: your-registry.example.com/ironwail-addons:latest
+    image: ghcr.io/kdmn2/quake-mods-server:latest
     container_name: ironwail-addons
     restart: unless-stopped
+    # The app runs as an unprivileged user (uid/gid shown in the startup log). The host directories below must be
+    # writable by it. On Unraid (files owned by nobody:users) either chown them to that uid/gid or uncomment:
+    # user: "99:100"
     ports:
       - "8080:5000"
     environment:

@@ -10,3 +10,9 @@ addons/
 fixtures/
 ironwail-src/
 .vscode/
+*.zip
+*.pak
+acceptance-artifacts/
+ironwail-src/
+reports/
+tests/

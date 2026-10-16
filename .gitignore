@@ -2,3 +2,10 @@ __pycache__/
 *.pyc
 store/
 public/
+
+# mod content and acceptance output must never be committed
+/*.zip
+/*.pak
+acceptance-artifacts/
+.venv/
+.pytest_cache/
