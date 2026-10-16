@@ -583,6 +583,120 @@ class LocalImportTests(FlowBase):
         self.assertTrue(z.exists())
 
 
+class EditMetadataTests(FlowBase):
+    def make_existing(self, addon_id="editme"):
+        self.upload(addon_id, make_pak_bytes([("maps/a.bsp", make_bsp())]))
+        return self.row(addon_id)
+
+    def edit_post(self, addon_id: int, data: dict, headers=None, follow=False):
+        payload = dict(data)
+        payload["csrf_token"] = self.csrf()
+        return self.c.post(f"/addons/{addon_id}/edit", data=payload, content_type="multipart/form-data", headers=headers or {}, follow_redirects=follow)
+
+    def test_metadata_only_edit_preserves_omitted_fields_and_allows_clearing_optional_ones(self):
+        row = self.make_existing("keep")
+        res = self.edit_post(row["id"], {"title": "Keep", "addon_id": row["addon_id"], "gamedir": row["gamedir"], "author": "", "description": ""})
+        self.assertEqual(res.status_code, 302)
+        updated = self.row("keep")
+        self.assertEqual(updated["title"], "Keep")
+        self.assertEqual((updated["author"], updated["description"]), ("", ""))
+        self.assertEqual(updated["date"], row["date"])  # omitted field preserved
+
+    def test_metadata_only_edit_does_not_invoke_conversion(self):
+        row = self.make_existing("noconvert")
+        import app as app_module
+        real = app_module.build_single_pak_from_zip
+        called = []
+        def boom(*a, **kw):
+            called.append(True)
+            raise AssertionError("conversion should not run for metadata-only edits")
+        app_module.build_single_pak_from_zip = boom
+        self.addCleanup(setattr, app_module, "build_single_pak_from_zip", real)
+        res = self.edit_post(row["id"], {"title": "No Convert", "addon_id": row["addon_id"], "gamedir": row["gamedir"], "author": "A"})
+        self.assertEqual(res.status_code, 302)
+        self.assertEqual(called, [])
+        self.assertEqual(self.row("noconvert")["title"], "No Convert")
+
+    def test_metadata_only_edit_keeps_the_existing_package_and_updates_fields(self):
+        row = self.make_existing("rel")
+        before = {
+            "package_path": row["package_path"],
+            "package_sha256": row["package_sha256"],
+            "package_size": row["package_size"],
+            "package_mtime": row["package_mtime"],
+            "conversion_report": row["conversion_report"],
+            "source_path": row["source_path"],
+            "source_sha256": row["source_sha256"],
+        }
+        res = self.edit_post(row["id"], {"title": "Renamed", "addon_id": row["addon_id"], "gamedir": row["gamedir"], "author": "New Author", "date": row["date"], "description": "Updated description"}, headers={"X-Requested-With": "XMLHttpRequest"})
+        self.assertEqual(res.status_code, 302)
+        updated = self.row("rel")
+        self.assertEqual((updated["title"], updated["author"], updated["description"]), ("Renamed", "New Author", "Updated description"))
+        for field, value in before.items():
+            self.assertEqual(updated[field], value, field)
+        self.assertEqual(self.stray_files(), [])
+
+    def test_empty_file_input_means_no_replacement(self):
+        row = self.make_existing("empty")
+        with open(row["package_path"], "rb") as fh:
+            res = self.edit_post(row["id"], {"title": "Still Empty", "addon_id": row["addon_id"], "gamedir": row["gamedir"], "package": (fh, "")})
+        self.assertEqual(res.status_code, 302)
+        updated = self.row("empty")
+        self.assertEqual(updated["title"], "Still Empty")
+        self.assertEqual(updated["package_sha256"], row["package_sha256"])
+        self.assertEqual(updated["package_path"], row["package_path"])
+
+    def test_edit_form_shows_replace_package_optional_and_current_package(self):
+        row = self.make_existing("showme")
+        html = self.c.get(f"/addons/{row['id']}/edit").get_data(as_text=True)
+        self.assertIn("Replace package — optional", html)
+        self.assertIn("Leave it empty to keep the current package.", html)
+        self.assertIn(row["package_name"], html)
+
+    def test_published_metadata_only_edit_updates_catalog_without_replacing_the_package(self):
+        row = self.make_existing("pubedit")
+        self.publish("pubedit")
+        before = self.c.get("/content.json").get_data(as_text=True)
+        res = self.edit_post(row["id"], {"title": "Published Title", "addon_id": row["addon_id"], "gamedir": row["gamedir"], "author": "A", "date": row["date"], "description": "d"}, headers={"X-Requested-With": "XMLHttpRequest"})
+        self.assertEqual(res.status_code, 302)
+        self.assertEqual(self.row("pubedit")["title"], "Published Title")
+        after = self.c.get("/content.json").get_data(as_text=True)
+        self.assertNotEqual(before, after)
+        self.assertIn("Published Title", after)
+        self.assertEqual(Path(self.row("pubedit")["package_path"]).read_bytes(), Path(row["package_path"]).read_bytes())
+
+    def test_optional_replacement_still_works_and_preserves_user_metadata(self):
+        row = self.make_existing("replaceable")
+        z2 = self.tmp / "new.zip"
+        release_zip(z2, [("extra.cfg", b"x")])
+        res = self.edit_post(row["id"], {"title": "User Title", "addon_id": row["addon_id"], "gamedir": row["gamedir"], "author": "User Author", "description": "User Desc", "package": (z2.open("rb"), "new.zip")})
+        self.assertEqual(self.status(self.job_id_from(res))["state"], "done")
+        updated = self.row("replaceable")
+        self.assertEqual((updated["title"], updated["author"], updated["description"]), ("User Title", "User Author", "User Desc"))
+        self.assertNotEqual(updated["package_sha256"], row["package_sha256"])
+
+    def test_missing_stored_artifact_still_allows_metadata_edit_but_not_publish(self):
+        row = self.make_existing("missing")
+        Path(row["package_path"]).unlink()
+        self.assertFalse(Path(row["package_path"]).exists())
+        res = self.edit_post(row["id"], {"title": "Missing OK", "addon_id": row["addon_id"], "gamedir": row["gamedir"], "author": "A", "description": "d"})
+        self.assertEqual(res.status_code, 302)
+        self.assertEqual(self.row("missing")["title"], "Missing OK")
+        pub = self.post(f"/addons/{row['id']}/publish", follow=True)
+        self.assertIn("package file is missing", pub.get_data(as_text=True).lower())
+
+    def test_required_fields_still_block_new_items(self):
+        res = self.post("/addons/new", {"title": "", "addon_id": "", "gamedir": ""}, headers={"X-Requested-With": "XMLHttpRequest"})
+        self.assertEqual((res.status_code, res.get_json()), (400, {"error": "Title, ID, and game dir are required."}))
+
+    def test_auth_and_csrf_still_apply_to_edit_route(self):
+        row = self.make_existing("secure")
+        from app import app as flask_app
+        anon = flask_app.test_client()
+        self.assertEqual(anon.get(f"/addons/{row['id']}/edit").status_code, 403)
+        self.assertEqual(self.c.post(f"/addons/{row['id']}/edit", data={"title": "x"}, content_type="multipart/form-data").status_code, 403)
+
+
 class FormOptionsTests(FlowBase):
     """The options are on the upload/edit form itself, not only on the review page."""
     OPTION_INPUTS = ('name="exclude_presets" value="authoring"', 'name="exclude_presets" value="junk"', 'name="exclude_presets" value="docs"',

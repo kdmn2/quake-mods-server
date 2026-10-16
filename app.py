@@ -961,15 +961,27 @@ def dashboard() -> Any:
     return render_template("dashboard.html", addons=addons, active_jobs=jobs.active(), pending_imports=pending_imports)
 
 
-def _read_addon_form() -> dict[str, str]:
+def _read_addon_form(*, defaults: dict[str, Any] | None = None) -> dict[str, str]:
+    defaults = defaults or {}
     return {
-        "title": request.form.get("title", "").strip(),
-        "addon_id": request.form.get("addon_id", "").strip(),
-        "gamedir": request.form.get("gamedir", "").strip(),
-        "author": request.form.get("author", "Unknown").strip(),
-        "date": request.form.get("date", "").strip(),
-        "description": request.form.get("description", "").strip(),
+        "title": request.form.get("title", defaults.get("title", "")).strip(),
+        "addon_id": request.form.get("addon_id", defaults.get("addon_id", "")).strip(),
+        "gamedir": request.form.get("gamedir", defaults.get("gamedir", "")).strip(),
+        "author": request.form.get("author", defaults.get("author", "Unknown")).strip(),
+        "date": request.form.get("date", defaults.get("date", "")).strip(),
+        "description": request.form.get("description", defaults.get("description", "")).strip(),
     }
+
+
+def _uploaded_file(field: str = "package"):
+    file = request.files.get(field)
+    if not file:
+        return None
+    if not getattr(file, "filename", ""):
+        return None
+    # Werkzeug gives an empty filename when the browser submits an empty file input.
+    # Treat that as "no replacement" so metadata-only edits work without extra UI steps.
+    return file
 
 
 def _stage_source(token: str) -> tuple[Path, str, bool]:
@@ -988,8 +1000,8 @@ def _stage_source(token: str) -> tuple[Path, str, bool]:
             raise ValueError("Local source must be a .zip or .pak file.")
         print(f"[import] local source selected: {source_path}", flush=True)
         return source_path, source_path.name, False
-    package_file = request.files.get("package")
-    if not package_file or not package_file.filename:
+    package_file = _uploaded_file()
+    if not package_file:
         raise ValueError("Package file is required for upload mode.")
     safe_name = secure_filename(package_file.filename)
     if not safe_name:
@@ -1126,15 +1138,18 @@ def edit_addon(addon_id: int) -> Any:
         conn.close()
     if not addon:
         raise NotFound()
-    ctx = {"mode": "edit", "addon": dict(addon)}
+    ctx = {"mode": "edit", "addon": dict(addon), "package": {"filename": addon["package_name"], "available": bool(addon["package_path"] and Path(addon["package_path"]).is_file())}}
     if request.method == "POST":
-        form = _read_addon_form()
+        form = _read_addon_form(defaults=dict(addon))
         if not form["title"] or not form["addon_id"] or not form["gamedir"]:
             return _form_failure("Title, ID, and game dir are required.", **ctx)
         if form["addon_id"] != addon["addon_id"] and addon["published"]:
             return _form_failure("Unpublish this add-on before changing its ID (the public download path is derived from it).", **ctx)
-        package_file = request.files.get("package")
-        if (package_file and package_file.filename) or request.form.get("import_mode") == "local":
+        package_file = _uploaded_file()
+        replacement = bool(package_file) or request.form.get("import_mode") == "local"
+        if replacement:
+            if package_file and not package_file.filename:
+                package_file = None
             return _start_import("replace", addon_id, form, ctx)
         try:
             with db_txn() as conn:

@@ -2,6 +2,12 @@
 {% block content %}
 <div class="card">
   <h2>{% if mode == 'edit' %}Edit add-on{% else %}Add a new add-on{% endif %}</h2>
+  {% if package %}
+  <div class="card" style="margin:12px 0">
+    <p><strong>Current package:</strong> {% if package.available %}{{ package.filename }}{% else %}<span class="error">{{ package.filename }} is missing</span>{% endif %}</p>
+    {% if mode == 'edit' %}<p class="small muted">Replace package — optional. Leave it empty to keep the existing package and change metadata only.</p>{% endif %}
+  </div>
+  {% endif %}
   <form method="post" enctype="multipart/form-data" id="addon-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <p>
@@ -29,8 +35,9 @@
       <textarea name="description" rows="5">{{ addon.description if addon else '' }}</textarea>
     </p>
     <p>
-      <label>Package file</label><br>
-      <input type="file" name="package">
+      <label>{% if mode == 'edit' %}Replace package — optional{% else %}Package file{% endif %}</label><br>
+      <input type="file" name="package" {% if mode != 'edit' %}required{% endif %}>
+      {% if mode == 'edit' %}<div class="small muted">Leave it empty to keep the current package.</div>{% endif %}
     </p>
     <p>
       <label>Import mode</label><br>
