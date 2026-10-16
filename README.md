@@ -160,6 +160,8 @@ On normal startup, the container also prints a single JSON banner to Docker logs
 If the banner still shows `/data`, that means you are running an older image or an overridden environment/config in the container settings.
 Recreate the container or re-import the template if you still see `/data`; the supported persistent root is `/appdata`.
 
+ZIP imports now also emit short `[import]` and `[zip-import]` log lines so you can tell whether the app used Python ZIP handling or the system `unzip` fallback.
+
 ### Unraid troubleshooting
 
 If the container fails before the Web UI appears, check the logs:

@@ -148,6 +148,7 @@ def _validate_zip_member_name(name: str) -> str:
 
 def _read_zip_entries_with_unzip(source: Path) -> list[tuple[str, bytes]]:
     entries: list[tuple[str, bytes]] = []
+    print(f"[zip-import] using system unzip fallback for {source.name}", flush=True)
     with tempfile.TemporaryDirectory(prefix="quake-zip-", dir=str(source.parent)) as tmpdir:
         cmd = ["unzip", "-qq", "-o", str(source), "-d", tmpdir]
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -160,6 +161,7 @@ def _read_zip_entries_with_unzip(source: Path) -> list[tuple[str, bytes]]:
             rel = path.relative_to(root).as_posix()
             _validate_zip_member_name(rel)
             entries.append((rel, path.read_bytes()))
+    print(f"[zip-import] unzip fallback extracted {len(entries)} files from {source.name}", flush=True)
     return entries
 
 
@@ -178,6 +180,7 @@ def repack_zip_to_pak(source: Path, target: Path, max_files: int = 5000, max_unc
             raise ValueError(f"{source.name!r} does not contain any files")
         if len(infos) > max_files:
             raise ValueError(f"ZIP has too many files ({len(infos)} > {max_files})")
+        print(f"[zip-import] python zipfile saw {len(infos)} files in {source.name}", flush=True)
         for info in infos:
             if info.flag_bits & 0x1:
                 raise ValueError(f"Encrypted ZIP entries are not supported: {info.filename!r}")
@@ -187,6 +190,7 @@ def repack_zip_to_pak(source: Path, target: Path, max_files: int = 5000, max_unc
                     data = fh.read()
             except NotImplementedError as exc:
                 python_zip_failed = True
+                print(f"[zip-import] python zipfile could not decode {info.filename}; falling back to unzip", flush=True)
                 break
             except RuntimeError as exc:
                 raise ValueError(f"Unable to read ZIP entry {info.filename!r}: {exc}") from exc
@@ -213,6 +217,7 @@ def repack_zip_to_pak(source: Path, target: Path, max_files: int = 5000, max_unc
 
     header = b"PACK" + struct.pack("<II", dir_offset + len(file_blobs), len(dir_records))
     atomic_write(target, header + file_blobs + dir_records)
+    print(f"[zip-import] repacked {len(entries)} files from {source.name} into {target.name} ({target.stat().st_size} bytes)", flush=True)
     return {"entries": len(entries), "size": target.stat().st_size, "sha256": _compute_sha256(target)}
 
 
@@ -240,6 +245,7 @@ def repack_zip_to_pak_from_entries(source: Path, target: Path, entries: list[tup
         dir_records.extend(struct.pack("<II", file_offset, len(data)))
     header = b"PACK" + struct.pack("<II", dir_offset + len(file_blobs), len(dir_records))
     atomic_write(target, header + file_blobs + dir_records)
+    print(f"[zip-import] repacked {len(cleaned)} files from {source.name} via unzip into {target.name} ({target.stat().st_size} bytes)", flush=True)
     return {"entries": len(cleaned), "size": target.stat().st_size, "sha256": _compute_sha256(target)}
 
 

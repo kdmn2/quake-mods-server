@@ -458,20 +458,25 @@ def add_addon() -> Any:
 
         try:
             if import_mode == "local":
+                print(f"[import] local source selected: {source_path}", flush=True)
                 shutil.copy2(source_path, upload_source)
             else:
+                print(f"[import] browser upload selected: {safe_name}", flush=True)
                 package_file.save(upload_source)
             detected = detect_package_format(upload_source)
+            print(f"[import] detected {detected} for {safe_name}; staging at {upload_source}", flush=True)
             if detected == "zip":
                 repack_zip_to_pak(upload_source, target)
                 conversion_msg = "Uploaded ZIP was repacked into a Quake PAK."
             elif detected == "pak":
                 shutil.copy2(upload_source, target)
+                print(f"[import] copied PAK unchanged to {target}", flush=True)
                 conversion_msg = "Uploaded PAK was stored unchanged."
             else:
                 raise ValueError(f"Unsupported package format for {safe_name!r}; expected a ZIP or Quake PAK")
 
             package_info = validate_package(target)
+            print(f"[import] validated package {target.name}: size={package_info['size']} sha256={package_info['sha256']}", flush=True)
             with db_txn() as conn:
                 if conn.execute("SELECT 1 FROM addons WHERE addon_id = ?", (addon_id,)).fetchone():
                     raise sqlite3.IntegrityError("duplicate addon id")

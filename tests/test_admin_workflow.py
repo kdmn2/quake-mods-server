@@ -178,6 +178,10 @@ class AdminWorkflowTests(unittest.TestCase):
         repack_zip_to_pak(zip_path, pak_path)
         self.assertEqual(pak_path.read_bytes()[:4], b"PACK")
 
+    def test_import_logging_helpers_are_available(self):
+        from app import _effective_config
+        self.assertIn("PERSIST_ROOT", _effective_config())
+
     def test_large_zip_repack_limit_is_higher(self):
         from tools.catalog import repack_zip_to_pak
         zip_path = self.tmp / "large.zip"
