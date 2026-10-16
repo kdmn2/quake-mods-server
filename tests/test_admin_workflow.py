@@ -160,6 +160,14 @@ class AdminWorkflowTests(unittest.TestCase):
         repack_zip_to_pak(zip_path, pak_path)
         self.assertEqual(pak_path.read_bytes()[:4], b"PACK")
 
+    def test_zip_deflate_read_path(self):
+        from tools.catalog import repack_zip_to_pak
+        zip_path = self.tmp / "deflate.zip"
+        pak_path = self.tmp / "deflate.pak"
+        self._make_zip(zip_path, {"qbj/copper.def": b"x" * 1024})
+        repack_zip_to_pak(zip_path, pak_path)
+        self.assertEqual(pak_path.read_bytes()[:4], b"PACK")
+
     def test_large_zip_repack_limit_is_higher(self):
         from tools.catalog import repack_zip_to_pak
         zip_path = self.tmp / "large.zip"
