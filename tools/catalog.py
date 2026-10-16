@@ -229,7 +229,7 @@ def build_single_pak_from_zip(source: Path, target: Path, max_files: int = 5000,
         if root_mode == "wrapper":
             wrapper = release["wrapper_dirs"][0]
         seen_zip_paths: set[str] = set()
-        for zip_index, info in enumerate(infos):
+        for info in infos:
             raw_name = _normalize_zip_member_path(info.filename)
             if raw_name in seen_zip_paths:
                 raise ValueError(f"ZIP contains duplicate path: {raw_name!r}")
@@ -245,11 +245,7 @@ def build_single_pak_from_zip(source: Path, target: Path, max_files: int = 5000,
                 continue
             if name.lower().endswith('.pak'):
                 pak_entries = _pak_manifest_bytes(data)
-                pak_rank = 0
-                pak_index = 0
-                if name.lower() == 'pak0.pak':
-                    pak_index = 0
-                elif name.lower().startswith('pak') and name.lower().endswith('.pak') and name[3:-4].isdigit():
+                if name.lower().startswith('pak') and name.lower().endswith('.pak') and name[3:-4].isdigit():
                     pak_index = int(name[3:-4])
                 else:
                     # embedded pak inside a release zip is treated as the base source package
@@ -257,7 +253,7 @@ def build_single_pak_from_zip(source: Path, target: Path, max_files: int = 5000,
                 for entry in pak_entries:
                     payload = data[entry['offset']:entry['offset'] + entry['size']]
                     prev = entries.get(entry['path'])
-                    candidate = (pak_rank, pak_index, payload)
+                    candidate = (0, pak_index, payload)
                     if prev is None or candidate[:2] >= prev[:2]:
                         entries[entry['path']] = candidate
             else:
