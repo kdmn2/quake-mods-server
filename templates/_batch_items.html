@@ -1,0 +1,48 @@
+<div id="batch-items" data-active="{{ active }}" data-waiting="{{ waiting }}">
+  <table class="table-sm">
+    <thead><tr><th>#</th><th>Source</th><th>Status</th><th>Progress</th><th>Result</th><th></th></tr></thead>
+    <tbody>
+    {% for it in items %}
+    <tr>
+      <td>{{ it.position }}</td>
+      <td>
+        <div>{{ it.display }}</div>
+        <div class="small muted">{{ 'Remote link' if it.source_type == 'url' else 'Server folder' }}{% if it.final_name %} · {{ it.final_name }}{% endif %}{% if it.sha256 %} · SHA-256 {{ it.sha256 }}…{% endif %}</div>
+      </td>
+      <td><span class="pill {{ it.state }}">{{ it.label }}</span>{% if it.attempts > 1 %} <span class="small muted">attempt {{ it.attempts }}</span>{% endif %}</td>
+      <td>
+        {% if it.stage %}
+          <div class="small">{{ it.stage }}</div>
+          {% if it.percent is not none %}<div class="progress" style="height:8px;margin:4px 0"><div style="width: {{ it.percent }}%"></div></div><div class="small muted">{{ it.done|filesize }} of {{ it.total|filesize }}</div>
+          {% elif it.done %}<div class="small muted">{{ it.done|filesize }} so far</div>{% endif %}
+        {% endif %}
+      </td>
+      <td>
+        {% if it.message %}
+          {% if it.message|length > 110 %}<details><summary>{{ it.message[:100] }}…</summary><div class="small">{{ it.message }}</div></details>
+          {% else %}<div class="small {{ 'error' if it.state in ('failed', 'interrupted') else '' }}">{{ it.message }}</div>{% endif %}
+        {% endif %}
+        {% if it.addon_url %}<div><a href="{{ it.addon_url }}">{% if it.state == 'completed' %}Open the draft{% else %}Open the existing add-on{% endif %}</a></div>{% endif %}
+        {% if it.review_url %}<div><a href="{{ it.review_url }}"><strong>Review and build</strong></a></div>{% endif %}
+        {% for value, text in it.choices %}
+        <form method="post" action="{{ url_for('batch_item_resolve', item_id=it.id) }}" style="display:block;margin:3px 0">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="choice" value="{{ value }}">
+          <button type="submit" class="small">{{ text }}</button>
+        </form>
+        {% endfor %}
+      </td>
+      <td>
+        {% if it.can_retry %}
+        <form method="post" action="{{ url_for('batch_item_retry', item_id=it.id) }}" style="display:inline"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">Retry</button></form>
+        {% endif %}
+        {% if it.can_cancel %}
+        <form method="post" action="{{ url_for('batch_item_cancel', item_id=it.id) }}" style="display:inline"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit" class="danger">{{ 'Discard' if it.state in ('awaiting_review', 'needs_decision') else 'Cancel' }}</button></form>
+        {% endif %}
+      </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="6">No items.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>

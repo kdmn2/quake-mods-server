@@ -38,6 +38,15 @@
     .opt h4 { margin: 0 0 6px; }
     .bad { color: #b42318; font-weight: bold; }
     button[disabled] { background: #9aa4b5; cursor: not-allowed; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; background: #eef1f6; }
+    .pill.completed { background: #e8f8ee; color: #127c47; }
+    .pill.failed, .pill.interrupted { background: #fbeaea; color: #b42318; }
+    .pill.awaiting_review, .pill.needs_decision { background: #fff6e0; color: #8a5a00; }
+    .pill.acquiring, .pill.converting { background: #e6efff; color: #1c4fa5; }
+    .pill.skipped, .pill.cancelled { background: #eef1f6; color: #5b6471; }
+    .source-box { border: 1px solid #e3e8ef; border-radius: 8px; padding: 14px; margin: 12px 0; }
+    .source-box h3 { margin-top: 0; }
+    textarea.mono { font-family: monospace; font-size: 13px; }
     details summary { cursor: pointer; font-weight: bold; margin: 8px 0; }
     code, .mono { font-family: monospace; word-break: break-all; }
     .table-sm td, .table-sm th { padding: 5px 8px; font-size: 13px; }
@@ -49,6 +58,7 @@
     <div class="nav">
       {% if current_user %}
         <a href="{{ url_for('dashboard') }}">Dashboard</a>
+        <a href="{{ url_for('batch_home') }}">Batch import</a>
         <a href="{{ url_for('add_addon') }}">Upload</a>
         <a href="{{ url_for('logout') }}">Logout</a>
       {% endif %}

@@ -4,7 +4,8 @@ Why: converting or publishing a large package can take minutes, longer than a re
 request now only records a job and returns; a single worker thread does the work while the browser polls a tiny status endpoint
 (each poll is a short request, so no proxy timeout applies).
 
-* One worker thread: conversions are CPU/disk heavy and two at once would just compete.
+* Lanes: "work" (convert, publish; one worker, they compete for CPU and disk) and, if configured, "net" (downloading/staging; a few
+  workers, so one slow remote server cannot hold up conversions or publishing). Both are fixed-size and shared by every import source.
 * Progress is written to the database (throttled), so any request thread can read it and a restart can mark what was interrupted.
 * Cancellation is cooperative: Progress raises JobCancelled the next time the job reports progress.
 * "inline" mode runs a job in the calling thread (used by tests and by anyone who prefers synchronous behaviour).
@@ -22,7 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 PROGRESS_WRITE_INTERVAL = 0.4
-KEEP_FINISHED_JOBS = 60
+KEEP_FINISHED_JOBS = 400
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -109,14 +110,18 @@ class Progress:
 
 
 class JobManager:
-    def __init__(self, connect: Callable[[], sqlite3.Connection], inline: Callable[[], bool], log: Callable[[str], None] = print):
+    def __init__(self, connect: Callable[[], sqlite3.Connection], inline: Callable[[], bool], log: Callable[[str], None] = print,
+                 lanes: dict[str, int] | None = None):
         self._connect = connect
         self._inline = inline
         self._log = log
-        self._queue: "queue.Queue[tuple[str, Callable[[Progress], JobOutcome]]]" = queue.Queue()
-        self._worker: threading.Thread | None = None
+        self._lanes = dict(lanes or {"work": 1})
+        self._lanes.setdefault("work", 1)
+        self._queues: dict[str, "queue.Queue[tuple[str, Callable[[Progress], JobOutcome]]]"] = {name: queue.Queue() for name in self._lanes}
+        self._workers: dict[str, list[threading.Thread]] = {name: [] for name in self._lanes}
         self._lock = threading.Lock()
         self._cancel_flags: dict[str, threading.Event] = {}
+        self._finalizers: dict[str, Callable[[str, str, str], None]] = {}
 
     # ---- schema / recovery ---------------------------------------------------------------------
     def init_schema(self, conn: sqlite3.Connection) -> None:
@@ -135,7 +140,12 @@ class JobManager:
             conn.close()
 
     # ---- submitting ----------------------------------------------------------------------------
-    def submit(self, kind: str, title: str, fn: Callable[[Progress], JobOutcome]) -> str:
+    def submit(self, kind: str, title: str, fn: Callable[[Progress], JobOutcome], lane: str = "work",
+               finalizer: Callable[[str, str, str], None] | None = None) -> str:
+        """Queue `fn`. `finalizer(state, message, level)` is called exactly once when the job reaches a final state
+        (done, failed, cancelled), including a cancellation before it ever started."""
+        if lane not in self._lanes:
+            raise ValueError(f"unknown job lane {lane!r}")
         job_id = uuid.uuid4().hex
         now = time.time()
         conn = self._connect()
@@ -147,32 +157,38 @@ class JobManager:
         finally:
             conn.close()
         self._cancel_flags[job_id] = threading.Event()
+        if finalizer:
+            self._finalizers[job_id] = finalizer
         if self._inline():
             self._run(job_id, fn)
         else:
-            self._ensure_worker()
-            self._queue.put((job_id, fn))
+            self._ensure_workers(lane)
+            self._queues[lane].put((job_id, fn))
         return job_id
 
-    def _ensure_worker(self) -> None:
+    def _ensure_workers(self, lane: str) -> None:
         with self._lock:
-            if self._worker is None or not self._worker.is_alive():
-                self._worker = threading.Thread(target=self._loop, name="job-worker", daemon=True)
-                self._worker.start()
+            alive = [t for t in self._workers[lane] if t.is_alive()]
+            while len(alive) < self._lanes[lane]:
+                t = threading.Thread(target=self._loop, args=(lane,), name=f"job-{lane}-{len(alive)}", daemon=True)
+                t.start()
+                alive.append(t)
+            self._workers[lane] = alive
 
-    def _loop(self) -> None:
+    def _loop(self, lane: str) -> None:
+        q = self._queues[lane]
         while True:
-            job_id, fn = self._queue.get()
+            job_id, fn = q.get()
             try:
                 self._run(job_id, fn)
             finally:
-                self._queue.task_done()
+                q.task_done()
 
     def wait_idle(self, timeout: float = 30.0) -> bool:
-        """Test helper: wait until the queue is drained."""
+        """Test helper: wait until every lane's queue is drained."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if self._queue.unfinished_tasks == 0:
+            if all(q.unfinished_tasks == 0 for q in self._queues.values()):
                 return True
             time.sleep(0.02)
         return False
@@ -228,6 +244,12 @@ class JobManager:
         if state == "done":
             fields["percent"] = 100.0
         self._update(job_id, **fields)
+        finalizer = self._finalizers.pop(job_id, None)
+        if finalizer:
+            try:
+                finalizer(state, message, level)
+            except Exception:                                  # a broken finalizer must not take the worker down
+                self._log(f"[job {job_id[:8]}] finalizer failed:\n{traceback.format_exc()}")
 
     # ---- reading / cancelling ------------------------------------------------------------------
     def get(self, job_id: str) -> dict[str, Any] | None:

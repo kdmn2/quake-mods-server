@@ -1,0 +1,83 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="card">
+  <h2>Folder scan: {{ root.label }}{% if scan.subpath %}/{{ scan.subpath }}{% endif %}</h2>
+  <p class="small muted">Server folder <span class="mono">{{ root.path }}</span>{% if scan.recursive %} (including subfolders){% endif %}. Nothing has been imported. Files are read only when you start the import.
+    Selected files are copied to temporary storage; the originals are never modified.</p>
+  <p>{{ total }} package(s) listed, {{ eligible_count }} eligible ({{ eligible_bytes|filesize }}).
+     {% if scan.summary.other_files %}{{ scan.summary.other_files }} other file(s) ignored. {% endif %}
+     {% if scan.summary.skipped_links %}{{ scan.summary.skipped_links }} symbolic link(s) ignored. {% endif %}</p>
+  {% if scan.summary.truncated %}<div class="sev warning">The folder is larger than the scan limits, so the list is incomplete. Scan a subfolder, or raise the IMPORT_SCAN_* limits.</div>{% endif %}
+  {% if scan.summary.errors %}<div class="sev warning">Some folders could not be read: {% for e in scan.summary.errors %}<span class="mono">{{ e }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</div>{% endif %}
+  <p><a href="{{ url_for('batch_home') }}">Scan another folder</a></p>
+</div>
+
+{% if shown %}
+<form method="post" action="{{ url_for('batch_submit_folder') }}" id="folder-form" data-once>
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="scan_id" value="{{ scan_id }}"><input type="hidden" name="submit_key" value="{{ submit_key }}">
+  <div class="card">
+    <div class="inline" style="margin-bottom:8px">
+      <button type="button" id="sel-all">Select all on this page</button>
+      <button type="button" id="sel-none">Clear selection</button>
+      <span id="sel-summary" class="small muted"></span>
+    </div>
+    <table class="table-sm">
+      <thead><tr><th></th><th>File</th><th>Size</th><th>Status</th></tr></thead>
+      <tbody>
+      {% for e in shown %}
+      <tr>
+        <td>{% if e.eligible %}<input type="checkbox" name="selected" value="{{ e.rel }}" data-size="{{ e.size }}" class="pick">{% endif %}</td>
+        <td class="mono">{{ e.rel }}</td>
+        <td>{{ e.size|filesize }}</td>
+        <td>{% if not e.eligible %}<span class="error small">{{ e.reason }}</span>
+            {% elif known.get(e.rel) %}<span class="small {{ 'error' if known[e.rel].kind == 'failed' else 'muted' }}">{{ known[e.rel].text }}</span>
+            {% else %}<span class="small muted">Eligible ({{ e.kind|upper }})</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <p class="small muted">Page {{ page }} of {{ pages }}.
+      {% if page > 1 %}<a href="{{ url_for('batch_scan_results', scan_id=scan_id, page=page - 1) }}">Previous</a>{% endif %}
+      {% if page < pages %}<a href="{{ url_for('batch_scan_results', scan_id=scan_id, page=page + 1) }}">Next</a>{% endif %}
+      Checkboxes only apply to the page you are on.</p>
+    <div class="inline">
+      <button type="submit" name="mode" value="selected" id="import-selected" data-confirm-template="Import {n} selected package(s) ({size}) as drafts?">Import selected</button>
+      {% if eligible_count %}
+      <button type="submit" name="mode" value="all" class="danger" data-confirm-text="Import ALL {{ eligible_count }} eligible package(s) ({{ eligible_bytes|filesize }}) from this scan as drafts?">Import all {{ eligible_count }} eligible</button>
+      {% endif %}
+      <span class="small muted">At most {{ max_items }} packages per batch.</span>
+    </div>
+  </div>
+</form>
+<script>
+(function () {
+  var form = document.getElementById('folder-form');
+  var picks = function () { return Array.prototype.slice.call(form.querySelectorAll('input.pick')); };
+  function bytes(n) { var u = ['B','KiB','MiB','GiB'], i = 0; while (n >= 1024 && i < 3) { n /= 1024; i++; } return n.toFixed(i && n < 100 ? 1 : 0) + ' ' + u[i]; }
+  function summary() {
+    var on = picks().filter(function (p) { return p.checked; });
+    var total = on.reduce(function (a, p) { return a + Number(p.getAttribute('data-size')); }, 0);
+    document.getElementById('sel-summary').textContent = on.length + ' selected · ' + bytes(total);
+    document.getElementById('import-selected').disabled = on.length === 0;
+    return { n: on.length, size: bytes(total) };
+  }
+  document.getElementById('sel-all').onclick = function () { picks().forEach(function (p) { p.checked = true; }); summary(); };
+  document.getElementById('sel-none').onclick = function () { picks().forEach(function (p) { p.checked = false; }); summary(); };
+  picks().forEach(function (p) { p.addEventListener('change', summary); });
+  summary();
+  var clicked = null;
+  form.querySelectorAll('button[type=submit]').forEach(function (b) { b.addEventListener('click', function () { clicked = b; }); });
+  form.addEventListener('submit', function (ev) {
+    var b = clicked, text;
+    if (b && b.getAttribute('data-confirm-text')) text = b.getAttribute('data-confirm-text');
+    else { var s = summary(); text = (b && b.getAttribute('data-confirm-template') || '').replace('{n}', s.n).replace('{size}', s.size); }
+    if (text && !window.confirm(text)) { ev.preventDefault(); return; }
+    form.querySelectorAll('button[type=submit]').forEach(function (x) { x.disabled = true; });
+    if (b) { var h = document.createElement('input'); h.type = 'hidden'; h.name = 'mode'; h.value = b.value; form.appendChild(h); }   // disabled buttons are not submitted
+  });
+})();
+</script>
+{% else %}
+<div class="card"><p>No ZIP files were found here.</p></div>
+{% endif %}
+{% endblock %}

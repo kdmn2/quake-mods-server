@@ -1,0 +1,68 @@
+{# Shared by the upload/edit form and the review page. Context: plan (or none), options, form, imp (or none), presets. #}
+
+    {% if not plan %}
+    <div class="opt">
+      <h4>Root folder</h4>
+      <p class="small muted">Normally detected automatically. If the ZIP holds several mods you can pick the right folder on the review step that follows the upload (keep “Review the conversion” ticked).</p>
+    </div>
+    {% elif plan.top_level_dirs %}
+    <div class="opt">
+      <h4>Root folder</h4>
+      <p class="small muted">Normally detected automatically. Choose a folder to treat it as the mod and leave everything outside it out of the package (needed when the ZIP holds several mods).</p>
+      <select name="root">
+        <option value="">Automatic{% if plan and plan.root_mapping and plan.root_mapping != 'selected' %} ({{ plan.root_mapping }}){% endif %}</option>
+        {% for d in plan.top_level_dirs %}<option value="{{ d }}" {% if options.root == d %}selected{% endif %}>{{ d }}/</option>{% endfor %}
+      </select>
+    </div>
+    {% endif %}
+
+    <div class="opt">
+      <h4>Leave out files Ironwail does not need</h4>
+      <p class="small muted">Removes content from the package. The preview lists exactly what goes.</p>
+      {% for key, preset in presets.items() %}
+      {% set stat = plan.preset_stats[key] if plan else None %}
+      <label><input type="checkbox" name="exclude_presets" value="{{ key }}" {% if key in options.exclude_presets %}checked{% endif %}>
+        {{ preset.label }}{% if stat %} — {{ stat.files }} file(s), {{ stat.bytes|filesize }}{% endif %}</label>
+      <div class="small muted" style="margin:0 0 6px 24px">{{ preset.help }}</div>
+      {% endfor %}
+      <label>Custom patterns, one per line</label>
+      <textarea name="exclude_patterns" rows="3" placeholder="*.bak&#10;/notes/&#10;sound/old/*.wav">{{ options.exclude_patterns|join('\n') }}</textarea>
+      <div class="small muted"><code>*.map</code> matches that file name anywhere; <code>mapsrc/</code> matches a folder of that name anywhere; a leading <code>/</code> anchors to the package root (<code>/*.txt</code> = root-level files only). Case is ignored.</div>
+    </div>
+
+    <div class="opt">
+      <h4>Re-encode TGA images as PNG (lossless)</h4>
+      <p class="small muted">
+        Ironwail decodes TGA and PNG with the same library and always to RGBA, so a PNG with identical pixels looks exactly the same in game.
+        Each image is decoded again after conversion and compared byte for byte; anything that cannot be proven identical, or would not get smaller, stays a TGA.
+        The package bytes change (only the image files) and the result depends on the Pillow/zlib versions, which are recorded.
+        Only 24/32-bit uncompressed or RLE TGAs are converted.
+      </p>
+      {% set cand = plan.image_candidates if plan else None %}
+      <label><input type="checkbox" name="reencode_textures" value="1" {% if options.reencode_textures %}checked{% endif %}>
+        Textures and other images{% if cand %} — {{ cand.textures.files }} TGA file(s), {{ cand.textures.bytes|filesize }}{% endif %}</label><br>
+      <label><input type="checkbox" name="reencode_skyboxes" value="1" {% if options.reencode_skyboxes %}checked{% endif %}>
+        Skybox faces (<span class="mono">gfx/env/</span>){% if cand %} — {{ cand.skyboxes.files }} TGA file(s), {{ cand.skyboxes.bytes|filesize }}{% endif %}</label>
+      <div class="small muted" style="margin-left:24px">Maps load PNG skyboxes normally. The only visible difference is that Ironwail's console tab-completion for the <code>sky</code> command lists TGA skyboxes only (host_cmd.c, SkyList_AddFile), so converted skies will not be suggested there.</div>
+    </div>
+
+    <div class="opt">
+      <h4>Add a mapdb.json</h4>
+      {% if plan and plan.mapdb_present %}
+      <p class="small muted">This release already contains a <span class="mono">mapdb.json</span>; it is always kept as it is, so this option has no effect.</p>
+      {% else %}
+      <p class="small muted">Adds a minimal file naming the episode so Ironwail shows the same name after installation. Written only when the release has none; contains no map list.</p>
+      {% endif %}
+      <label><input type="checkbox" name="generate_mapdb" value="1" {% if options.mapdb %}checked{% endif %}> Add it</label><br>
+      <label>Episode name <input name="mapdb_name" value="{{ options.mapdb[0] if options.mapdb else (form.title if plan else '') }}" placeholder="defaults to the Title"></label>
+      <label>Directory <input name="mapdb_dir" value="{{ options.mapdb[1] if options.mapdb else (form.gamedir if plan else '') }}" placeholder="defaults to the installation directory"></label>
+    </div>
+
+    {% if not imp or imp.owns_source or imp.kind == 'new' %}
+    <div class="opt">
+      <h4>Keep the uploaded ZIP</h4>
+      <p class="small muted">Stored on the server so the package can be rebuilt later with different options without uploading again. Uses disk space equal to the ZIP {% if imp %}({{ imp.source_name }}){% endif %}. Deleted with the add-on.</p>
+      <label><input type="checkbox" name="keep_source" value="1" {% if imp and imp.keep_source %}checked{% endif %}> Keep a copy</label>
+    </div>
+    {% endif %}
+

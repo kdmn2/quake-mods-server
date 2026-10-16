@@ -583,6 +583,108 @@ class LocalImportTests(FlowBase):
         self.assertTrue(z.exists())
 
 
+class FormOptionsTests(FlowBase):
+    """The options are on the upload/edit form itself, not only on the review page."""
+    OPTION_INPUTS = ('name="exclude_presets" value="authoring"', 'name="exclude_presets" value="junk"', 'name="exclude_presets" value="docs"',
+                     'name="exclude_patterns"', 'name="reencode_textures"', 'name="reencode_skyboxes"', 'name="generate_mapdb"',
+                     'name="mapdb_name"', 'name="mapdb_dir"', 'name="keep_source"', 'name="review"')
+
+    def zip_with_images(self):
+        tga = tga_bytes(64, 64, gradient(64, 64, 3), channels=3)
+        return release_zip(self.tmp / "rel.zip", [("gfx/t.tga", tga), ("gfx/env/s_up.tga", tga)])
+
+    def test_every_option_is_on_the_new_add_on_form(self):
+        html = self.c.get("/addons/new").get_data(as_text=True)
+        for needle in self.OPTION_INPUTS:
+            self.assertIn(needle, html, needle)
+        self.assertEqual(html.count('name="keep_source"'), 1)               # one checkbox, not one per template
+        self.assertIn("Conversion options", html)
+        for preset in ("authoring", "junk", "docs"):
+            self.assertIn(f'name="exclude_presets" value="{preset}" >', html)                      # every option starts switched off
+        for name in ("reencode_textures", "reencode_skyboxes", "generate_mapdb", "keep_source"):
+            self.assertIn(f'name="{name}" value="1" >', html)
+        self.assertIn('name="review" value="1" checked', html)                                       # only the review step starts ticked
+
+    def test_every_option_is_on_the_edit_form_too(self):
+        self.upload("edit", make_pak_bytes([("maps/a.bsp", make_bsp())]))
+        html = self.c.get(f"/addons/{self.row('edit')['id']}/edit").get_data(as_text=True)
+        for needle in self.OPTION_INPUTS:
+            self.assertIn(needle, html, needle)
+
+    def test_options_chosen_on_the_form_apply_to_a_direct_build(self):
+        z = self.zip_with_images()
+        res = self.start_upload(z, "direct", exclude_presets=["authoring"], reencode_textures="1", generate_mapdb="1", keep_source="1")
+        st = self.status(self.job_id_from(res))
+        self.assertEqual((st["kind"], st["state"]), ("build", "done"))      # no review step: options are used immediately
+        got = parse_pak(Path(self.row("direct")["package_path"]))
+        self.assertEqual(sorted(got), ["gfx/env/s_up.tga", "gfx/t.png", "mapdb.json", "maps/a.bsp", "maps/b.bsp", "pun.txt", "sound/x.wav"])
+        self.assertEqual(json.loads(got["mapdb.json"]), {"episodes": [{"dir": "direct", "name": "direct"}], "maps": []})   # blank fields default to title / directory
+        rec = json.loads(self.row("direct")["conversion_report"])
+        self.assertEqual((rec["options"]["exclude_presets"], rec["reencoded"]["converted"], rec["excluded"]["total"]), (["authoring"], 1, 1))
+        self.assertTrue(Path(self.row("direct")["source_path"]).is_file())
+
+    def test_explicit_mapdb_values_beat_the_defaults(self):
+        res = self.start_upload(self.zip_with_images(), "mapx", generate_mapdb="1", mapdb_name="  The Real Name ", mapdb_dir="realdir")
+        self.assertEqual(self.status(self.job_id_from(res))["state"], "done")
+        got = parse_pak(Path(self.row("mapx")["package_path"]))
+        self.assertEqual(json.loads(got["mapdb.json"])["episodes"], [{"dir": "realdir", "name": "The Real Name"}])
+
+    def test_options_from_the_form_carry_over_to_the_review_page(self):
+        res = self.start_upload(self.zip_with_images(), "carry", review="1", exclude_presets=["authoring", "junk"], exclude_patterns="*.txt",
+                                reencode_skyboxes="1", keep_source="1")
+        self.assertEqual(self.status(self.job_id_from(res))["kind"], "plan")
+        token = self.last_import()["token"]
+        plan = json.loads(self.last_import()["plan_json"])
+        self.assertEqual(plan["excluded"]["total"], 2)                      # b.map (authoring) + pun.txt (custom), already reflected in the preview
+        html = self.c.get(f"/imports/{token}").get_data(as_text=True)
+        for preset in ("authoring", "junk"):
+            self.assertIn(f'name="exclude_presets" value="{preset}" checked', html)
+        self.assertIn('name="exclude_presets" value="docs" >', html)
+        self.assertIn('name="reencode_skyboxes" value="1" checked', html)
+        self.assertIn('name="reencode_textures" value="1" >', html)
+        self.assertIn('name="keep_source" value="1" checked', html)
+        self.assertIn("*.txt", html)
+        # pressing Build without touching anything keeps those choices
+        st = self.status(self.job_id_from(self.post(f"/imports/{token}/build", {"exclude_presets": ["authoring", "junk"], "exclude_patterns": "*.txt", "reencode_skyboxes": "1", "keep_source": "1"})))
+        self.assertEqual(st["state"], "done", st["message"])
+        self.assertEqual(sorted(parse_pak(Path(self.row("carry")["package_path"]))), ["gfx/env/s_up.png", "gfx/t.tga", "maps/a.bsp", "maps/b.bsp", "sound/x.wav"])
+
+    def test_bad_options_are_rejected_before_anything_is_staged(self):
+        z = self.zip_with_images()
+        for extra, message in (({"exclude_presets": ["nonsense"]}, "Unknown exclusion preset"), ({"exclude_patterns": "*"}, "would match everything"),
+                               ({"exclude_patterns": "../x"}, "'..'")):
+            with self.subTest(extra=extra):
+                res = self.start_upload(z, "bad", headers={"X-Requested-With": "XMLHttpRequest"}, **extra)
+                self.assertEqual(res.status_code, 400)
+                self.assertIn("Options rejected", res.get_json()["error"])
+                self.assertIn(message, res.get_json()["error"])
+                self.assertEqual((self.stray_files(), self.import_count(), self.row("bad")), ([], 0, None))
+        res = self.start_upload(z, "bad", exclude_patterns="*", follow=True)                      # same message for a plain (non-JavaScript) post
+        self.assertIn("Options rejected", res.get_data(as_text=True))
+
+    def test_options_are_ignored_for_plain_pak_uploads(self):
+        pak = make_pak_bytes([("maps/a.bsp", make_bsp()), ("src/a.qc", b"code")])
+        f = self.tmp / "m.pak"
+        f.write_bytes(pak)
+        data = self.new_addon_form("plainpak", exclude_presets=["authoring"], reencode_textures="1", generate_mapdb="1", keep_source="1")
+        data["package"] = (f.open("rb"), "m.pak")
+        st = self.status(self.job_id_from(self.post("/addons/new", data)))
+        self.assertEqual(st["state"], "done")
+        self.assertEqual(Path(self.row("plainpak")["package_path"]).read_bytes(), pak)           # stored unchanged, nothing applied
+        self.assertIsNone(self.row("plainpak")["source_path"])
+
+    def test_replacing_a_package_from_the_edit_form_uses_the_chosen_options(self):
+        self.upload("swap", make_pak_bytes([("maps/a.bsp", make_bsp())]))
+        row = self.row("swap")
+        z = self.zip_with_images()
+        data = {"title": "swap", "addon_id": "swap", "gamedir": "swap", "exclude_presets": ["authoring"], "reencode_textures": "1", "package": (z.open("rb"), "rel.zip")}
+        st = self.status(self.job_id_from(self.post(f"/addons/{row['id']}/edit", data)))
+        self.assertEqual(st["state"], "done", st["message"])
+        got = parse_pak(Path(self.row("swap")["package_path"]))
+        self.assertIn("gfx/t.png", got)
+        self.assertNotIn("maps/b.map", got)
+
+
 class HousekeepingTests(FlowBase):
     def test_xhr_errors_are_json(self):
         res = self.post("/addons/new", {"title": "", "addon_id": "", "gamedir": ""}, headers={"X-Requested-With": "XMLHttpRequest"})

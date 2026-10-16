@@ -1,0 +1,43 @@
+{% extends 'base.html' %}
+{% block head %}{% if active %}<noscript><meta http-equiv="refresh" content="5"></noscript>{% endif %}{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>Batch #{{ batch.id }}: {{ batch.label }}</h2>
+  <p class="small muted">{{ 'Remote links' if batch.source_type == 'url' else 'Server folder' }}. Jobs keep running if you close this page. Drafts are never published automatically.</p>
+  <p>
+    {% for state, label in labels.items() %}{% if counts.get(state) %}<span class="pill {{ state }}">{{ label }}: {{ counts[state] }}</span> {% endif %}{% endfor %}
+    <span class="small muted">{{ total }} item(s) in total</span>
+  </p>
+  <div class="inline">
+    <form method="post" action="{{ url_for('batch_retry_all', batch_id=batch.id) }}" data-confirm="Retry every failed, cancelled and interrupted item in this batch?">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">Retry all failed</button></form>
+    <form method="post" action="{{ url_for('batch_cancel_all', batch_id=batch.id) }}" data-confirm="Cancel every item in this batch that is still running or waiting? Drafts that already exist are kept.">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit" class="danger">Cancel all remaining</button></form>
+    <a href="{{ url_for('batch_home') }}">Back to batch import</a>
+  </div>
+</div>
+<div class="card" id="batch-container">{% include '_batch_items.html' %}</div>
+<script>
+(function () {
+  var box = document.getElementById('batch-container');
+  document.querySelectorAll('form[data-confirm]').forEach(function (f) {
+    f.addEventListener('submit', function (ev) { if (!window.confirm(f.getAttribute('data-confirm'))) ev.preventDefault(); });
+  });
+  var url = {{ url_for('batch_page', batch_id=batch.id, fragment=1)|tojson }};
+  var timer = null;
+  function refresh() {
+    fetch(url, { cache: 'no-store', credentials: 'same-origin' })
+      .then(function (r) { if (!r.ok) throw new Error(r.status); return r.text(); })
+      .then(function (html) {
+        // the fragment is server-rendered with escaped values; it replaces the table so progress and states update in place
+        var holder = document.createElement('div'); holder.innerHTML = html;
+        var fresh = holder.firstElementChild;
+        if (fresh && box.innerHTML.trim() !== fresh.outerHTML.trim()) box.innerHTML = fresh.outerHTML;
+        if (fresh && fresh.getAttribute('data-active') === '0') { clearInterval(timer); }
+      })
+      .catch(function () { /* transient; the next tick retries */ });
+  }
+  if (document.getElementById('batch-items').getAttribute('data-active') !== '0') timer = setInterval(refresh, 2000);
+})();
+</script>
+{% endblock %}

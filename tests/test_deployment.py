@@ -185,7 +185,7 @@ class DeploymentFileConsistencyTests(unittest.TestCase):
     def test_templates_compose_and_image_agree_on_container_paths(self):
         for path in ("unraid-template.xml", "unraid/templates/ironwail-addons.xml"):
             cfg = self.template(path)
-            self.assertEqual({t for t in cfg if t.startswith("/")}, {"/appdata", "/public", "/uploads"}, path)
+            self.assertEqual({t for t in cfg if t.startswith("/")}, {"/appdata", "/public", "/uploads", "/imports"}, path)
             self.assertEqual(cfg["PERSIST_ROOT"][1], "/appdata")
             self.assertEqual(cfg["DB_PATH"][1], "/appdata/addons.sqlite3")
             self.assertEqual(cfg["PUBLIC_ROOT"][1], "/public")
@@ -205,6 +205,44 @@ class DeploymentFileConsistencyTests(unittest.TestCase):
         for env in ("PERSIST_ROOT=/appdata", "DB_PATH=/appdata/addons.sqlite3", "PUBLIC_ROOT=/public", "UPLOAD_FOLDER=/uploads"):
             self.assertIn(env, dockerfile, "image must default to its own mount points, never /tmp")
         self.assertNotRegex(dockerfile + compose, r"chmod\s+-?R?\s*777")
+
+    def test_the_import_mount_is_optional_read_only_and_never_mandatory(self):
+        for path in ("unraid-template.xml", "unraid/templates/ironwail-addons.xml"):
+            root = ElementTree.parse(ROOT / path).getroot()
+            imports = [c for c in root.iter("Config") if c.get("Target") == "/imports"]
+            self.assertEqual(len(imports), 1, path)
+            c = imports[0]
+            self.assertEqual((c.get("Type"), c.get("Mode"), c.get("Required"), c.get("Default"), (c.text or "").strip()), ("Path", "ro", "false", "", ""), path)
+            self.assertEqual(root.findtext("Privileged"), "false")
+        compose = (ROOT / "docker-compose.portainer.yml").read_text()
+        active = [l for l in compose.splitlines() if not l.strip().startswith("#")]
+        self.assertFalse(any("/imports" in l for l in active), "the import mount must be opt-in (commented out) in the compose example")
+        self.assertIn(":/imports:ro", compose)
+        everything = compose + (ROOT / "Dockerfile").read_text() + (ROOT / "unraid-template.xml").read_text()
+        for forbidden in ("docker.sock", "privileged: true", "network_mode: host", "cap_add"):
+            self.assertNotIn(forbidden, everything)
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        self.assertNotIn("/imports", dockerfile)                                   # nothing mandatory: a remote-only deployment has no such folder
+        self.assertNotIn("IMPORT_ROOTS", dockerfile)
+
+    def test_every_variable_in_the_template_is_one_the_application_reads(self):
+        source = (ROOT / "app.py").read_text()
+        read = set(re.findall(r'(?:os\.environ\.get|_env_int|_env_float)\(\s*"([A-Z_]+)"', source))
+        read |= {"PERSIST_ROOT", "DB_PATH", "PUBLIC_ROOT", "UPLOAD_FOLDER", "PORT", "APP_SECRET_KEY", "PUBLIC_BASE_URL"}
+        read |= {"BATCH_DOWNLOAD_WORKERS", "BATCH_STAGING_LIMIT_GIB"}
+        for path in ("unraid-template.xml", "unraid/templates/ironwail-addons.xml"):
+            for c in ElementTree.parse(ROOT / path).getroot().iter("Config"):
+                if c.get("Type") == "Variable":
+                    self.assertIn(c.get("Target"), read, f"{path}: {c.get('Target')} is not read by the application")
+
+    def test_documented_batch_variables_exist_in_the_code(self):
+        source = (ROOT / "app.py").read_text()
+        readme = (ROOT / "README.md").read_text()
+        for name in ("IMPORT_ROOTS", "IMPORT_SCAN_MAX_DEPTH", "IMPORT_SCAN_MAX_ENTRIES", "IMPORT_SCAN_MAX_RESULTS", "IMPORT_PAGE_SIZE", "BATCH_MAX_ITEMS", "BATCH_MAX_PENDING",
+                     "BATCH_MAX_URL_LENGTH", "BATCH_MAX_DOWNLOAD_BYTES", "BATCH_STAGING_LIMIT_GIB", "BATCH_CONNECT_TIMEOUT", "BATCH_READ_TIMEOUT", "BATCH_MAX_DURATION",
+                     "BATCH_MAX_REDIRECTS", "BATCH_MAX_ATTEMPTS", "BATCH_RETRY_BASE", "BATCH_RETRY_AFTER_MAX", "BATCH_RETENTION_DAYS", "BATCH_DOWNLOAD_WORKERS"):
+            self.assertIn(f'"{name}"', source, name)
+            self.assertIn(name, readme, f"{name} is not documented")
 
 
 if __name__ == "__main__":

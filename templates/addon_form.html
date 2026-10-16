@@ -44,11 +44,12 @@
     </p>
     <p>
       <label><input type="checkbox" name="review" value="1" checked> Review the conversion before building (recommended for ZIP releases)</label>
-      <div class="small muted">Shows what the package will contain and offers optional clean-ups (leaving out sources, lossless image re-encoding, root selection). Ignored for plain PAK files.</div>
+      <div class="small muted">Shows what the package will contain, lets you pick the root folder and see exactly what each option below would change. Untick it to build straight away with the options chosen here.</div>
     </p>
-    <p>
-      <label><input type="checkbox" name="keep_source" value="1"> Keep the uploaded ZIP on the server (lets you rebuild with different options later)</label>
-    </p>
+    <div class="card" style="margin:12px 0">
+      <h3>Conversion options <span class="small muted">(optional, ZIP releases only; everything is off unless you tick it)</span></h3>
+      {% with plan=None, imp=None, options=default_options, form={'title': '', 'gamedir': ''} %}{% include "_convert_options.html" %}{% endwith %}
+    </div>
     <button type="submit" id="submit-btn">{% if mode == 'edit' %}Save{% else %}Upload{% endif %}</button>
     <div id="upload-box" hidden>
       <div class="progress"><div id="upload-bar"></div></div>

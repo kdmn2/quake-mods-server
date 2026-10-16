@@ -337,9 +337,13 @@ class _Resolved:
     blockers: list[str] = field(default_factory=list)
 
 
-def _block(res: _Resolved, strict: bool, message: str) -> None:
+class ReleaseNeedsReview(ValueError):
+    """The release cannot be built automatically but an administrator can fix it with the preview options (choose a root, leave files out)."""
+
+
+def _block(res: _Resolved, strict: bool, message: str, review: bool = False) -> None:
     if strict:
-        raise ValueError(message)
+        raise (ReleaseNeedsReview if review else ValueError)(message)
     if message not in res.blockers and len(res.blockers) < 20:
         res.blockers.append(message)
 
@@ -375,7 +379,7 @@ def _resolve_release(source: Path, zf: zipfile.ZipFile, tmpdir: Path, options: C
         res.layout = layout
         eff = list(members)
         if layout["root_mapping"] == "ambiguous":
-            _block(res, strict, "ZIP release has ambiguous root mapping; provide a single wrapper directory or already-rooted game content")
+            _block(res, strict, "ZIP release has ambiguous root mapping; provide a single wrapper directory or already-rooted game content", review=True)
         else:
             try:
                 eff = _strip_wrapper(layout, members)
@@ -386,7 +390,7 @@ def _resolve_release(source: Path, zf: zipfile.ZipFile, tmpdir: Path, options: C
                 inner_dirs = {n.split("/", 1)[0] for n in names if "/" in n}
                 if layout["has_wrapper"] and len(inner_dirs) == 1 and not any("/" not in n for n in names) \
                         and next(iter(inner_dirs)).lower() not in CONTENT_DIRS | AUX_DIRS:
-                    _block(res, strict, f"ZIP release has nested wrapper directories ({layout['wrapper_dirs'][0]}/{next(iter(inner_dirs))}/); ambiguous root mapping")
+                    _block(res, strict, f"ZIP release has nested wrapper directories ({layout['wrapper_dirs'][0]}/{next(iter(inner_dirs))}/); ambiguous root mapping", review=True)
     res.effective_count = len(eff)
     patterns = options.patterns()
 
@@ -466,7 +470,7 @@ def _check_winners(res: _Resolved, strict: bool) -> None:
             _block(res, strict, f"Paths differ only by letter case: {folded[name.lower()]!r} and {name!r}")
         folded[name.lower()] = name
     if len(res.winners) > MAX_PAK_ENTRIES:
-        _block(res, strict, f"Release resolves to {len(res.winners)} files; a single PAK may hold at most {MAX_PAK_ENTRIES} (Ironwail limit)")
+        _block(res, strict, f"Release resolves to {len(res.winners)} files; a single PAK may hold at most {MAX_PAK_ENTRIES} (Ironwail limit)", review=True)
 
 
 def _image_candidates(winners: dict[str, _Win], options: ConvertOptions | None = None) -> dict[str, list[str]]:

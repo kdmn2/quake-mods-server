@@ -18,10 +18,17 @@ services:
       UPLOAD_FOLDER: "/uploads"
       DB_PATH: "/appdata/addons.sqlite3"
       PORT: "5000"
+      # Optional batch-import limits (the values shown are the defaults):
+      # BATCH_MAX_ITEMS: "50"            # most links/files per batch
+      # BATCH_DOWNLOAD_WORKERS: "2"      # simultaneous downloads/copies (conversions always run one at a time)
+      # BATCH_STAGING_LIMIT_GIB: "20"    # cap on downloaded packages waiting in /uploads
     volumes:
       - /mnt/user/appdata/ironwail-addons/data:/appdata
       - /mnt/user/appdata/ironwail-addons/public:/public
       - /mnt/user/appdata/ironwail-addons/uploads:/uploads
+      # Optional: packages to offer under Batch import > Server folder. Read-only: the app never changes, moves or deletes them.
+      # Host folder on the left, always /imports inside the container. Leave this line out if you only import from URLs or the browser.
+      # - /mnt/user/mods-to-import:/imports:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health').read()"]
       interval: 20s

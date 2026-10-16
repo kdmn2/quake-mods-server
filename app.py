@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 import sqlite3
@@ -12,6 +13,8 @@ import time
 import uuid
 import sys
 from contextlib import contextmanager
+from dataclasses import dataclass
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, Dict, Iterator, Tuple
 
@@ -20,9 +23,11 @@ from werkzeug.exceptions import BadRequest, Forbidden, NotFound, RequestEntityTo
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
-from tools.catalog import (_compute_sha256 as _sha256_file, _validate_date, build_single_pak_from_zip, detect_package_format, plan_zip_release,
-                           validate_package, validate_pak_paths)
+from tools.catalog import (ReleaseNeedsReview, _compute_sha256 as _sha256_file, _validate_date, build_single_pak_from_zip, detect_package_format,
+                           plan_zip_release, validate_package, validate_pak_paths)
 from tools.convert_options import PRESETS, ConvertOptions, options_from_form
+from tools import batchstore
+from tools.batch_import import BatchService
 from tools.jobs import JobCancelled, JobFailed, JobManager, JobOutcome, Progress
 from tools.pak_report import analyze_pak, summarize_conversion
 
@@ -41,6 +46,44 @@ app.config.update(
     JOB_MODE=os.environ.get("JOB_MODE", ""),            # "thread" (default) runs conversions in the background; "inline" runs them inside the request
 )
 
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, default)))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+# Batch import (remote URLs / server folder). Every limit is bounded and overridable; see README "Batch import".
+app.config.update(
+    # absolute container paths, ':' separated. Unset: /imports is used automatically, but only if something is mounted there,
+    # so a remote-only deployment has no import folder and nothing to configure.
+    IMPORT_ROOTS=os.environ.get("IMPORT_ROOTS") or ("/imports" if os.path.isdir("/imports") else ""),
+    IMPORT_SCAN_MAX_DEPTH=_env_int("IMPORT_SCAN_MAX_DEPTH", 8, 0),
+    IMPORT_SCAN_MAX_ENTRIES=_env_int("IMPORT_SCAN_MAX_ENTRIES", 20000, 100),
+    IMPORT_SCAN_MAX_RESULTS=_env_int("IMPORT_SCAN_MAX_RESULTS", 2000, 10),
+    IMPORT_PAGE_SIZE=_env_int("IMPORT_PAGE_SIZE", 100, 10),
+    BATCH_MAX_ITEMS=_env_int("BATCH_MAX_ITEMS", 50, 1),
+    BATCH_MAX_PENDING=_env_int("BATCH_MAX_PENDING", 200, 1),
+    BATCH_MAX_URL_LENGTH=_env_int("BATCH_MAX_URL_LENGTH", 2048, 64),
+    BATCH_MAX_DOWNLOAD_BYTES=_env_int("BATCH_MAX_DOWNLOAD_BYTES", int(os.environ.get("MAX_CONTENT_LENGTH", 2 * 1024 ** 3)), 1024),
+    BATCH_STAGING_LIMIT_BYTES=_env_int("BATCH_STAGING_LIMIT_GIB", 20, 1) * 1024 ** 3,
+    BATCH_CONNECT_TIMEOUT=_env_float("BATCH_CONNECT_TIMEOUT", 10),
+    BATCH_READ_TIMEOUT=_env_float("BATCH_READ_TIMEOUT", 30),
+    BATCH_MAX_DURATION=_env_float("BATCH_MAX_DURATION", 3600),
+    BATCH_MAX_REDIRECTS=_env_int("BATCH_MAX_REDIRECTS", 5, 0),
+    BATCH_MAX_ATTEMPTS=_env_int("BATCH_MAX_ATTEMPTS", 3, 1),
+    BATCH_RETRY_BASE=_env_float("BATCH_RETRY_BASE", 2),
+    BATCH_RETRY_AFTER_MAX=_env_float("BATCH_RETRY_AFTER_MAX", 120),
+    BATCH_RETENTION_DAYS=_env_int("BATCH_RETENTION_DAYS", 14, 1),
+)
 
 LOCK = threading.RLock()
 APP_VERSION = os.environ.get("APP_VERSION", "dev")
@@ -123,14 +166,14 @@ def _delete_import(token: str) -> None:
 
 
 def _save_import(token: str, kind: str, addon_pk: int | None, form: dict[str, str], source: Path, name: str, fmt: str,
-                 owns_source: bool, keep_source: bool, review: bool) -> None:
+                 owns_source: bool, keep_source: bool, review: bool, options: ConvertOptions | None = None, batch_item_id: int | None = None) -> None:
     conn = get_db()
     try:
         conn.execute(
-            "INSERT INTO imports (token, kind, addon_pk, form_json, source_path, source_name, source_format, owns_source, keep_source, review, options_json, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO imports (token, kind, addon_pk, form_json, source_path, source_name, source_format, owns_source, keep_source, review, options_json, created_at, batch_item_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (token, kind, addon_pk, json.dumps(form), str(source), name, fmt, int(owns_source), int(keep_source), int(review),
-             json.dumps(ConvertOptions().to_dict()), time.time()),
+             json.dumps((options or ConvertOptions()).to_dict()), time.time(), batch_item_id),
         )
     finally:
         conn.close()
@@ -154,6 +197,7 @@ def startup_cleanup() -> None:
     if interrupted:
         print(f"[startup] marked {interrupted} interrupted job(s) as failed", flush=True)
     shutil.rmtree(Path(app.config["UPLOAD_FOLDER"]) / ".work", ignore_errors=True)
+    batch_service.recover()          # in-flight batch items become "interrupted" (retry is explicit); old scans/batches are expired
     # A direct (no-preview) import exists only to be built at once; if the process died, nothing can resume it, so its staged
     # upload is discarded. Previewed imports stay available from the dashboard.
     conn = get_db()
@@ -163,6 +207,15 @@ def startup_cleanup() -> None:
         conn.close()
     for token in orphans:
         _delete_import(token)
+    batch_service.reconcile()
+    conn = get_db()
+    try:
+        referenced = {r["token"] for r in conn.execute("SELECT token FROM imports").fetchall()}
+    finally:
+        conn.close()
+    for child in Path(app.config["UPLOAD_FOLDER"]).glob("*"):         # staging directories nothing refers to (a download/copy died half-way)
+        if child.is_dir() and re.fullmatch(r"[0-9a-f]{32}", child.name) and child.name not in referenced:
+            shutil.rmtree(child, ignore_errors=True)
     for folder, pattern in ((_packages_dir(), ".staging-*.pak"), (_public_addons_dir(), ".publish-*.tmp"), (_public_addons_dir(), "*.pak.tmp")):
         for leftover in folder.glob(pattern):
             leftover.unlink(missing_ok=True)
@@ -196,10 +249,38 @@ def _build_stages(fmt: str, options: ConvertOptions, keep_source: bool) -> list[
     return stages + [("Installing", 2)]
 
 
-def _run_build(token: str, progress: Progress) -> JobOutcome:
+class ImportConflict(JobFailed):
+    """The add-on ID or install directory is already taken (a person has to decide: new ID, replace, or skip)."""
+
+
+class ReviewRequired(JobFailed):
+    """The package cannot be built as it is, but the preview options (root folder, leaving files out) could fix it."""
+
+
+@dataclass
+class BuildResult:
+    text: str
+    level: str
+    addon_pk: int | None = None
+    warning_count: int = 0
+    replaced: bool = False
+    published: bool = False
+    skipped: str | None = None            # set when nothing was installed because identical content already exists
+    skipped_addon_pk: int | None = None
+
+
+def _build_import(token: str, progress: Progress, policy: dict[str, Any] | None = None) -> BuildResult:
+    """Convert/validate a staged import and install it as a draft (or replace an add-on's package). The only conversion path:
+    browser uploads, local imports and batch items all end up here.
+
+    policy (all optional): skip_identical_output - install nothing if another add-on already has exactly this converted package;
+    keep_on_review - keep the staged import (instead of deleting it) when the release needs a decision or a preview;
+    provenance - a dict recorded in the conversion record (source type, host, file name, import time)."""
+    policy = policy or {}
     imp = _load_import(token)
     if imp is None:
         raise JobFailed("This import was cancelled or has expired. Start again from the add-on form.", "add_addon")
+    batch_item_id = imp["batch_item_id"]
     form = json.loads(imp["form_json"])
     replace = imp["kind"] == "replace"
     fmt = imp["source_format"]
@@ -231,14 +312,27 @@ def _run_build(token: str, progress: Progress) -> JobOutcome:
             )
             package = validate_package(staged, sha256=info["sha256"])
             record = summarize_conversion(info, imp["source_name"], source_sha)
+            source_digest = source_sha
             message = "Uploaded ZIP release was inspected and packaged from its embedded PAK."
         else:
             sha, _ = _copy_hashing(source, staged, progress, "Copying package")
             package = validate_package(staged, sha256=sha)
             record = {"report_version": 1, "kind": "pak-upload", "source_name": imp["source_name"],
                       "output_sha256": package["sha256"], "output_size": package["size"]}
+            source_digest = package["sha256"]
             message = "Uploaded PAK was stored unchanged."
+        if policy.get("provenance"):
+            record["provenance"] = policy["provenance"]
         print(f"[import] validated package for {form['addon_id']}: size={package['size']} sha256={package['sha256']}", flush=True)
+        if policy.get("skip_identical_output"):
+            conn = get_db()
+            try:
+                twin = conn.execute("SELECT id, addon_id FROM addons WHERE package_sha256 = ? AND id != ? LIMIT 1", (package["sha256"], imp["addon_pk"] or -1)).fetchone()
+            finally:
+                conn.close()
+            if twin:
+                _delete_import(token)
+                return BuildResult(f"Skipped: the converted package is identical to add-on '{twin['addon_id']}'.", "info", skipped="identical-output", skipped_addon_pk=twin["id"])
         warning_count = _inspection_warnings(staged, form["gamedir"])
 
         source_path = source_name = None
@@ -265,9 +359,9 @@ def _run_build(token: str, progress: Progress) -> JobOutcome:
                 conn.execute(
                     "UPDATE addons SET title=?, addon_id=?, gamedir=?, author=?, date=?, description=?, package_size=?, package_sha256=?, "
                     "package_mtime=?, conversion_report=?, source_path=COALESCE(?, source_path), source_name=COALESCE(?, source_name), "
-                    "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    "source_sha256=?, batch_item_id=COALESCE(?, batch_item_id), updated_at=CURRENT_TIMESTAMP WHERE id=?",
                     (form["title"], form["addon_id"], form["gamedir"], form["author"], form["date"], form["description"], package["size"],
-                     package["sha256"], int(staged.stat().st_mtime), json.dumps(record, sort_keys=True), source_path, source_name, addon["id"]),
+                     package["sha256"], int(staged.stat().st_mtime), json.dumps(record, sort_keys=True), source_path, source_name, source_digest, batch_item_id, addon["id"]),
                 )
                 addon_pk, published = addon["id"], bool(addon["published"])
             else:
@@ -281,11 +375,11 @@ def _run_build(token: str, progress: Progress) -> JobOutcome:
                     INSERT INTO addons (
                         addon_id, title, gamedir, author, date, description,
                         package_name, package_path, package_size, package_sha256, package_mtime,
-                        published, draft, manifest_path, conversion_report, source_path, source_name
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, NULL, ?, ?, ?)
+                        published, draft, manifest_path, conversion_report, source_path, source_name, source_sha256, batch_item_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, NULL, ?, ?, ?, ?, ?)
                     """,
                     (form["addon_id"], form["title"], form["gamedir"], form["author"], form["date"], form["description"], target.name, str(target),
-                     package["size"], package["sha256"], int(staged.stat().st_mtime), json.dumps(record, sort_keys=True), source_path, source_name),
+                     package["size"], package["sha256"], int(staged.stat().st_mtime), json.dumps(record, sort_keys=True), source_path, source_name, source_digest, batch_item_id),
                 )
                 addon_pk, published = cur.lastrowid, False
             os.replace(staged, target)                       # last step: only after every database statement succeeded
@@ -304,8 +398,21 @@ def _run_build(token: str, progress: Progress) -> JobOutcome:
     except (sqlite3.IntegrityError, OSError, ValueError) as exc:
         if installed_target is not None and not replace:
             installed_target.unlink(missing_ok=True)
-        if not keep_import_on_failure:
+        conflict = isinstance(exc, sqlite3.IntegrityError) and "duplicate" in str(exc)
+        needs_review = isinstance(exc, ReleaseNeedsReview)
+        keep = keep_import_on_failure or (bool(policy.get("keep_on_review")) and (conflict or needs_review))
+        if not keep:
             _delete_import(token)
+        elif not keep_import_on_failure:
+            conn = get_db()
+            try:
+                conn.execute("UPDATE imports SET review = 1 WHERE token = ?", (token,))     # survives a restart and stays on the dashboard
+            finally:
+                conn.close()
+        if policy.get("keep_on_review") and conflict:
+            raise ImportConflict(f"Package rejected: {exc}", *retry) from exc
+        if policy.get("keep_on_review") and needs_review:
+            raise ReviewRequired(f"Package rejected: {exc}", "import_plan", {"token": token}) from exc
         raise JobFailed(f"Package rejected: {exc}", *retry) from exc
     finally:
         staged.unlink(missing_ok=True)
@@ -318,7 +425,12 @@ def _run_build(token: str, progress: Progress) -> JobOutcome:
         text = f"{message} Add-on updated.{note}{tail}"
     else:
         text = f"{message} Add-on saved as a draft.{note} Review and publish when ready."
-    return JobOutcome(text, "warning" if warning_count else "success", "addon_detail", {"addon_id": addon_pk})
+    return BuildResult(text, "warning" if warning_count else "success", addon_pk, warning_count, replace, published)
+
+
+def _run_build(token: str, progress: Progress) -> JobOutcome:
+    result = _build_import(token, progress)
+    return JobOutcome(result.text, result.level, "addon_detail", {"addon_id": result.addon_pk})
 
 
 def _run_plan(token: str, progress: Progress) -> JobOutcome:
@@ -448,7 +560,8 @@ def _job_mode_inline() -> bool:
     return mode == "inline"
 
 
-jobs = JobManager(lambda: get_db(), _job_mode_inline, log=lambda m: print(m, flush=True))
+jobs = JobManager(lambda: get_db(), _job_mode_inline, log=lambda m: print(m, flush=True),
+                  lanes={"work": 1, "net": _env_int("BATCH_DOWNLOAD_WORKERS", 2, 1)})     # fixed-size pools shared by every import source
 
 
 def init_db() -> None:
@@ -513,10 +626,20 @@ def init_db() -> None:
             review INTEGER NOT NULL DEFAULT 0,
             options_json TEXT,
             plan_json TEXT,
-            created_at REAL NOT NULL
+            created_at REAL NOT NULL,
+            batch_item_id INTEGER
         )
         """
     )
+    if "batch_item_id" not in {row[1] for row in conn.execute("PRAGMA table_info(imports)").fetchall()}:
+        conn.execute("ALTER TABLE imports ADD COLUMN batch_item_id INTEGER")
+    if "source_sha256" not in {row[1] for row in conn.execute("PRAGMA table_info(addons)").fetchall()}:
+        conn.execute("ALTER TABLE addons ADD COLUMN source_sha256 TEXT")
+    if "batch_item_id" not in {row[1] for row in conn.execute("PRAGMA table_info(addons)").fetchall()}:
+        conn.execute("ALTER TABLE addons ADD COLUMN batch_item_id INTEGER")
+    # one draft per batch item, enforced by the database, so a retry or a crash cannot create a second one
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_addons_batch_item ON addons(batch_item_id) WHERE batch_item_id IS NOT NULL")
+    batchstore.init_schema(conn)
     jobs.init_schema(conn)
     conn.commit()
     conn.close()
@@ -728,10 +851,11 @@ def check_csrf() -> None:
 
 @app.before_request
 def ensure_csrf() -> None:
-    if request.path.startswith("/admin") or request.path.startswith("/dashboard") or request.path.startswith("/addons/"):
-        if request.method == "POST" and request.path != "/content.json":
-            check_csrf()
-        make_csrf_token()
+    """Every state-changing request needs the session's CSRF token. (This used to cover only /admin, /dashboard and /addons/, which left
+    /imports, /jobs and any later route open to cross-site POSTs from a logged-in administrator.)"""
+    if request.method == "POST":
+        check_csrf()
+    make_csrf_token()
 
 
 @app.context_processor
@@ -740,7 +864,16 @@ def inject_globals() -> Dict[str, Any]:
         "public_base_url": app.config["BASE_URL"],
         "current_user": session.get("username"),
         "csrf_token": make_csrf_token(),
+        "presets": PRESETS,
+        "default_options": ConvertOptions(),
     }
+
+
+@app.after_request
+def security_headers(response):
+    response.headers.setdefault("Referrer-Policy", "no-referrer")          # a pasted link or a file name must never leak through a Referer header
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    return response
 
 
 @app.errorhandler(RequestEntityTooLarge)
@@ -875,6 +1008,10 @@ def _start_import(kind: str, addon_pk: int | None, form: dict[str, str], ctx: di
     template = "addon_form.html"
     owned = False
     try:
+        options = options_from_form(request.form, defaults=form)          # validate before anything is staged
+    except ValueError as exc:
+        return _form_failure(f"Options rejected: {exc}", template, **ctx)
+    try:
         try:
             source, name, owned = _stage_source(token)
         except OSError as exc:
@@ -900,7 +1037,8 @@ def _start_import(kind: str, addon_pk: int | None, form: dict[str, str], ctx: di
         return _form_failure(message, template, **ctx)
     expire_stale_imports()
     review = bool(request.form.get("review")) and fmt == "zip"
-    _save_import(token, kind, addon_pk, form, source, name, fmt, owned, bool(request.form.get("keep_source")) and fmt == "zip", review)
+    _save_import(token, kind, addon_pk, form, source, name, fmt, owned, bool(request.form.get("keep_source")) and fmt == "zip", review,
+                 options if fmt == "zip" else ConvertOptions())
     if review:
         job_id = jobs.submit("plan", f"Preview of {name}", lambda progress: _run_plan(token, progress))
     else:
@@ -1084,7 +1222,7 @@ def _import_or_404(token: str) -> sqlite3.Row:
 
 def _store_options(token: str, imp: sqlite3.Row) -> ConvertOptions | None:
     try:
-        options = options_from_form(request.form)
+        options = options_from_form(request.form, defaults=json.loads(imp["form_json"]))
     except ValueError as exc:
         flash(f"Options rejected: {exc}", "error")
         return None
@@ -1299,6 +1437,40 @@ def main() -> int:
     generate_catalog()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), threaded=True)
     return 0
+
+
+def _update_import(token: str, **fields: Any) -> None:
+    allowed = {"kind", "addon_pk", "form_json", "review", "options_json"}
+    fields = {k: v for k, v in fields.items() if k in allowed}
+    if not fields:
+        return
+    conn = get_db()
+    try:
+        conn.execute(f"UPDATE imports SET {', '.join(k + ' = ?' for k in fields)} WHERE token = ?", (*fields.values(), token))
+    finally:
+        conn.close()
+
+
+def _plan_import(token: str) -> None:
+    """Compute and store the conversion preview for a staged import (used when a batch item needs a person to look at it)."""
+    imp = _load_import(token)
+    if imp is None or imp["source_format"] != "zip":
+        return
+    options = ConvertOptions.from_dict(json.loads(imp["options_json"] or "{}"))
+    plan = plan_zip_release(Path(imp["source_path"]), options, workdir=_workdir())
+    conn = get_db()
+    try:
+        conn.execute("UPDATE imports SET plan_json = ? WHERE token = ?", (json.dumps(plan), token))
+    finally:
+        conn.close()
+
+
+batch_service = BatchService(app, SimpleNamespace(
+    get_db=get_db, jobs=jobs, require_auth=require_auth, detect_package_format=detect_package_format,
+    save_import=_save_import, load_import=_load_import, delete_import=_delete_import, update_import=_update_import,
+    build_import=_build_import, plan_import=_plan_import, ReviewRequired=ReviewRequired, ImportConflict=ImportConflict,
+))
+batch_service.register_routes()
 
 
 def create_app() -> Flask:

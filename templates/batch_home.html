@@ -1,0 +1,66 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="card">
+  <h2>Batch import</h2>
+  <p class="muted">Import several packages at once. Each one goes through the same inspection, conversion and validation as a single upload and becomes a
+    <strong>draft</strong>; nothing is published automatically. Jobs continue on the server if you close the page.</p>
+  {% if error %}<div class="flash error">{{ error }}</div>{% endif %}
+
+  <div class="source-box">
+    <h3>1. Remote URLs</h3>
+    <p class="small muted">One direct download link per line (<span class="mono">http://</span> or <span class="mono">https://</span>, HTTPS preferred), up to {{ max_items }} per batch.
+      The link must lead straight to a ZIP or Quake PAK file; it need not end in <span class="mono">.zip</span>. Web pages, logins and links to private or internal addresses are refused.
+      Signed links are fine; only the host and file name are ever shown or logged.</p>
+    <form method="post" action="{{ url_for('batch_submit_urls') }}" data-once>
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="submit_key" value="{{ submit_key }}">
+      <textarea name="urls" class="mono" rows="7" placeholder="https://example.org/files/mod-one.zip&#10;https://example.org/download?id=1234" maxlength="400000">{{ urls or '' }}</textarea>
+      {% if problems %}
+      <div class="sev warning"><strong>Fix these lines and submit again; nothing was queued.</strong>
+        <ul>{% for p in problems %}<li>{% if p.line %}Line {{ p.line }}: <span class="mono">{{ p.text }}</span> — {% endif %}{{ p.message }}</li>{% endfor %}</ul></div>
+      {% endif %}
+      {% if duplicates %}<div class="sev info">{% for d in duplicates %}Line {{ d.line }}: {{ d.message }}.<br>{% endfor %}</div>{% endif %}
+      <p><button type="submit">Queue downloads</button></p>
+    </form>
+  </div>
+
+  <div class="source-box">
+    <h3>2. Import from server folder</h3>
+    <p class="small muted">This lists packages in a folder on the <strong>server / container</strong>, not on your own computer. Folders must be configured by the administrator
+      (<span class="mono">IMPORT_ROOTS</span>, normally a read-only mount at <span class="mono">/imports</span>). Files are only read, never changed, moved or deleted.
+      Scanning only lists files; nothing is imported until you select files and confirm.</p>
+    {% if not roots %}
+      <div class="sev info">No import folder is configured. To use this, mount a host folder read-only into the container at <span class="mono">/imports</span>
+        (see the README, “Batch import”) and set <span class="mono">IMPORT_ROOTS=/imports</span>.</div>
+    {% else %}
+    <form method="post" action="{{ url_for('batch_scan') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <p><label>Folder<br><select name="root">
+        {% for r in roots %}<option value="{{ r.index }}" {% if r.problem %}disabled{% endif %}>{{ r.label }} ({{ r.path }}){% if r.problem %} — unavailable{% endif %}</option>{% endfor %}
+      </select></label></p>
+      {% for r in roots if r.problem %}<div class="sev warning">{{ r.label }}: {{ r.problem }}</div>{% endfor %}
+      <p><label>Subfolder (optional)<br><input name="subpath" placeholder="e.g. new-releases/2026"></label></p>
+      <p><label><input type="checkbox" name="recursive" value="1"> Include subfolders</label>
+         <label style="margin-left:16px"><input type="checkbox" name="include_pak" value="1"> Also list <span class="mono">.pak</span> files</label></p>
+      <button type="submit">Scan folder</button>
+    </form>
+    {% endif %}
+  </div>
+</div>
+
+{% if recent %}
+<div class="card">
+  <h3>Recent batches</h3>
+  <table class="table-sm">
+    {% for b in recent %}
+    <tr><td><a href="{{ url_for('batch_page', batch_id=b.id) }}">#{{ b.id }} · {{ b.label }}</a></td>
+      <td>{% for state, label in labels.items() %}{% if b.counts.get(state) %}<span class="pill {{ state }}">{{ label }}: {{ b.counts[state] }}</span> {% endif %}{% endfor %}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+<script>
+document.querySelectorAll('form[data-once]').forEach(function (f) {
+  f.addEventListener('submit', function () { f.querySelectorAll('button[type=submit]').forEach(function (b) { b.disabled = true; }); });
+});
+</script>
+{% endblock %}

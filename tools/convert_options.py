@@ -135,11 +135,13 @@ def first_match(patterns: Iterable[tuple[str, str]], path: str) -> tuple[str, st
     return None
 
 
-def options_from_form(form: Any) -> ConvertOptions:
-    """Build options from a Flask form (multi-valued checkboxes + textarea)."""
+def options_from_form(form: Any, defaults: dict[str, str] | None = None) -> ConvertOptions:
+    """Build options from a Flask form (multi-valued checkboxes + textarea).
+    `defaults` (the add-on's title and gamedir) fill in a blank mapdb episode name/directory."""
+    defaults = defaults or {}
     mapdb = None
     if form.get("generate_mapdb"):
-        mapdb = [form.get("mapdb_name", ""), form.get("mapdb_dir", "")]
+        mapdb = [form.get("mapdb_name", "").strip() or defaults.get("title", ""), form.get("mapdb_dir", "").strip() or defaults.get("gamedir", "")]
     return ConvertOptions.from_dict({
         "exclude_presets": form.getlist("exclude_presets"),
         "exclude_patterns": form.get("exclude_patterns", ""),
