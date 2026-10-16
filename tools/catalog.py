@@ -188,11 +188,26 @@ def inspect_zip_release(source: Path) -> dict[str, Any]:
             norm = _normalize_zip_member_path(info.filename)
             top_levels.add(norm.split("/", 1)[0])
             if info.filename.lower().endswith(".pak"):
-                embedded.append({"path": norm, "size": info.file_size, "sha256": hashlib.sha256(zf.read(info)).hexdigest()})
+                try:
+                    payload = zf.read(info)
+                except NotImplementedError:
+                    payload = None
+                if payload is None:
+                    break
+                embedded.append({"path": norm, "size": info.file_size, "sha256": hashlib.sha256(payload).hexdigest()})
             else:
-                loose.append({"path": norm, "size": info.file_size, "sha256": hashlib.sha256(zf.read(info)).hexdigest()})
+                try:
+                    payload = zf.read(info)
+                except NotImplementedError:
+                    payload = None
+                if payload is None:
+                    break
+                loose.append({"path": norm, "size": info.file_size, "sha256": hashlib.sha256(payload).hexdigest()})
                 if "/" not in norm:
                     result["root_level_files"].append(norm)
+        if len(embedded) + len(loose) != len(infos):
+            # Fall back to the system unzip path for unsupported compression methods.
+            return _inspect_zip_release_via_unzip(source)
         content_dirs = {"maps", "progs", "sound", "music", "gfx"}
         non_content = sorted([p for p in top_levels if p not in content_dirs and not any(x["path"] == p or x["path"].startswith(p + "/") for x in embedded)])
         content_only = all((x["path"].split("/", 1)[0] in content_dirs) or x["path"].lower().endswith(".pak") or "/" not in x["path"] for x in loose)
@@ -208,6 +223,35 @@ def inspect_zip_release(source: Path) -> dict[str, Any]:
         result["wrapper_dirs"] = non_content if result["root_mapping"] == "wrapper" else []
         result["has_wrapper"] = result["root_mapping"] == "wrapper"
     return result
+
+
+def _inspect_zip_release_via_unzip(source: Path) -> dict[str, Any]:
+    import tempfile
+    result: dict[str, Any] = {"embedded_paks": [], "loose": [], "wrapper_dirs": [], "has_wrapper": False, "root_mapping": "unknown", "root_level_files": []}
+    with tempfile.TemporaryDirectory(prefix="quake-zip-inspect-", dir=str(source.parent)) as tmpdir:
+        proc = subprocess.run(["unzip", "-qq", "-o", str(source), "-d", tmpdir], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if proc.returncode != 0:
+            raise ValueError(f"unzip failed for {source.name!r}: {proc.stderr.strip() or proc.stdout.strip() or 'unknown error'}")
+        root = Path(tmpdir)
+        infos = [p for p in sorted(root.rglob("*")) if p.is_file()]
+        top_levels = set()
+        embedded = []
+        loose = []
+        for path in infos:
+            rel = path.relative_to(root).as_posix()
+            _validate_zip_member_name(rel)
+            top_levels.add(rel.split("/", 1)[0])
+            data = path.read_bytes()
+            if rel.lower().endswith(".pak"):
+                embedded.append({"path": rel, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+            else:
+                loose.append({"path": rel, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+                if "/" not in rel:
+                    result["root_level_files"].append(rel)
+        result["embedded_paks"] = embedded
+        result["loose"] = loose
+        result["root_mapping"] = "rooted" if not any(p not in {"maps", "progs", "sound", "music", "gfx"} for p in top_levels) else "ambiguous"
+        return result
 
 
 def build_single_pak_from_zip(source: Path, target: Path, max_files: int = 5000, max_uncompressed_size: int = 2 * 1024 * 1024 * 1024) -> dict[str, Any]:

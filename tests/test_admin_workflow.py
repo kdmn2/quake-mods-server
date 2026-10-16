@@ -541,6 +541,36 @@ class AdminWorkflowTests(unittest.TestCase):
         )
         self.assertIn(b"packaged from", res.data)
 
+    def test_unsupported_zip_compression_uses_unzip_fallback(self):
+        self._login()
+        old_limit = app.config["MAX_CONTENT_LENGTH"]
+        app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024
+        self.addCleanup(lambda: app.config.__setitem__("MAX_CONTENT_LENGTH", old_limit))
+        zip_path = self.tmp / "deflate.zip"
+        import zipfile
+        embedded = self.tmp / "embedded.pak"
+        self._make_pak(embedded, ["maps/a.bsp"])
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.write(embedded, "pak0.pak")
+            zf.writestr("maps/b.bsp", b"B" * 32)
+        res = self.app.post(
+            "/addons/new",
+            data={
+                "title": "Deflate",
+                "addon_id": "deflate",
+                "gamedir": "deflate",
+                "author": "Tester",
+                "date": "2026/10/15",
+                "description": "Deflated zip",
+                "package": (zip_path.open("rb"), "deflate.zip"),
+                "csrf_token": self._csrf(),
+            },
+            content_type="multipart/form-data",
+            follow_redirects=True,
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertIn(b"packaged from", res.data)
+
     def test_failed_replacement_preserves_published_package(self):
         self._login()
         pkg = self.tmp / "good.pak"
