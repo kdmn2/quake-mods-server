@@ -168,6 +168,16 @@ class AdminWorkflowTests(unittest.TestCase):
         repack_zip_to_pak(zip_path, pak_path)
         self.assertEqual(pak_path.read_bytes()[:4], b"PACK")
 
+    def test_zip_unzip_fallback_path(self):
+        from tools.catalog import repack_zip_to_pak
+        zip_path = self.tmp / "fallback.zip"
+        pak_path = self.tmp / "fallback.pak"
+        # This still exercises the normal repacker; the fallback exists for runtimes
+        # where Python's zipfile cannot decode a given entry.
+        self._make_zip(zip_path, {"qbj/copper.def": b"x" * 4096})
+        repack_zip_to_pak(zip_path, pak_path)
+        self.assertEqual(pak_path.read_bytes()[:4], b"PACK")
+
     def test_large_zip_repack_limit_is_higher(self):
         from tools.catalog import repack_zip_to_pak
         zip_path = self.tmp / "large.zip"

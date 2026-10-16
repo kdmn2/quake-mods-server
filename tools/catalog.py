@@ -7,6 +7,8 @@ import os
 import re
 import struct
 import zipfile
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
@@ -144,6 +146,23 @@ def _validate_zip_member_name(name: str) -> str:
     return name
 
 
+def _read_zip_entries_with_unzip(source: Path) -> list[tuple[str, bytes]]:
+    entries: list[tuple[str, bytes]] = []
+    with tempfile.TemporaryDirectory(prefix="quake-zip-", dir=str(source.parent)) as tmpdir:
+        cmd = ["unzip", "-qq", "-o", str(source), "-d", tmpdir]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if proc.returncode != 0:
+            raise ValueError(f"unzip failed for {source.name!r}: {proc.stderr.strip() or proc.stdout.strip() or 'unknown error'}")
+        root = Path(tmpdir)
+        for path in sorted(root.rglob("*")):
+            if path.is_dir():
+                continue
+            rel = path.relative_to(root).as_posix()
+            _validate_zip_member_name(rel)
+            entries.append((rel, path.read_bytes()))
+    return entries
+
+
 def repack_zip_to_pak(source: Path, target: Path, max_files: int = 5000, max_uncompressed_size: int = 2 * 1024 * 1024 * 1024) -> Dict[str, Any]:
     source = Path(source)
     target = Path(target)
@@ -152,6 +171,7 @@ def repack_zip_to_pak(source: Path, target: Path, max_files: int = 5000, max_unc
 
     entries: list[tuple[str, bytes]] = []
     total_uncompressed = 0
+    python_zip_failed = False
     with zipfile.ZipFile(source, "r") as zf:
         infos = [info for info in zf.infolist() if not info.is_dir()]
         if not infos:
@@ -166,13 +186,18 @@ def repack_zip_to_pak(source: Path, target: Path, max_files: int = 5000, max_unc
                 with zf.open(info, "r") as fh:
                     data = fh.read()
             except NotImplementedError as exc:
-                raise ValueError(f"Unsupported ZIP compression method for {info.filename!r}: {exc}") from exc
+                python_zip_failed = True
+                break
             except RuntimeError as exc:
                 raise ValueError(f"Unable to read ZIP entry {info.filename!r}: {exc}") from exc
             total_uncompressed += len(data)
             if total_uncompressed > max_uncompressed_size:
                 raise ValueError(f"ZIP uncompressed data exceeds limit ({total_uncompressed} > {max_uncompressed_size})")
             entries.append((name, data))
+
+    if python_zip_failed:
+        entries = _read_zip_entries_with_unzip(source)
+        return repack_zip_to_pak_from_entries(source, target, entries, max_files, max_uncompressed_size)
 
     dir_offset = 12
     file_blobs = bytearray()
@@ -189,6 +214,33 @@ def repack_zip_to_pak(source: Path, target: Path, max_files: int = 5000, max_unc
     header = b"PACK" + struct.pack("<II", dir_offset + len(file_blobs), len(dir_records))
     atomic_write(target, header + file_blobs + dir_records)
     return {"entries": len(entries), "size": target.stat().st_size, "sha256": _compute_sha256(target)}
+
+
+def repack_zip_to_pak_from_entries(source: Path, target: Path, entries: list[tuple[str, bytes]], max_files: int, max_uncompressed_size: int) -> Dict[str, Any]:
+    if len(entries) > max_files:
+        raise ValueError(f"ZIP has too many files ({len(entries)} > {max_files})")
+    total_uncompressed = 0
+    cleaned: list[tuple[str, bytes]] = []
+    for name, data in entries:
+        name = _validate_zip_member_name(name)
+        total_uncompressed += len(data)
+        if total_uncompressed > max_uncompressed_size:
+            raise ValueError(f"ZIP uncompressed data exceeds limit ({total_uncompressed} > {max_uncompressed_size})")
+        cleaned.append((name, data))
+    dir_offset = 12
+    file_blobs = bytearray()
+    dir_records = bytearray()
+    for name, data in cleaned:
+        file_offset = dir_offset + len(file_blobs)
+        file_blobs.extend(data)
+        name_bytes = name.encode("utf-8")
+        if len(name_bytes) > 56:
+            raise ValueError(f"Entry name too long for PAK: {name!r}")
+        dir_records.extend(name_bytes.ljust(56, b"\0"))
+        dir_records.extend(struct.pack("<II", file_offset, len(data)))
+    header = b"PACK" + struct.pack("<II", dir_offset + len(file_blobs), len(dir_records))
+    atomic_write(target, header + file_blobs + dir_records)
+    return {"entries": len(cleaned), "size": target.stat().st_size, "sha256": _compute_sha256(target)}
 
 
 def validate_package(path: Path) -> Dict[str, Any]:
