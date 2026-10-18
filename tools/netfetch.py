@@ -573,6 +573,178 @@ def _fetch_once(url: str, dest: Path, limits: FetchLimits, progress, resolver: R
             conn.close()
 
 
+@dataclass
+class MemoryResult:
+    body: bytes
+    content_type: str
+    url: str                      # final URL after redirects
+    attempts: int
+    redirects: int
+
+
+def _fetch_memory_once(url: str, limits: FetchLimits, accepted_types: tuple[str, ...], max_bytes: int, progress,
+                       resolver: Resolver, connector: Connector, ssl_context: ssl.SSLContext | None, clock) -> MemoryResult:
+    """One GET into memory with the same destination, redirect and transport checks as _fetch_once, but no package sniffing:
+    the response must match `accepted_types` (empty tuple accepts anything but HTML) and fit `max_bytes` after decoding."""
+    started = clock()
+    current = parse_url(url, limits.max_url_length)
+    seen = {current.url}
+    redirects = 0
+    while True:
+        addrs = resolver(current.host, current.port, limits.connect_timeout)
+        if not addrs:
+            raise FetchError("dns", "The host name has no addresses", retryable=False)
+        if not all(is_public_ip(a) for a in addrs):
+            raise FetchError("unsafe-destination", "The host name points to a private or internal address; only public internet destinations are allowed")
+        if current.scheme == "https":
+            conn: http.client.HTTPConnection = _PinnedHTTPS(current.host, current.port, addrs=addrs, connector=connector, connect_timeout=limits.connect_timeout,
+                                                            read_timeout=limits.read_timeout, context=ssl_context or ssl.create_default_context())
+        else:
+            conn = _PinnedHTTP(current.host, current.port, addrs=addrs, connector=connector, connect_timeout=limits.connect_timeout, read_timeout=limits.read_timeout)
+        try:
+            try:
+                conn.request("GET", current.target, headers={"User-Agent": USER_AGENT, "Accept": "*/*", "Accept-Encoding": "identity", "Connection": "close"})
+                resp = conn.getresponse()
+            except ssl.SSLCertVerificationError:
+                raise FetchError("tls", "The server's TLS certificate could not be verified (untrusted, expired or for another host name)") from None
+            except ssl.SSLError as exc:
+                raise FetchError("tls", f"TLS error: {exc.__class__.__name__}") from None
+            except socket.timeout:
+                raise FetchError("timeout", "The server did not respond in time", retryable=True) from None
+            except (ConnectionError, http.client.HTTPException, OSError) as exc:
+                if isinstance(exc, FetchError):
+                    raise
+                raise FetchError("connection", "The connection failed or was interrupted", retryable=True) from None
+
+            status = resp.status
+            if status in _REDIRECTS:
+                location = resp.getheader("Location")
+                resp.read(0)
+                if not location:
+                    raise FetchError("redirect", f"The server redirected (HTTP {status}) without saying where to")
+                redirects += 1
+                if redirects > limits.max_redirects:
+                    raise FetchError("redirect", f"Too many redirects (more than {limits.max_redirects})")
+                nxt = parse_url(urljoin(current.url, location), limits.max_url_length)       # same checks as the first URL
+                if current.scheme == "https" and nxt.scheme == "http":
+                    raise FetchError("redirect", "The server redirected from HTTPS to plain HTTP, which is refused")
+                if nxt.url in seen:
+                    raise FetchError("redirect", "Redirect loop")
+                seen.add(nxt.url)
+                current = nxt
+                continue
+            if status != 200:
+                wait = _retry_after(resp.getheader("Retry-After"))
+                if status in _RETRYABLE_STATUS:
+                    raise FetchError("http", f"The server answered HTTP {status}" + (" (rate limited)" if status == 429 else ""), retryable=True, retry_after=wait)
+                if status in (401, 403):
+                    raise FetchError("http", f"The server refused access (HTTP {status})")
+                if status in (404, 410):
+                    raise FetchError("http", f"The file was not found (HTTP {status})")
+                raise FetchError("http", f"The server answered HTTP {status}")
+
+            ctype = (resp.getheader("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if ctype in ("text/html", "application/xhtml+xml"):
+                raise FetchError("html", "The link returned a web page, not structured data.")
+            if accepted_types and ctype not in accepted_types:
+                raise FetchError("content", f"The answer is {ctype or 'of an unknown type'}, not {accepted_types[0]}")
+            length = resp.getheader("Content-Length")
+            total = int(length) if length and length.isdigit() else 0
+            if total > max_bytes:
+                raise FetchError("too-large", f"The response is larger than the allowed {max_bytes} bytes")
+            encoding = (resp.getheader("Content-Encoding") or "identity").strip().lower()
+            if encoding in ("", "identity"):
+                decoder = None
+            elif encoding in ("gzip", "x-gzip"):
+                decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            elif encoding == "deflate":
+                decoder = zlib.decompressobj()
+            else:
+                raise FetchError("encoding", f"The server used an unsupported Content-Encoding ({encoding[:20]})")
+
+            body = bytearray()
+            wire = decoded = 0
+            try:
+                while True:
+                    if clock() - started > limits.max_duration:
+                        raise FetchError("timeout", "The download took longer than the allowed time")
+                    try:
+                        chunk = resp.read1(READ_SIZE)
+                    except socket.timeout:
+                        raise FetchError("timeout", "The server stopped sending data", retryable=True) from None
+                    except (http.client.IncompleteRead, ConnectionError, OSError, http.client.HTTPException):
+                        raise FetchError("connection", "The connection was interrupted", retryable=True) from None
+                    if not chunk:
+                        break
+                    wire += len(chunk)
+                    if wire > max_bytes:
+                        raise FetchError("too-large", f"The response exceeded the allowed {max_bytes} bytes")
+                    if decoder is None:
+                        body += chunk
+                    else:
+                        pending = chunk
+                        while pending:
+                            try:
+                                piece = decoder.decompress(pending, CHUNK)
+                            except zlib.error:
+                                raise FetchError("encoding", "The response body could not be decoded") from None
+                            decoded += len(piece)
+                            if decoded > max_bytes:
+                                raise FetchError("too-large", f"The decoded content exceeded the allowed {max_bytes} bytes")
+                            body += piece
+                            pending = decoder.unconsumed_tail
+                            if not piece:
+                                break
+                    if progress:
+                        progress("Fetching", wire, total)
+                if decoder is not None:
+                    tail = decoder.flush()
+                    decoded += len(tail)
+                    if decoded > max_bytes:
+                        raise FetchError("too-large", "The decoded content exceeded the allowed size")
+                    body += tail
+            except MemoryError:
+                raise FetchError("too-large", f"The response exceeded the allowed {max_bytes} bytes") from None
+            return MemoryResult(body=bytes(body), content_type=ctype, url=current.url, attempts=1, redirects=redirects)
+        finally:
+            conn.close()
+
+
+def fetch_to_memory(url: str, limits: FetchLimits | None = None, *, accepted_types: tuple[str, ...] = (), max_bytes: int = 32 * 1024 ** 2,
+                    progress=None, resolver: Resolver | None = None, connector: Connector | None = None, ssl_context: ssl.SSLContext | None = None,
+                    sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic) -> MemoryResult:
+    """GET a bounded response into memory (metadata, not packages). Same destination policy, TLS, redirect and retry rules as
+    fetch_to_file; the body is capped while streaming, never trusted from Content-Length."""
+    limits = limits or FetchLimits()
+    resolver = resolver or system_resolver
+    connector = connector or socket_connector
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            result = _fetch_memory_once(url, limits, accepted_types, max_bytes, progress, resolver, connector, ssl_context, clock)
+            result.attempts = attempt
+            return result
+        except FetchError as exc:
+            exc.attempts = attempt
+            if not exc.retryable or attempt >= limits.max_attempts:
+                raise
+            if exc.retry_after is not None and exc.retry_after > limits.retry_after_max:
+                raise FetchError(exc.kind, f"{exc} The server asked to wait {int(exc.retry_after)} s, longer than the allowed {int(limits.retry_after_max)} s.",
+                                 retryable=False) from None
+            delay = exc.retry_after if exc.retry_after is not None else limits.backoff_base * (2 ** (attempt - 1))
+            delay = min(delay, limits.retry_after_max)
+            waited = 0.0
+            while waited < delay:
+                step = min(0.5, delay - waited)
+                if progress:
+                    progress(f"Waiting to retry (attempt {attempt + 1} of {limits.max_attempts})", 0, 0)
+                sleep(step)
+                waited += step
+        except BaseException:
+            raise
+
+
 def fetch_to_file(url: str, dest: Path, limits: FetchLimits | None = None, progress=None, *, resolver: Resolver | None = None,
                   connector: Connector | None = None, ssl_context: ssl.SSLContext | None = None,
                   sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic) -> FetchResult:

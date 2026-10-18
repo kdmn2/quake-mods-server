@@ -26,7 +26,7 @@ from werkzeug.utils import secure_filename
 from tools.catalog import (ReleaseNeedsReview, _compute_sha256 as _sha256_file, _validate_date, build_single_pak_from_zip, detect_package_format,
                            plan_zip_release, validate_package, validate_pak_paths)
 from tools.convert_options import PRESETS, ConvertOptions, options_from_form
-from tools import batchstore
+from tools import batchstore, quaddicted as quaddicted_module
 from tools.batch_import import BatchService
 from tools.jobs import JobCancelled, JobFailed, JobManager, JobOutcome, Progress
 from tools.pak_report import analyze_pak, summarize_conversion
@@ -641,6 +641,7 @@ def init_db() -> None:
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_addons_batch_item ON addons(batch_item_id) WHERE batch_item_id IS NOT NULL")
     batchstore.init_schema(conn)
     jobs.init_schema(conn)
+    quaddicted_module.init_schema(conn)
     conn.commit()
     conn.close()
 
@@ -1480,12 +1481,16 @@ def _plan_import(token: str) -> None:
         conn.close()
 
 
-batch_service = BatchService(app, SimpleNamespace(
+_quaddicted_core = SimpleNamespace(
     get_db=get_db, jobs=jobs, require_auth=require_auth, detect_package_format=detect_package_format,
     save_import=_save_import, load_import=_load_import, delete_import=_delete_import, update_import=_update_import,
     build_import=_build_import, plan_import=_plan_import, ReviewRequired=ReviewRequired, ImportConflict=ImportConflict,
-))
+    db_txn=db_txn,
+)
+batch_service = BatchService(app, _quaddicted_core)
 batch_service.register_routes()
+quaddicted_service = quaddicted_module.QuaddictedService(app, _quaddicted_core, batch_service)
+quaddicted_service.register_routes()
 
 
 def create_app() -> Flask:

@@ -31,6 +31,7 @@ from flask import abort, flash, jsonify, redirect, render_template, request, url
 from tools import batchstore as store
 from tools import localscan, netfetch
 from tools.jobs import JobCancelled, JobFailed, JobOutcome
+from tools.quaddicted import source_key as source_key_of
 
 STATE_LABELS = {
     "queued": "Queued", "acquiring": "Fetching", "converting": "Converting", "awaiting_review": "Needs review", "needs_decision": "Needs a decision",
@@ -51,6 +52,33 @@ def slugify(name: str) -> str:
 def title_from(name: str) -> str:
     stem = name.rsplit(".", 1)[0] if "." in name else name
     return re.sub(r"\s+", " ", re.sub(r"[_]+", " ", stem)).strip()[:80] or "Imported add-on"
+
+
+def quaddicted_source_meta(item) -> dict[str, Any]:
+    """Metadata carried for Quaddicted items (entry identity, suggestions, provenance). Never trusted: templates escape it."""
+    try:
+        meta = json.loads(item["source_json"] or "{}")
+        return meta if isinstance(meta, dict) else {}
+    except ValueError:
+        return {}
+
+
+def form_from_item(item, final_name: str, addon_id: str) -> dict[str, str]:
+    """The draft's starting metadata. Upstream (Quaddicted) metadata is only a suggestion: it lands in editable form fields
+    and never overwrites a record the administrator has already edited (replacement flows reuse the existing values)."""
+    meta = quaddicted_source_meta(item)
+    base = {"title": title_from(final_name), "author": "Unknown", "date": "", "description": ""}
+    if meta:
+        if meta.get("title"):
+            base["title"] = str(meta["title"])[:200]
+        if meta.get("author"):
+            base["author"] = str(meta["author"])[:200]
+        if meta.get("date"):
+            base["date"] = str(meta["date"])[:40]
+        if meta.get("description"):
+            base["description"] = str(meta["description"])[:4000]
+    return {"title": base["title"], "addon_id": addon_id, "gamedir": addon_id, "author": base["author"], "date": base["date"],
+            "description": base["description"]}
 
 
 class BatchService:
@@ -93,6 +121,40 @@ class BatchService:
         if pending + count > limit:
             return f"The import queue is full ({pending} waiting, limit {limit}). Wait for some to finish or cancel some."
         return None
+
+    def create_quaddicted_batch(self, prepared: list[dict[str, str]], submit_key: str | None) -> dict[str, Any]:
+        """prepared items come from the Quaddicted service: one selected entry each, with the resolved canonical download URL.
+        Duplicate detection (same entry already queued, same bytes already imported) works through source_key and
+        source_sha256 like every other source."""
+        if not prepared:
+            return {"error": "Nothing to import."}
+        max_items = int(self.cfg("BATCH_MAX_ITEMS", 50))
+        if len(prepared) > max_items:
+            return {"error": f"{len(prepared)} entries selected; at most {max_items} can be imported at once."}
+        full = self._room_for(len(prepared))
+        if full:
+            return {"error": full}
+        with self.db() as c:
+            if submit_key and (existing := store.batch_by_key(c, submit_key)):
+                return {"batch_id": existing["id"], "repeat": True}
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                batch_id = store.create_batch(c, "quaddicted", f"{len(prepared)} Quaddicted package(s)", submit_key)
+                item_ids, already = [], 0
+                for pos, p in enumerate(prepared):
+                    key = source_key_of(p["sha256"])
+                    if store.active_for_source(c, key):
+                        already += 1
+                        continue
+                    item_ids.append(store.add_item(c, batch_id, pos, "quaddicted", key, p["display"], source_url=p["url"],
+                                                   source_json=p["source_json"]))
+                c.execute("COMMIT")
+            except Exception:
+                c.execute("ROLLBACK")
+                raise
+        for item_id in item_ids:
+            self._submit_acquire(item_id)
+        return {"batch_id": batch_id, "already_queued": already}
 
     def create_url_batch(self, text: str, submit_key: str | None) -> dict[str, Any]:
         """Returns {'batch_id'} on success or {'error', 'problems', 'duplicates'}."""
@@ -236,6 +298,22 @@ class BatchService:
                     raise JobFailed(self._scrub(item, f"{exc}{suffix}")) from None
                 sha, final_name, host, size = res.sha256, res.filename, res.host, res.size
                 self.log(f"item {item_id}: downloaded {size} bytes from {item['source_display']} in {res.attempts} attempt(s)")
+            elif item["source_type"] == "quaddicted":
+                limits = self.limits(max_bytes)
+                try:
+                    res = netfetch.fetch_to_file(item["source_url"], dest, limits, progress, **self.transport)
+                except netfetch.FetchError as exc:
+                    if exc.kind in ("too-large", "disk") and space_bound:
+                        raise JobFailed(self.STAGING_FULL) from None
+                    suffix = f" (after {exc.attempts} attempts)" if exc.attempts > 1 else ""
+                    raise JobFailed(self._scrub(item, f"{exc}{suffix}")) from None
+                sha, final_name, host, size = res.sha256, res.filename, res.host, res.size
+                expected = quaddicted_source_meta(item).get("sha256", "").lower()
+                if expected and sha != expected:
+                    # The entry identity IS the content hash, so a mismatch means the link did not serve the package.
+                    raise JobFailed(f"The download does not match the Quaddicted entry (its content hash is {sha[:12]}…, the entry says {expected[:12]}…). "
+                                    "Refresh the index and try again; if it persists, the upstream entry may be broken.") from None
+                self.log(f"item {item_id}: downloaded {size} bytes for Quaddicted entry {expected[:12]}… in {res.attempts} attempt(s)")
             else:
                 roots = self.roots()
                 if item["folder_root"] is None or not (0 <= item["folder_root"] < len(roots)):
@@ -306,8 +384,7 @@ class BatchService:
             elif taken:
                 reason, existing = "id-taken", taken
             new_id = self._free_id(c, base)
-        form = {"title": title_from(final_name), "addon_id": base if not reason else new_id, "gamedir": base if not reason else new_id,
-                "author": "Unknown", "date": "", "description": ""}
+        form = form_from_item(item, final_name, base if not reason else new_id)
         if item["force"] and taken:
             form["addon_id"] = form["gamedir"] = new_id                                   # explicit "import anyway": use a free ID
             reason = None
@@ -365,6 +442,10 @@ class BatchService:
                       "batch_item_id": item_id}
         if item["source_type"] == "url":
             provenance["host"] = item["host"]
+        elif item["source_type"] == "quaddicted":
+            meta = quaddicted_source_meta(item)
+            provenance.update({"source": "quaddicted", "quaddicted_sha256": item["sha256"], "source_page": meta.get("page_url") or "",
+                               "upstream_updated": meta.get("upstream_updated") or ""})
         else:
             roots = self.roots()
             provenance["folder"] = roots[item["folder_root"]].label if item["folder_root"] is not None and item["folder_root"] < len(roots) else "?"
@@ -436,7 +517,7 @@ class BatchService:
                 return False, "Unknown item."
             if item["state"] not in store.RETRYABLE:
                 return False, f"This item is {STATE_LABELS.get(item['state'], item['state']).lower()}; only failed, cancelled or interrupted items can be retried."
-            if item["source_type"] == "url" and not item["source_url"]:
+            if item["source_type"] in ("url", "quaddicted") and not item["source_url"]:
                 return False, "The link was not kept. Submit it again."
             if not store.transition(c, item_id, store.RETRYABLE, "queued", message="", job_id=None, import_token=None, action_json=None):
                 return False, "Another request already retried this item."

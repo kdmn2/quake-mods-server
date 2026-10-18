@@ -1,0 +1,78 @@
+{% extends 'base.html' %}
+{% block content %}
+{% if not entry %}
+<div class="card"><h2>Quaddicted entry</h2><p>That entry is not in the local copy. Refresh the catalogue
+  on the <a href="{{ url_for('quaddicted_home') }}">Quaddicted page</a>, or import it there once it appears.</p></div>
+{% else %}
+<div class="card">
+  <h2>{{ entry.title }}</h2>
+  <p class="small muted">From <a href="https://www.quaddicted.com/" rel="noopener noreferrer">quaddicted.com</a> ·
+    entry ID <span class="mono">{{ entry.sha256_short }}</span> ·
+    <a href="{{ entry.page }}" rel="noopener noreferrer">entry page</a>{% if entry.filename %} ·
+    <span class="mono">{{ entry.filename }}</span>{% endif %}</p>
+
+  {% if entry.status %}
+    {% if entry.status.state == 'published' %}
+    <div class="sev info">A published add-on was imported from this exact entry:
+      <a href="{{ url_for('addon_detail', addon_id=entry.status.addon_pk) }}">{{ entry.status.addon_id }}</a>.
+      Importing again would create a separate draft, not replace it — use the batch page or the add-on page for replacements.</div>
+    {% elif entry.status.state == 'draft' %}
+    <div class="sev info">A draft was already created from this exact entry:
+      <a href="{{ url_for('addon_detail', addon_id=entry.status.addon_pk) }}">{{ entry.status.addon_id }}</a>.</div>
+    {% elif entry.status.state == 'queued' %}
+    <div class="sev info">This entry is already queued or being converted in a batch import.</div>
+    {% endif %}
+  {% endif %}
+
+  <table class="table-sm">
+    <tr><th style="width:160px">Author</th><td>{{ entry.authors|join(', ') if entry.authors else '—' }}</td></tr>
+    <tr><th>Type</th><td>{{ entry.types|join(', ') if entry.types else '—' }}</td></tr>
+    <tr><th>Game mode</th><td>{{ entry.game_modes|join(', ') if entry.game_modes else '—' }}</td></tr>
+    <tr><th>Release date</th><td>{{ entry.release_date or '—' }}</td></tr>
+    <tr><th>Package size</th><td>{{ entry.bytes|filesize if entry.bytes is not none else '—' }}</td></tr>
+    <tr><th>Upstream data updated</th><td>{{ entry.json_timestamp or '—' }}{% if entry.json_version %} <span class="small muted mono">({{ entry.json_version }})</span>{% endif %}</td></tr>
+  </table>
+
+  {% if entry.description or entry.notes %}
+  <h3 style="margin-bottom:4px">Description</h3>
+  <p style="white-space:pre-wrap">{{ entry.description if entry.description else '' }}</p>
+  {% if entry.notes %}<p class="small muted" style="white-space:pre-wrap">{{ entry.notes }}</p>{% endif %}
+  {% endif %}
+
+  {% if entry.depends or entry.mods or entry.dependency_files or entry.provides %}
+  <div class="sev warning">
+    <strong>Dependencies and requirements</strong> — this app publishes each add-on as a single standalone package; it does
+    <strong>not</strong> bundle dependencies into it. If a package needs one of these, import the dependency too (as its own
+    add-on/draft) and check how your engine loads both:
+    <ul>
+      {% for d in entry.depends %}<li>requires: {{ d }}</li>{% endfor %}
+      {% for d in entry.mods %}<li>needs mod family: {{ d }}</li>{% endfor %}
+      {% for d in entry.dependency_files %}<li>references: {{ d }}</li>{% endfor %}
+      {% for d in entry.provides %}<li>provides: {{ d }}</li>{% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+  {% if entry.exceeds_limits %}<div class="sev warning"><strong>Marked upstream as exceeding classic Quake limits</strong> — it may need a modern engine or exceed this app's package limits (2048 entries, names ≤ 55 bytes).</div>{% endif %}
+  {% if entry.nuked %}<div class="sev warning">Upstream marks this entry as removed (“nuked”); it may be broken or unwanted.</div>{% endif %}
+  {% if entry.install_extract %}<p class="small muted">Upstream says the archive extracts to <span class="mono">{{ entry.install_extract }}</span>.
+    Content meant for <span class="mono">id1</span> is converted to this add-on's own directory; anything ambiguous goes through the usual review page.</p>{% endif %}
+
+  {% if entry.screenshot %}
+  <p><img src="{{ entry.screenshot }}" alt="Screenshot of {{ entry.title }} on quaddicted.com" loading="lazy" style="max-width:480px;border:1px solid #e3e8ef"></p>
+  <p class="small muted">The image is loaded directly from quaddicted.com by the browser.</p>
+  {% endif %}
+
+  {% if entry.safe_links %}
+  <p class="small muted">Upstream links:
+    {% for l in entry.safe_links %}<a href="{{ l }}" rel="noopener noreferrer nofollow">{{ l }}</a>{% if not loop.last %}, {% endif %}{% endfor %}</p>
+  {% endif %}
+
+  <form method="post" action="{{ url_for('quaddicted_import') }}" data-once>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="sha" value="{{ entry.sha256 }}">
+    <input type="hidden" name="submit_key" value="{{ submit_key }}">
+    <button type="submit">Import this package as a draft</button>
+    <span class="small muted">Downloads {{ entry.bytes|filesize if entry.bytes is not none else '' }} from quaddicted.com, verifies its SHA-256 against the entry, and runs the usual inspection, conversion and validation. At most {{ max_items }} batches in one go.</span>
+  </form>
+</div>
+{% endif %}
+{% endblock %}

@@ -58,6 +58,7 @@ SCHEMA = (
         host TEXT,
         staged_bytes INTEGER NOT NULL DEFAULT 0,
         derived_json TEXT,                       -- derived add-on id/title
+        source_json TEXT,                        -- quaddicted items: the entry's metadata for draft suggestions and provenance
         action_json TEXT,                        -- what a person is being asked to decide
         force INTEGER NOT NULL DEFAULT 0,        -- import even though identical content exists
         created_at REAL NOT NULL,
@@ -86,6 +87,9 @@ SCHEMA = (
 def init_schema(conn: sqlite3.Connection) -> None:
     for statement in SCHEMA:
         conn.execute(statement)
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(batch_items)").fetchall()}
+    if "source_json" not in existing:                        # non-destructive upgrade of existing installations
+        conn.execute("ALTER TABLE batch_items ADD COLUMN source_json TEXT")
 
 
 # ---- batches ---------------------------------------------------------------------------------------------------------

@@ -1,12 +1,9 @@
 # Ironwail Add-on Manager
-
 This project provides a lightweight self-hosted admin workflow for an Ironwail-compatible Quake add-on catalog. It keeps the public contract compatible with Ironwail’s verified source at `v0.8.2`, while adding a browser-based admin interface for uploads, metadata, publishing, and catalog generation.
-
 Quick deploy to Unraid
 - Native Unraid template: `unraid-template.xml`
 - Auto-published image: `ghcr.io/kdmn2/quake-mods-server:latest`
 - First-run setup: `http://<unraid-host>:<port>/setup`
-
 Important protocol summary
 - Ironwail requests `<base>/content.json`
 - Each catalog entry requires `download` and `gamedir`
@@ -346,7 +343,8 @@ Which copy of a file wins follows Ironwail's own search order (`common.c`: `COM_
 
 ## Batch import
 
-**Batch import** (top menu) brings in many packages at once, from two sources. Both feed the *same* pipeline as a single upload: format detection, ZIP/PAK validation, root inference, asset precedence, conversion, output validation and inspection. Nothing is converted or published by a second code path, and **every successful item becomes a draft**. Publishing stays an explicit click on each draft.
+**Batch import** (top menu) brings in many packages at once, from several sources (pasted URLs, a server folder, or the
+Quaddicted catalogue). All feed the *same* pipeline as a single upload: format detection, ZIP/PAK validation, root inference, asset precedence, conversion, output validation and inspection. Nothing is converted or published by a second code path, and **every successful item becomes a draft**. Publishing stays an explicit click on each draft.
 
 ```text
 choose sources -> validate -> queue -> acquire into staging -> existing conversion -> validate the PAK -> draft
@@ -383,6 +381,27 @@ The flow is **scan, select, confirm**. Scanning only lists files (non-recursive 
 
 The single-file *Import from server path* option on the add-on form is unchanged: it accepts any absolute path the application user can read and is meant for the administrator only.
 
+### 3. Quaddicted
+
+**Batch import → Quaddicted** (or the top-menu page) searches a **local copy** of
+[quaddicted.com](https://www.quaddicted.com/)’s database — the Quake archive — and imports its packages. The copy is
+fetched once from Quaddicted’s own read-only JSON API (`/api/v1/`, the site’s intended machine interface) with your
+button press, never per page view; the page shows how old the copy is. Search, filters (type, game mode) and pagination
+run on the local copy.
+
+Select entries (with a visible “already imported/queued” status per entry), then **Import selected as drafts**. Each
+selected entry is acquired like a pasted URL: the safe downloader fetches the entry’s content-addressed package
+(`files/by-sha256/…`), the download is **verified against the entry’s SHA-256** (the entry identity *is* the content
+hash) and it continues through exactly the shared inspection → conversion → validation → **draft** pipeline. Known
+dependencies (`depends`, `mod`, `dependency`, `provides`) and “exceeds Quake limits” markers are shown as warnings;
+nothing is bundled automatically, and ratings are not available upstream, so none are shown.
+
+Pasting an individual entry page URL or its ID works after a refresh: the entry detail route
+(`/quaddicted/entry/<sha256>`) accepts any 64-hex ID known to the local copy and offers a one-click import.
+Metadata (title, author, release date, description) is suggested from the entry into the draft’s editable fields;
+imports record upstream provenance (entry ID, canonical page, upstream update time). Details and the upstream schema:
+`docs/quaddicted.md`. Optional tuning: `QUADDICTED_CONNECT_TIMEOUT`, `QUADDICTED_READ_TIMEOUT`, `QUADDICTED_MAX_DURATION`.
+
 ### Jobs, progress and recovery
 
 * Each package is its own item with its own state: *queued, fetching, converting, needs review, needs a decision, draft created, skipped, failed, cancelled, interrupted*. One failure never stops the others. The batch page shows source type, a safe description, progress (a percentage only where the total is known), the draft link and expandable errors, and keeps working after you close or refresh the page.
@@ -402,12 +421,17 @@ The single-file *Import from server path* option on the add-on form is unchanged
 
 Drafts get an ID, directory and title derived from the file name (`pungfx.zip` becomes `pungfx`); the add-on page's metadata suggestions can improve them.
 
+
+
+
+
 ### Configuration
 
 All optional; defaults shown. Set them as container environment variables (Unraid shows the most useful ones under *advanced*).
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
+| `QUADDICTED_CONNECT_TIMEOUT` / `QUADDICTED_READ_TIMEOUT` / `QUADDICTED_MAX_DURATION` | 10 s / 60 s / 600 s | Quaddicted catalogue refresh limits (manual refresh only) |
 | `IMPORT_ROOTS` | `/imports` if mounted | Container paths offered for folder import, separated by `:` |
 | `IMPORT_SCAN_MAX_DEPTH` / `IMPORT_SCAN_MAX_ENTRIES` / `IMPORT_SCAN_MAX_RESULTS` | 8 / 20000 / 2000 | Scan bounds (depth, entries visited, files listed) |
 | `IMPORT_PAGE_SIZE` | 100 | Files per page in scan results |

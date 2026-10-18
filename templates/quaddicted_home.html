@@ -1,0 +1,119 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="card">
+  <h2>Quaddicted</h2>
+  <p class="small muted">Search the database of <a href="https://www.quaddicted.com/" rel="noopener noreferrer">quaddicted.com</a> (the Quake archive)
+    and import packages as <strong>drafts</strong> — nothing is published automatically. The catalogue below is a local copy:
+    search and browsing do not query Quaddicted, and packages are downloaded only when you import them. Import, inspection,
+    conversion and publishing go through exactly the same pipeline as the other import sources.</p>
+
+  {% if total == 0 and not synced_at %}
+  <div class="sev info">
+    The local copy of the Quaddicted catalogue is empty. <form method="post" action="{{ url_for('quaddicted_sync') }}" style="display:inline">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">Fetch the catalogue now</button></form>
+    (one bounded series of requests to <span class="mono">quaddicted.com</span>; afterwards everything on this page is served from the local copy).
+  </div>
+  {% else %}
+  <div class="sev info">
+    Local copy: <strong>{{ total }}</strong> entr{{ 'y' if total == 1 else 'ies' }}.
+    {% if synced_at %}Last refreshed <span title="{{ synced_at }}">{{ age }}</span>{% else %}Never fully refreshed{% endif %}.
+    <form method="post" action="{{ url_for('quaddicted_sync') }}" style="display:inline">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit" title="{{ min_sync_seconds }}s minimum between refreshes">Refresh now</button></form>
+    {% if synced_at %}<span class="small muted">— this copy may be out of date; refresh to see new or changed upstream entries.</span>{% endif %}
+  </div>
+  {% endif %}
+</div>
+
+<form method="get" action="{{ url_for('quaddicted_home') }}">
+  <div class="card">
+    <div class="inline">
+      <input style="flex:2" name="q" value="{{ q }}" placeholder="Search title, file name, author, description…">
+      <select style="width:auto" name="type">
+        <option value="">Any type</option>
+        {% for t in types %}<option value="{{ t }}" {% if kind == t %}selected{% endif %}>{{ t }}</option>{% endfor %}
+      </select>
+      <select style="width:auto" name="mode">
+        <option value="">Any game mode</option>
+        {% for m in modes %}<option value="{{ m }}" {% if mode == m %}selected{% endif %}>{{ m }}</option>{% endfor %}
+      </select>
+      <select style="width:auto" name="sort">
+        <option value="title" {% if sort == 'title' %}selected{% endif %}>By title</option>
+        <option value="release" {% if sort == 'release' %}selected{% endif %}>By release date</option>
+        <option value="size" {% if sort == 'size' %}selected{% endif %}>By size</option>
+      </select>
+      <button style="width:auto" type="submit">Search</button>
+    </div>
+  </div>
+</form>
+
+{% if entries %}
+<form method="post" action="{{ url_for('quaddicted_import') }}" id="qd-form" data-once>
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="submit_key" value="{{ submit_key }}">
+  <div class="card">
+    <table class="table-sm">
+      <thead><tr><th></th><th>Title</th><th>Author</th><th>Type</th><th>Released</th><th>Size</th><th>Status</th></tr></thead>
+      <tbody>
+      {% for e in entries %}
+      <tr>
+        <td><input type="checkbox" name="sha" value="{{ e.sha256 }}" class="pick"
+                   {% if known.get(e.sha256) and known[e.sha256].state in ('draft','published','queued') %}disabled title="Already handled locally"{% endif %}></td>
+        <td><a href="{{ url_for('quaddicted_entry', sha=e.sha256) }}">{{ e.title }}</a>
+          {% if e.filename %}<span class="small muted mono">{{ e.filename }}</span>{% endif %}</td>
+        <td>{{ e.authors|join(', ') }}</td>
+        <td>{{ e.types|join(', ') }}</td>
+        <td>{{ e.release_date or '—' }}</td>
+        <td>{{ e.bytes|filesize if e.bytes is not none else '—' }}</td>
+        <td>
+          {% if known.get(e.sha256) %}
+            {% if known[e.sha256].state == 'published' %}<span class="pill completed">Imported (published)</span>
+            {% elif known[e.sha256].state == 'draft' %}<span class="pill awaiting_review">Imported (draft)</span>
+            {% elif known[e.sha256].state == 'queued' %}<span class="pill acquiring">Already queued</span>
+            {% else %}<span class="small muted">Skipped before</span>{% endif %}
+          {% else %}<span class="small muted">Not imported</span>{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <p class="small muted">
+      Showing {{ entries|length }} of {{ total }} matching entr{{ 'y' if total == 1 else 'ies' }} (local copy). Page {{ page }} of {{ pages }}.
+      {% if page > 1 %}<a href="{{ url_for('quaddicted_home', q=q, type=kind, mode=mode, sort=sort, page=page - 1) }}">Previous</a>{% endif %}
+      {% if page < pages %}<a href="{{ url_for('quaddicted_home', q=q, type=kind, mode=mode, sort=sort, page=page + 1) }}">Next</a>{% endif %}
+    </p>
+    <div class="inline">
+      <button type="button" id="sel-all">Select all on this page</button>
+      <button type="button" id="sel-none">Clear</button>
+      <span id="sel-summary" class="small muted"></span>
+      <button type="submit" id="import-selected" disabled>Import selected as drafts</button>
+      <span class="small muted">At most {{ max_items }} per batch.</span>
+    </div>
+  </div>
+</form>
+{% elif entries %}
+{% else %}
+<div class="card">
+  <p>No entries match this search in the local copy{% if q %} for “{{ q }}”{% endif %}.
+    Try fewer words, a different type, or <a href="{{ url_for('quaddicted_home') }}">clear the search</a>.
+    If you expected something new, refresh the catalogue (button above) — the copy may predate it.</p>
+</div>
+{% endif %}
+
+<script>
+(function () {
+  var form = document.getElementById('qd-form');
+  if (!form) return;
+  var picks = function () { return Array.prototype.slice.call(form.querySelectorAll('input.pick')); };
+  function bytes(n) { var u = ['B','KiB','MiB','GiB'], i = 0; while (n >= 1024 && i < 3) { n /= 1024; i++; } return n.toFixed(i && n < 100 ? 1 : 0) + ' ' + u[i]; }
+  function summary() {
+    var on = picks().filter(function (p) { return p.checked; });
+    var total = on.reduce(function (a, p) { return a + Number(p.getAttribute('data-size') || 0); }, 0);
+    document.getElementById('sel-summary').textContent = on.length + ' selected';
+    document.getElementById('import-selected').disabled = on.length === 0;
+  }
+  document.getElementById('sel-all').onclick = function () { picks().forEach(function (p) { if (!p.disabled) p.checked = true; }); summary(); };
+  document.getElementById('sel-none').onclick = function () { picks().forEach(function (p) { p.checked = false; }); summary(); };
+  picks().forEach(function (p) { p.addEventListener('change', summary); });
+  summary();
+})();
+</script>
+{% endblock %}
