@@ -543,6 +543,40 @@ class ImportTests(QuaddictedBase):
         self.assertEqual(self.states(bid), ["failed"])
         self.assertIn("private or internal", self.status(bid)["items"][0]["message"])
 
+    def test_entry_with_no_usable_url_is_reported_with_actionable_message(self):
+        """An entry whose Quaddicted document has no `urls` field (an upstream data-quality issue,
+        observed in the wild for sha256 65894a8a8a6b…/Tomb of Thunder) is reported with the
+        entry's title and an actionable workaround — not just a bare 'no usable link'."""
+        # Seed a catalogue entry with no urls at all (the same shape as Tomb of Thunder upstream)
+        sha = self.seed_entry(sha64(70), urls=[],
+                              tags=["title=Upstream Incomplete", "filename=incomplete.zip",
+                                    "type=mod"])["sha256"]
+        result = SVC.import_prepared([sha])
+        self.assertEqual(result["prepared"], [])                              # nothing was prepared
+        self.assertEqual(len(result["problems"]), 1)
+        short, reason = result["problems"][0]
+        self.assertEqual(short, sha[:12])
+        # The improved message names the entry (so the user knows which mod), names the upstream
+        # cause, and points at the supported workaround (the Upload form).
+        self.assertIn("Upstream Incomplete", reason)
+        self.assertIn("no URLs", reason)
+        self.assertIn("Upload form", reason)
+        # And the user-facing preview page surfaces the same text
+        res = self.post("/quaddicted/import", {"sha": [sha], "preview": "1"})
+        self.assertEqual(res.status_code, 200)
+        html = res.get_data(as_text=True)
+        self.assertIn("Upstream Incomplete", html)
+        self.assertIn("no URLs", html)
+        # Posting without preview (the action that would queue an import) keeps the same wording.
+        # Nothing got queued; the flash names the entry and the upstream cause.
+        with self.c.session_transaction() as sess:
+            csrf = sess["csrf_token"]
+        res2 = self.c.post("/quaddicted/import", data={"sha": [sha], "submit_key": "k", "csrf_token": csrf},
+                           follow_redirects=True)
+        flash_html = res2.get_data(as_text=True)
+        self.assertIn("no usable direct download link", flash_html)
+        self.assertIn("Upstream Incomplete", flash_html)
+
     def test_browse_page_marks_entries_imported_and_links_the_draft(self):
         sha, _ = self.host_quaddicted_release("rte.zip", "RTE")
         self.assertIn("Not imported", self.c.get("/quaddicted").get_data(as_text=True))

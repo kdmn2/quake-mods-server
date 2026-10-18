@@ -738,7 +738,17 @@ class QuaddictedService:
                 continue
             url = pick_download_url(entry.urls)
             if url is None:
-                problems.append((sha[:12], "the upstream entry lists no usable direct download link"))
+                # The Quaddicted API document is missing every usable download URL for this entry.
+                # This is an upstream data quality issue (e.g. the entry exists in the catalogue
+                # but the by-sha256 link was never published, or the only download was on a third-
+                # party site that requires a session). Name the entry so the message is actionable
+                # and tell the user the supported workaround.
+                title = entry.display_title if entry else ""
+                tag = f" ({title})" if title else ""
+                problems.append((sha[:12], f"the upstream entry{tag} lists no usable direct download link "
+                                  f"— Quaddicted's catalogue entry for this SHA-256 has no URLs; "
+                                  f"download the file from the upstream source and upload it directly "
+                                  f"via the Upload form on the dashboard."))
                 continue
             prepared.append({"sha256": sha, "url": url, "display": entry.filename or sha[:12], "source_json": entry.source_json()})
         return {"prepared": prepared, "problems": problems}
