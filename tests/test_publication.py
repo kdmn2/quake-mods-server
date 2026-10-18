@@ -339,5 +339,122 @@ class ReprocessThenPublishIntegration(PublicationBase):
         self.assertEqual(after["draft"], 1)
 
 
+# ---- integration: ZIP with overlong entry -> default-skip -> publish -> download (overlong policy)
+
+class OverlongNameZipIntegration(PublicationBase):
+    """Full lifecycle on isolated storage with the user's example overlong path:
+
+      1. Upload a ZIP with valid assets AND a 63-byte AlbumArt_…/UUID…/Large.jpg entry.
+      2. The package lands as a draft (default skip-on, so the overlong is recorded as
+         an exclusion rather than blocking the upload).
+      3. The stored PAK contains the keepable entries with the right bytes; the overlong
+         path is absent; the conversion report names it.
+      4. Publish and download the public artifact; the served PAK matches.
+    """
+
+    LONG_NAME = "music/AlbumArt_{B5020207-474E-4720-D903-8139E4180600}_Large.jpg"
+    KEEPABLES = [("maps/start.bsp", b"BSP-DATA-START"),
+                 ("maps/end.bsp", b"BSP-DATA-END"),
+                 ("sound/keep.wav", b"RIFF-WAVE-DATA")]
+
+    def _zip_with_mixed_content(self):
+        from io import BytesIO
+        import zipfile
+        zbuf = BytesIO()
+        with zipfile.ZipFile(zbuf, "w") as zf:
+            for name, data in self.KEEPABLES:
+                zf.writestr(name, data)
+            zf.writestr(self.LONG_NAME, b"ALBUM-ART-BYTES")
+        return zbuf.getvalue()
+
+    def test_full_lifecycle_skip_then_publish(self):
+        zip_bytes = self._zip_with_mixed_content()
+        res = self.upload("overlong", zip_bytes, filename="overlong.zip", path="/addons/new")
+        self.assertEqual(res.status_code, 200)
+        row = self.row("overlong")
+        self.assertIsNotNone(row)
+        self.assertEqual(row["published"], 0)
+        self.assertEqual(row["draft"], 1)
+        # The PAK was built successfully (the overlong was skipped, not blocking).
+        from tools.catalog import read_pak_directory
+        kept = sorted(e["path"] for e in read_pak_directory(Path(row["package_path"])))
+        self.assertEqual(kept, sorted(name for name, _ in self.KEEPABLES))
+        # Each kept entry has the right bytes.
+        pak_path = Path(row["package_path"])
+        entries = {e["path"]: e for e in read_pak_directory(pak_path)}
+        for name, expected in self.KEEPABLES:
+            with open(pak_path, "rb") as f:
+                f.seek(entries[name]["offset"])
+                self.assertEqual(f.read(entries[name]["size"]), expected,
+                                 f"bytes of {name} changed")
+        # The overlong name is in the conversion report with the documented wording.
+        report = json.loads(row["conversion_report"])
+        self.assertIsNotNone(report["excluded"])
+        self.assertEqual(report["excluded"]["total"], 1)
+        # The exclusion rule text names the entry's byte length and the limit.
+        rule_text = next(iter(report["excluded"]["by_rule"]))
+        self.assertIn(self.LONG_NAME, report["excluded"]["sample"][0]["path"])
+        self.assertIn(str(len(self.LONG_NAME.encode("utf-8"))), rule_text)
+        self.assertIn("55", rule_text)
+        # The on-disk package size and hash match the actual bytes.
+        self.assertEqual(row["package_size"], pak_path.stat().st_size)
+        # Publish and download.
+        pub_res = self.c.post(f"/addons/{row['id']}/publish",
+                              data={"csrf_token": self.csrf()}, follow_redirects=True)
+        self.assertEqual(pub_res.status_code, 200)
+        self.assertEqual(self.row("overlong")["published"], 1)
+        # The catalog entry has the same size and download URL.
+        cat = self.catalog()
+        entry = next(e for e in cat if e["gamedir"] == "overlong")
+        download = self.c.get("/" + entry["download"]).data
+        self.assertEqual(len(download), entry["size"])
+        # Independent parse: keepable entries present with right bytes, overlong absent.
+        download_path = self.tmp / "overlong-download.pak"
+        download_path.write_bytes(download)
+        downloaded = parse_pak(download_path)
+        self.assertEqual(set(downloaded.keys()), set(name for name, _ in self.KEEPABLES))
+        for name, expected in self.KEEPABLES:
+            self.assertEqual(downloaded[name], expected)
+        # The overlong AlbumArt entry is not in the served file.
+        self.assertNotIn(self.LONG_NAME, downloaded)
+
+    def test_strict_mode_rejects_the_same_zip_with_actionable_message(self):
+        """The same ZIP under explicit strict mode (skip_overlong_names=False) is rejected
+        outright with a clear message that names the offending path."""
+        from io import BytesIO
+        import zipfile
+        zbuf = BytesIO()
+        with zipfile.ZipFile(zbuf, "w") as zf:
+            for name, data in self.KEEPABLES:
+                zf.writestr(name, data)
+            zf.writestr(self.LONG_NAME, b"ALBUM-ART-BYTES")
+        zip_bytes = zbuf.getvalue()
+        res = self.upload("strict_zip", zip_bytes, filename="strict.zip", path="/addons/new",
+                          skip_overlong_names="0")
+        self.assertEqual(res.status_code, 200)
+        body = res.data if isinstance(res.data, bytes) else res.data.encode("utf-8", "replace")
+        # The failure message names the entry and the byte count vs limit.
+        self.assertIn(b"Entry name too long for PAK", body)
+        self.assertIn(b"63", body)                                   # the actual byte length
+        self.assertIn(b"55", body)                                   # the limit
+        # Nothing was installed.
+        self.assertIsNone(self.row("strict_zip"))
+
+    def test_only_overlong_entries_in_zip_refuses_to_write_an_empty_package(self):
+        """A ZIP whose only entry is overlong is rejected with a clear empty-package message."""
+        from io import BytesIO
+        import zipfile
+        zbuf = BytesIO()
+        with zipfile.ZipFile(zbuf, "w") as zf:
+            zf.writestr(self.LONG_NAME, b"X")
+        zip_bytes = zbuf.getvalue()
+        res = self.upload("empty_after_skip", zip_bytes, filename="empty.zip", path="/addons/new")
+        self.assertEqual(res.status_code, 200)
+        body = res.data if isinstance(res.data, bytes) else res.data.encode("utf-8", "replace")
+        self.assertIn(b"Refusing to write an empty package", body)
+        self.assertIn(b"too long", body)
+        self.assertIsNone(self.row("empty_after_skip"))
+
+
 if __name__ == "__main__":
     unittest.main()

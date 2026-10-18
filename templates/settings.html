@@ -28,6 +28,19 @@
         decoding* are converted; anything the verifier cannot prove identical stays TGA. Ironwail loads .png before .tga with
         the same decoder, so converted files are indistinguishable in the engine. Side effect: the package bytes change.</div>
     </div>
+    <div class="opt">
+      <h4>Overlong entry names</h4>
+      <label><input type="checkbox" name="skip_overlong_names" value="1" {% if saved.skip_overlong_names %}checked{% endif %}>
+        Skip entries with names too long for PAK</label>
+      <input type="hidden" name="skip_overlong_names" value="0">
+      <div class="small muted">Entries whose final PAK-relative path exceeds Ironwail's 55-byte
+        filename limit (for example, an album-art image with an embedded UUID) are normally rejected
+        outright. With this option on, the importer omits such entries and records each exclusion in
+        the conversion report. With it off, the build is rejected with a strict error.
+        <strong>Default is on</strong> for new jobs so that a single overlong asset does not block an
+        otherwise usable release. The package may still require review if those files are needed by the
+        mod — load it in Ironwail before publishing.</div>
+    </div>
     <button type="submit">Save defaults</button>
     <button type="submit" name="action" value="reset" class="danger" style="margin-left:12px"
             title="Removes the saved defaults; per-item settings continue to work as before">Reset to application defaults</button>

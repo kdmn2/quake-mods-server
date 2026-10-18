@@ -142,6 +142,20 @@
     {% endif %}
     {% if conv.excluded %}
     <p>{{ conv.excluded.total }} file(s) ({{ conv.excluded.bytes|filesize }}) were left out by your options.</p>
+    {% set overlong_samples = [] %}
+    {% for e in conv.excluded.sample %}{% if "too long" in e.reason %}{% set _ = overlong_samples.append(e) %}{% endif %}{% endfor %}
+    {% if overlong_samples %}
+    <div class="sev warning">
+      <strong>Heads up — entries with names too long for PAK were omitted.</strong>
+      A Quake PAK entry name is at most 55 bytes; the overlong ones listed below were left out
+      so the rest of the release could still be packed. If any of them are required for the mod
+      (a map, model, sound, script, …) the mod may not work as intended — load it in Ironwail
+      before publishing.
+      <details><summary>Overlong names omitted ({{ overlong_samples|length }})</summary>
+        <div class="small mono">{% for e in overlong_samples %}{{ e.path }}<br>{% endfor %}</div>
+      </details>
+    </div>
+    {% endif %}
     <details><summary>Left out</summary><div class="small mono">{% for e in conv.excluded.sample %}{{ e.path }} <span class="muted">({{ e.reason }})</span><br>{% endfor %}</div></details>
     {% endif %}
     {% if conv.reencoded %}

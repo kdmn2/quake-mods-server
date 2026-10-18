@@ -1194,3 +1194,101 @@ class ReprocessPackageTests(CollectionBase):
         pk = get_db().execute("SELECT id FROM addons WHERE addon_id = 'ht'").fetchone()[0]
         html = self.c.get(f"/addons/{pk}").data.decode()
         self.assertIn('href="/addons/' + str(pk) + '/reprocess"', html)
+
+
+# ---- overlong entry-name handling (settings + reprocess) --------------------------------------
+
+class OverlongNamePolicyTests(CollectionBase):
+    """End-to-end coverage for the overlong-name skip-with-warning policy:
+    settings persistence, per-item tri-state, reprocess flow, and the public
+    catalog untouched until explicit Publish."""
+
+    def test_settings_page_lists_the_skip_option(self):
+        """The settings page now exposes the overlong-name toggle with help text."""
+        html = self.c.get("/settings").data.decode()
+        self.assertIn("Skip entries with names too long for PAK", html)
+        self.assertIn("55-byte", html)                                   # Ironwail limit
+        # The default is on, so the saved-default branch renders the checkbox as checked.
+        self.assertIn('name="skip_overlong_names" value="1" checked', html)
+
+    def test_explicit_false_saved_default_overrides_for_new_jobs(self):
+        """Saved default False is honored by the effective-options resolver."""
+        self.post("/settings", {"reencode_textures": "0", "reencode_skyboxes": "0",
+                                "skip_overlong_names": "0", "action": "save"})
+        from app import _processing_defaults, _effective_convert_options
+        self.assertFalse(_processing_defaults()["skip_overlong_names"])
+        # A per-item form with NO choice inherits the saved default (False).
+        out = _effective_convert_options({})
+        self.assertFalse(out["skip_overlong_names"])
+        # A per-item form with the explicit "off" marker (hidden "0" partner, no checkbox) yields False.
+        from werkzeug.datastructures import ImmutableMultiDict
+        form_off = ImmutableMultiDict([("reencode_textures", "0"), ("reencode_skyboxes", "0"),
+                                        ("skip_overlong_names", "0")])
+        self.assertFalse(_effective_convert_options(form_off)["skip_overlong_names"])
+        # A per-item form with the explicit "on" marker wins over the saved default (hidden "0" + checkbox "1").
+        form_on = ImmutableMultiDict([("reencode_textures", "0"), ("reencode_skyboxes", "0"),
+                                       ("skip_overlong_names", "0"), ("skip_overlong_names", "1")])
+        self.assertTrue(_effective_convert_options(form_on)["skip_overlong_names"])
+
+    def test_reprocess_does_not_rewrite_a_valid_pak_due_to_overlong_settings_change(self):
+        """Reprocess on a valid stored PAK with the new overlong-name skip-on default does
+        not silently drop or rewrite the existing entries. The input PAK cannot physically
+        contain an overlong name (Ironwail's 55-byte limit applies to the on-disk format),
+        so reprocess is unchanged regardless of the option — the policy applies only to
+        fresh ZIP imports."""
+        from tests.test_zip_conversion import make_pak_bytes
+        entries = [("maps/start.bsp", b"BSPDATA"), ("sound/keep.wav", b"RIFF-WAVE")]
+        pak = make_pak_bytes(entries)
+        f = self.tmp / "reproc.pak"
+        f.write_bytes(pak)
+        pk = insert_addon("reproc", published=1, size=len(pak), path=f)
+        before_bytes = f.read_bytes()
+        # Reprocess with the default (skip-on).
+        res = self.post(f"/addons/{pk}/reprocess",
+                        {"csrf_token": self.csrf(), "exclude_presets_submitted": "1"})
+        self.assertEqual(res.status_code, 302)
+        from tools.catalog import read_pak_directory as rpd
+        post = sorted(e["path"] for e in rpd(f))
+        self.assertEqual(post, ["maps/start.bsp", "sound/keep.wav"])      # all kept
+        # The conversion record stores the result (no exclusions because nothing was dropped).
+        conn = get_db()
+        report = json.loads(conn.execute("SELECT conversion_report FROM addons WHERE id = ?", (pk,)).fetchone()[0])
+        conn.close()
+        self.assertEqual(report["kind"], "pak-reprocess")
+        self.assertIsNone(report["excluded"])
+        # Publication state is preserved (still published).
+        conn = get_db()
+        self.assertEqual(conn.execute("SELECT published FROM addons WHERE id = ?", (pk,)).fetchone()[0], 1)
+        conn.close()
+
+    def test_settings_help_text_describes_the_overlong_policy(self):
+        """The settings help text explains the new policy accurately."""
+        html = self.c.get("/settings").data.decode()
+        self.assertIn("Overlong entry names", html)
+        self.assertIn("55-byte", html)
+        self.assertIn("Default is on", html)
+        # Hidden "0" partner is present so an unchecked submit is treated as explicit False.
+        self.assertIn('name="skip_overlong_names" value="0"', html)
+
+    def test_no_rewrite_of_existing_packages_when_default_changes(self):
+        """Saving skip_overlong_names does NOT rewrite existing packages' content."""
+        from tests.test_zip_conversion import make_pak_bytes
+        pak = make_pak_bytes([("maps/a.bsp", b"A")])
+        f = self.tmp / "stable.pak"
+        f.write_bytes(pak)
+        pk = insert_addon("stable", published=0, size=len(pak), path=f)
+        before_bytes = f.read_bytes()
+        before_sha = hashlib.sha256(before_bytes).hexdigest()
+        # Mirror what the upload flow does: stamp the recorded hash.
+        conn = get_db()
+        conn.execute("UPDATE addons SET package_sha256 = ? WHERE id = ?", (before_sha, pk))
+        conn.commit()
+        conn.close()
+        # Flip the saved default to False; the existing package is unchanged.
+        self.post("/settings", {"reencode_textures": "0", "reencode_skyboxes": "0",
+                                "skip_overlong_names": "0", "action": "save"})
+        conn = get_db()
+        row = conn.execute("SELECT package_sha256, package_size FROM addons WHERE id = ?", (pk,)).fetchone()
+        conn.close()
+        self.assertEqual(row[0], before_sha)
+        self.assertEqual(row[1], len(before_bytes))

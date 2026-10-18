@@ -22,6 +22,21 @@
     {% elif options.rooted %}<input type="hidden" name="rooted" value="1">{% endif %}
 
     <div class="opt">
+      <h4>Overlong entry names</h4>
+      <p class="small muted">A Quake PAK entry name can be at most 55 bytes (Ironwail's <span class="mono">dpackfile_t.name[56]</span>).
+        Entries whose final path is longer than that cannot be represented. By default this importer
+        <strong>omits</strong> such entries and records each exclusion in the conversion report, so a
+        single overlong asset (typically an album-art image with embedded UUIDs or another third-party
+        blob) does not block an otherwise usable release. Untick to keep the strict rejection — the
+        package will be refused unless the path fits.</p>
+      <p class="small muted">Even with skipping on, missing required assets may affect gameplay — review
+        the conversion report and load the package in Ironwail before publishing.</p>
+      <label><input type="checkbox" name="skip_overlong_names" value="1" {% if options.skip_overlong_names %}checked{% endif %}>
+        Skip entries with names too long for PAK</label>
+      <input type="hidden" name="skip_overlong_names" value="0">
+    </div>
+
+    <div class="opt">
       <h4>Leave out files Ironwail does not need</h4>
       <p class="small muted">Removes content from the package. The preview lists exactly what goes.</p>
       <input type="hidden" name="exclude_presets_submitted" value="1">

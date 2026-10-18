@@ -1268,17 +1268,20 @@ def _validate_options_text(names: Any, valid: tuple[str, ...], max_count: int) -
     return ",".join(seen)
 
 
-PROCESSING_DEFAULT_KEYS = ("cleanup_presets", "reencode_textures", "reencode_skyboxes")
+PROCESSING_DEFAULT_KEYS = ("cleanup_presets", "reencode_textures", "reencode_skyboxes", "skip_overlong_names")
 
 
 def _processing_defaults() -> dict[str, Any]:
     conn = get_db()
     try:
-        rows = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM app_settings WHERE key IN (?, ?, ?)",
+        rows = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM app_settings WHERE key IN (?, ?, ?, ?)",
                                                            PROCESSING_DEFAULT_KEYS).fetchall()}
     finally:
         conn.close()
-    out = {"cleanup_presets": [], "reencode_textures": False, "reencode_skyboxes": False}
+    out = {"cleanup_presets": [], "reencode_textures": False, "reencode_skyboxes": False,
+           # Default to skip-on so a single overlong entry does not block an otherwise usable release.
+           # Existing saved values (whether True or False) override this fallback.
+           "skip_overlong_names": True}
     raw_presets = rows.get("cleanup_presets")
     if raw_presets:
         out["cleanup_presets"] = [p for p in raw_presets.split(",") if p in PRESETS]
@@ -1288,17 +1291,22 @@ def _processing_defaults() -> dict[str, Any]:
     value = _tri_state(rows.get("reencode_skyboxes"))
     if value is not None:
         out["reencode_skyboxes"] = value
+    skip = _tri_state(rows.get("skip_overlong_names"))
+    if skip is not None:
+        out["skip_overlong_names"] = skip
     return out
 
 
-def _save_processing_defaults(presets: str, textures: bool | None, skyboxes: bool | None) -> None:
+def _save_processing_defaults(presets: str, textures: bool | None, skyboxes: bool | None,
+                            skip_overlong: bool | None) -> None:
     conn = get_db()
     try:
         with conn:
             if presets is not None:
                 conn.execute("INSERT INTO app_settings (key, value, updated_at) VALUES ('cleanup_presets', ?, ?) "
                              "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at", (presets, time.time()))
-            for key, value in (("reencode_textures", textures), ("reencode_skyboxes", skyboxes)):
+            for key, value in (("reencode_textures", textures), ("reencode_skyboxes", skyboxes),
+                                ("skip_overlong_names", skip_overlong)):
                 if value is not None:
                     conn.execute("INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?) "
                                  "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
@@ -1350,10 +1358,15 @@ def _effective_convert_options(form) -> dict[str, Any]:
             raise ValueError(f"Unknown exclusion preset: {unknown[0]!r}")
     reenc_t = _checkbox_state(form, "reencode_textures")
     reenc_s = _checkbox_state(form, "reencode_skyboxes")
+    skip_state = _checkbox_state(form, "skip_overlong_names")
     textures = reenc_t if reenc_t is not None else saved["reencode_textures"]
     skyboxes = reenc_s if reenc_s is not None else saved["reencode_skyboxes"]
+    # Tri-state for skip-overlong-names matches the reencode fields: explicit per-item wins,
+    # otherwise the saved default (which itself defaults to True on the application side).
+    skip = skip_state if skip_state is not None else saved["skip_overlong_names"]
     return {"exclude_presets": list(dict.fromkeys(presets))[:len(PRESETS)],
-            "reencode_textures": textures, "reencode_skyboxes": skyboxes}
+            "reencode_textures": textures, "reencode_skyboxes": skyboxes,
+            "skip_overlong_names": skip}
 
 
 def _convert_options_from_resolved(resolved: dict[str, Any]) -> ConvertOptions:
@@ -1371,7 +1384,7 @@ def settings_page() -> Any:
                 conn = get_db()
                 try:
                     with conn:
-                        conn.execute("DELETE FROM app_settings WHERE key IN (?, ?, ?)", PROCESSING_DEFAULT_KEYS)
+                        conn.execute(f"DELETE FROM app_settings WHERE key IN ({','.join('?' * len(PROCESSING_DEFAULT_KEYS))})", PROCESSING_DEFAULT_KEYS)
                 finally:
                     conn.close()
                 flash("Processing defaults reset to application defaults.", "success")
@@ -1379,7 +1392,8 @@ def settings_page() -> Any:
                 presets = _validate_options_text(request.form.getlist("cleanup_presets"), tuple(PRESETS), len(PRESETS))
                 textures = _tri_state(request.form.get("reencode_textures"))
                 skyboxes = _tri_state(request.form.get("reencode_skyboxes"))
-                _save_processing_defaults(presets or "", textures, skyboxes)
+                skip_overlong = _tri_state(request.form.get("skip_overlong_names"))
+                _save_processing_defaults(presets or "", textures, skyboxes, skip_overlong)
                 flash("Processing defaults saved. New imports use them unless an option is set explicitly for the item; existing packages are unchanged.", "success")
         except ValueError as exc:
             flash(f"Invalid setting: {exc}", "error")

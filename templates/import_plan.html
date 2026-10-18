@@ -26,6 +26,16 @@
     <tr><th>Sources</th><td>{{ plan.loose_files }} loose file(s){% for p in plan.embedded_paks %}; <span class="mono">{{ p.name }}</span> ({{ p.entries }} entries, {{ p.bytes|filesize }}){% endfor %}</td></tr>
     <tr><th>Duplicated paths</th><td>{{ plan.overrides_total }} (Ironwail's search order decides which copy is kept: higher-numbered PAK, then lower PAK, then loose file)</td></tr>
     <tr><th>Left out by your options</th><td>{{ plan.excluded.total }} file(s), {{ plan.excluded.bytes|filesize }}</td></tr>
+    {% if plan.excluded and plan.excluded.by_rule %}
+      {% for rule, n in plan.excluded.by_rule.items() %}
+        {% if "too long" in rule %}
+        <tr><th>Overlong names</th><td>
+          <span class="error">{{ n }} entr{{ 'y' if n == 1 else 'ies' }} with names too long for PAK</span>
+          <div class="small muted">These would be omitted in the default skip mode and named in the conversion report. If any of them are required for the mod the package may not load as intended.</div>
+        </td></tr>
+        {% endif %}
+      {% endfor %}
+    {% endif %}
   </table>
   {% if space and space.low %}
   <div class="sev warning"><strong>Low disk space.</strong> Building needs roughly {{ space.need|filesize }} of temporary space (work area has {{ space.free_work|filesize }} free)

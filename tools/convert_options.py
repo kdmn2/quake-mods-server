@@ -43,6 +43,12 @@ class ConvertOptions:
     reencode_textures: bool = False
     reencode_skyboxes: bool = False
     mapdb: tuple[str, str] | None = None            # (episode name, episode dir) written only if the release has no mapdb.json
+    # When True, an entry whose final PAK-relative path exceeds the supported 55-byte name limit
+    # is omitted with a recorded exclusion. When False, any such entry rejects the build outright.
+    # The default favours acceptance (skip) so that a single overlong asset — typically an album-
+    # art image or a third-party blob — does not block an otherwise usable release. Stored JSON
+    # missing this key defaults to True to keep the on-disk behaviour aligned with new builds.
+    skip_overlong_names: bool = True
 
     @property
     def is_default(self) -> bool:
@@ -60,6 +66,7 @@ class ConvertOptions:
             "rooted": self.rooted,
             "reencode_textures": self.reencode_textures, "reencode_skyboxes": self.reencode_skyboxes,
             "mapdb": list(self.mapdb) if self.mapdb else None,
+            "skip_overlong_names": self.skip_overlong_names,
         }
 
     @classmethod
@@ -92,7 +99,8 @@ class ConvertOptions:
                 raise ValueError("The generated mapdb.json needs a non-empty name and directory")
             mapdb_t = (name, d)
         return cls(tuple(dict.fromkeys(presets)), tuple(dict.fromkeys(patterns)), root, rooted,
-                   bool(raw.get("reencode_textures")), bool(raw.get("reencode_skyboxes")), mapdb_t)
+                   bool(raw.get("reencode_textures")), bool(raw.get("reencode_skyboxes")), mapdb_t,
+                   _tri_state_default_true(raw.get("skip_overlong_names")))
 
 
 def _str_list(value: Any) -> list[str]:
@@ -103,6 +111,23 @@ def _str_list(value: Any) -> list[str]:
     if isinstance(value, (list, tuple)) and all(isinstance(v, str) for v in value):
         return list(value)
     raise ValueError("Expected a list of strings")
+
+
+def _tri_state_default_true(value: Any) -> bool:
+    """Like ``bool(...)`` but treats absent / empty / None as True (so a missing key means 'enabled').
+
+    Reused for skip-overlong-names: stored JSON from earlier builds lacks the key, and the
+    application default for new jobs is to skip; this helper avoids breaking stored options by
+    silently flipping old records to strict.
+    """
+    if value is None or value == "":
+        return True
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("0", "false", "off", "no"):
+        return False
+    return True
 
 
 def normalise_pattern(pattern: str) -> str:
@@ -159,6 +184,7 @@ def options_from_form(form: Any, defaults: dict[str, str] | None = None, overrid
         "reencode_textures": form.get("reencode_textures"),
         "reencode_skyboxes": form.get("reencode_skyboxes"),
         "mapdb": mapdb,
+        "skip_overlong_names": form.get("skip_overlong_names"),
     }
     for key, value in overrides.items():
         if key in raw and value is not None:

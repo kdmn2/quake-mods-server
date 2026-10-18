@@ -479,8 +479,32 @@ def _resolve_release(source: Path, zf: zipfile.ZipFile, tmpdir: Path, options: C
 
     if not res.winners:
         _block(res, strict, f"{source.name!r} does not contain any representable files")
+    _drop_overlong_winners(res, options.skip_overlong_names)
     _check_winners(res, strict)
     return res
+
+
+def _drop_overlong_winners(res: "_Resolved", skip_overlong_names: bool) -> None:
+    """Drop entries whose final PAK-relative path exceeds the 55-byte Ironwail limit.
+
+    When ``skip_overlong_names`` is True (the application default for new jobs) the entry is
+    moved from ``res.winners`` into ``res.excluded`` with a clear reason and size, so the
+    conversion report lists it and the writer never sees an unrepresentable path.
+
+    When False (strict mode) this function is a no-op and the original validation in
+    ``_check_winners`` still rejects the build with the standard wording.
+    """
+    if not skip_overlong_names:
+        return
+    overlong = []
+    for name, win in list(res.winners.items()):
+        encoded_len = len(name.encode("utf-8"))
+        if encoded_len > MAX_PAK_NAME_BYTES:
+            overlong.append((name, win, encoded_len))
+    for name, win, encoded_len in overlong:
+        reason = f"entry name too long for PAK ({encoded_len} > {MAX_PAK_NAME_BYTES} bytes)"
+        res.excluded.append({"path": name, "reason": reason, "size": win.size})
+        del res.winners[name]
 
 
 def _check_winners(res: _Resolved, strict: bool) -> None:
@@ -574,6 +598,19 @@ def build_single_pak_from_zip(source: Path, target: Path, max_files: int = 5000,
         emit("Reading archive", 0, 1)
         res = _resolve_release(source, zf, tmpdir, options, True, max_files, max_uncompressed_size, progress)
         winners = res.winners
+        if not winners:
+            # All entries were excluded (overlong names, custom patterns, or other policies). Refuse
+            # to write an empty / misleading package; the caller reports the exclusions.
+            overlong = sum(1 for e in res.excluded if "too long" in e["reason"])
+            other = len(res.excluded) - overlong
+            parts = []
+            if overlong:
+                parts.append(f"{overlong} entr{'y' if overlong == 1 else 'ies'} with names too long for PAK")
+            if other:
+                parts.append(f"{other} entr{'y' if other == 1 else 'ies'} excluded by options")
+            detail = "; ".join(parts) or "all entries were excluded"
+            raise ValueError(f"Refusing to write an empty package: {detail}. "
+                             f"Drop the overlong-name policy (or the relevant exclusion options) and rebuild.")
 
         loose_wins = sorted((n, w) for n, w in winners.items() if w.kind == "loose")
         total = sum(w.size for _, w in loose_wins)
@@ -739,6 +776,11 @@ def build_single_pak_from_pak(source: Path, target: Path, *, options: ConvertOpt
         if hit:
             excluded.append({"path": name, "reason": f"{hit[1]} ({hit[0]})", "size": entry["size"]})
             excluded_names.add(name)
+    # The overlong-name skip policy applies to fresh ZIP imports, not to reprocessing an
+    # existing PAK: the input here has already passed `read_pak_directory`'s strict check
+    # (dpackfile_t.name[56]), so any overlong name would have been rejected there first.
+    # We keep this path strict and rely on the final `_validate_reprocess_entries` to raise
+    # if anything unexpected slips through.
     for name in excluded_names:
         del winners[name]
     if not winners:

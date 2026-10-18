@@ -24,6 +24,7 @@ from tools.catalog import (
     validate_package,
     validate_pak_paths,
 )
+from tools.convert_options import ConvertOptions
 
 
 def make_pak_bytes(entries):
@@ -252,7 +253,26 @@ class ZipConversionTests(unittest.TestCase):
         ok_name = "maps/" + "x" * 50                       # 55 bytes
         got, _, _ = self.convert([(ok_name, b"1")])
         self.assertIn(ok_name, got)
-        self.assertRejected([("maps/" + "x" * 51, b"1")], "too long")
+        # Strict mode (the historical default) rejects an overlong name outright.
+        self.assertRejected([("maps/" + "x" * 51, b"1")], "too long",
+                             options=ConvertOptions(skip_overlong_names=False))
+        # Default mode (skip on): every entry overlong → build refused with a clear message.
+        long_name = "maps/" + "x" * 51
+        self.assertRejected([(long_name, b"1")], "Refusing to write an empty package")
+        # Mixed payload: keepable entries survive, the overlong one is recorded in the report.
+        z2 = self.tmp / "mixed.zip"
+        keepable_path = "maps/a.bsp"
+        write_zip(z2, [(keepable_path, b"A"), (long_name, b"X")])
+        out2 = self.tmp / "mixed.pak"
+        info2 = build_single_pak_from_zip(z2, out2)
+        self.assertTrue(out2.is_file())
+        self.assertEqual(parse_pak(out2), {keepable_path: b"A"})            # only the keepable entry survives
+        self.assertIsNotNone(info2["excluded"])                            # the overlong one is in the report
+        self.assertEqual(info2["excluded"]["total"], 1)
+        # The exclusion reason is preserved verbatim; the rule bucket identifies it.
+        by_rule = info2["excluded"]["by_rule"]
+        self.assertEqual(sum(by_rule.values()), 1)
+        self.assertIn("too long", next(iter(by_rule)))
         many = [(f"maps/m{i}.bsp", b"") for i in range(2049)]
         self.assertRejected(many, "2048")
         got, _, _ = self.convert(many[:2048], name="max.zip")
@@ -315,6 +335,179 @@ class ZipConversionTests(unittest.TestCase):
         z.write_bytes(bytes(raw))
         with self.assertRaises(ValueError):
             build_single_pak_from_zip(z, self.tmp / "lie.pak")
+
+
+class OverlongEntryNameTests(unittest.TestCase):
+    """Skip-with-warning vs strict rejection for entries whose final PAK path exceeds
+    Ironwail's 55-byte dpackfile_t.name[56] limit. Covers the user's example
+    (AlbumArt_...{UUID}_Large.jpg) and the related edge cases."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="quake-overlong-tests-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        # 63-byte path used in the user's report; the B5020207-… GUID is 36 chars,
+        # AlbumArt_{…}_Large.jpg = 6 + 36 + 11 = 53, plus music/ prefix = 59 bytes.
+        # Use a path that is exactly the byte count reported: 63 bytes total.
+        self.long_name = "music/AlbumArt_{B5020207-474E-4720-D903-8139E4180600}_Large.jpg"
+        self.keepables = [("maps/start.bsp", b"BSP-DATA-START"),
+                          ("maps/end.bsp", b"BSP-DATA-END"),
+                          ("sound/shot.wav", b"RIFF-WAVE-DATA")]
+
+    def _zip_with(self, *entries):
+        z = self.tmp / "src.zip"
+        write_zip(z, entries)
+        return z
+
+    def test_default_skip_omits_overlong_entry_and_keeps_everything_else(self):
+        """New jobs default to skip-overlong-names. The overlong entry is dropped with a
+        clear exclusion record; all kept entries keep their exact bytes; no name truncation."""
+        z = self._zip_with(*self.keepables, (self.long_name, b"ALBUM-ART-BYTES"))
+        out = self.tmp / "out.pak"
+        info = build_single_pak_from_zip(z, out)                  # default = skip on
+        self.assertTrue(out.is_file())
+        got = parse_pak(out)
+        self.assertEqual(set(got.keys()), {p for p, _ in self.keepables})
+        # Each kept entry's bytes are byte-for-byte preserved.
+        for name, payload in self.keepables:
+            self.assertEqual(got[name], payload, f"bytes of {name} changed")
+        # The overlong entry is in the exclusion record with the documented wording.
+        excl = info["excluded"]
+        self.assertIsNotNone(excl)
+        self.assertEqual(excl["total"], 1)
+        self.assertEqual(excl["bytes"], len(b"ALBUM-ART-BYTES"))
+        # The reason names the entry, the actual byte length, and the limit.
+        rule_text = next(iter(excl["by_rule"]))
+        self.assertIn("too long", rule_text)
+        self.assertIn(str(len(self.long_name.encode("utf-8"))), rule_text)
+        self.assertIn(str(55), rule_text)
+        self.assertEqual(excl["sample"][0]["path"], self.long_name)
+
+    def test_explicit_skip_off_strictly_rejects_overlong_entry(self):
+        """Per-item or settings explicit False → strict rejection. Nothing is dropped."""
+        z = self._zip_with(*self.keepables, (self.long_name, b"X"))
+        out = self.tmp / "out.pak"
+        with self.assertRaises(ValueError) as ctx:
+            build_single_pak_from_zip(z, out, options=ConvertOptions(skip_overlong_names=False))
+        self.assertIn("Entry name too long for PAK", str(ctx.exception))
+        self.assertIn("63 > 55", str(ctx.exception))               # actual byte counts
+        self.assertFalse(out.is_file())                             # no partial output
+
+    def test_exact_byte_boundary_55_passes_through(self):
+        """A 55-byte path is exactly at the limit and must be kept."""
+        ok_path = "maps/" + "x" * 50                                  # 55 bytes total
+        z = self._zip_with((ok_path, b"OK"))
+        out = self.tmp / "out.pak"
+        info = build_single_pak_from_zip(z, out)
+        self.assertIn(ok_path, parse_pak(out))
+        # The entry is kept, so no exclusion should be recorded for it.
+        if info["excluded"]:
+            for sample in info["excluded"]["sample"]:
+                self.assertNotEqual(sample["path"], ok_path)
+
+    def test_one_byte_over_the_boundary_56_is_omitted_in_default_mode(self):
+        """A 56-byte path is over the limit; default skip mode drops it with a clear record."""
+        over_by_one = "maps/" + "x" * 51                              # 56 bytes total
+        z = self._zip_with(("maps/keep.bsp", b"K"), (over_by_one, b"X"))
+        out = self.tmp / "out.pak"
+        info = build_single_pak_from_zip(z, out)
+        self.assertIn("maps/keep.bsp", parse_pak(out))
+        self.assertNotIn(over_by_one, parse_pak(out))
+        rule_text = next(iter(info["excluded"]["by_rule"]))
+        self.assertIn("56 > 55", rule_text)
+
+    def test_multibyte_name_uses_utf8_byte_length_not_char_count(self):
+        """A name with multi-byte characters is counted by UTF-8 bytes (the format's actual encoding)."""
+        # 10 ASCII chars + one 2-byte UTF-8 char (é = 2 bytes) = 12 bytes
+        # A 53-byte path with several é characters at the end:
+        multibyte_name = "maps/αβγδεζηθικλμνξοπ"  # 14 Greek chars * 2 bytes = 28 bytes + 5 ascii = 33 bytes; still under limit
+        # Make it overlong: prefix + many multibyte chars
+        multibyte_overlong = "maps/" + "α" * 30      # 5 + 60 = 65 bytes (over 55)
+        z = self.tmp / "src.zip"
+        write_zip(z, [("maps/αβ.bsp", b"B"), (multibyte_overlong, b"X")])
+        out = self.tmp / "out.pak"
+        info = build_single_pak_from_zip(z, out)
+        self.assertIn("maps/αβ.bsp", parse_pak(out))
+        self.assertNotIn(multibyte_overlong, parse_pak(out))
+        rule_text = next(iter(info["excluded"]["by_rule"]))
+        # 65 bytes (5 ascii + 30 * 2-byte UTF-8) > 55.
+        self.assertIn(f"{len(multibyte_overlong.encode('utf-8'))} > 55", rule_text)
+
+    def test_outer_wrapper_removal_makes_a_path_that_would_have_fit_now_fit(self):
+        """A name that's overlong ONLY because of an outer wrapper directory is still
+        overlong after wrapper removal — this test pins the principle that validation
+        happens after root-mapping/wrapper-removal."""
+        # Without the wrapper: 56 bytes ("maps/" + "x"*51) — overlong.
+        overlong_path = "maps/" + "x" * 51
+        # ZIP wraps it in 'release/'; after wrapper removal the final path is the same
+        # 56 bytes, so skip mode still drops it. (The point is to document behaviour.)
+        z = self.tmp / "src.zip"
+        write_zip(z, [(f"release/{overlong_path}", b"X"), ("release/maps/keep.bsp", b"K")])
+        out = self.tmp / "out.pak"
+        info = build_single_pak_from_zip(z, out)
+        # The release/ wrapper is stripped; the overlong final path is dropped, the keepable one survives.
+        self.assertIn("maps/keep.bsp", parse_pak(out))
+        self.assertNotIn(overlong_path, parse_pak(out))
+        self.assertEqual(info["excluded"]["total"], 1)
+
+    def test_outer_wrapper_removal_can_rescue_a_path_that_otherwise_fits(self):
+        """A path that is overlong in the raw archive but fits after wrapper removal is kept."""
+        # Raw: release/maps/<51 x's> = 7 + 51 = 58 bytes (overlong)
+        # After wrapper removal: maps/<51 x's> = 56 bytes (still overlong by 1) -- pick a case that fits.
+        # Use a wrapper that consumes exactly 5 bytes of headroom:
+        #   raw: w/maps/<49 x's> = 2 + 5 + 49 = 56 (overlong)
+        #   after: maps/<49 x's> = 55 (fits)
+        raw_path = "w/maps/" + "x" * 49                  # 56 bytes raw
+        fits_after = "maps/" + "x" * 49                  # 55 bytes after wrapper removal
+        z = self.tmp / "src.zip"
+        write_zip(z, [(raw_path, b"X"), ("w/maps/keep.bsp", b"K")])
+        out = self.tmp / "out.pak"
+        info = build_single_pak_from_zip(z, out)
+        got = parse_pak(out)
+        self.assertIn(fits_after, got)                      # wrapper-stripped path fits
+        self.assertNotIn(raw_path, got)
+        self.assertIsNone(info["excluded"])                # nothing else was dropped
+
+    def test_skip_default_in_convert_options(self):
+        """ConvertOptions() defaults to skip=True; from_dict({}) defaults to True for the same reason."""
+        self.assertTrue(ConvertOptions().skip_overlong_names)
+        self.assertTrue(ConvertOptions.from_dict({}).skip_overlong_names)
+        # Explicit False round-trips.
+        self.assertFalse(ConvertOptions.from_dict({"skip_overlong_names": "0"}).skip_overlong_names)
+        self.assertFalse(ConvertOptions.from_dict({"skip_overlong_names": False}).skip_overlong_names)
+        # Stored JSON missing the key defaults to True (preserves "skip on" for older records).
+        self.assertTrue(ConvertOptions.from_dict({"reencode_textures": True}).skip_overlong_names)
+
+    def test_no_usable_entries_remaining_is_rejected_not_silently_packed(self):
+        """Every entry overlong → refuse to write an empty package with a clear message."""
+        z = self.tmp / "src.zip"
+        write_zip(z, [(self.long_name, b"X"), ("sound/" + "x" * 49 + ".wav", b"X")])  # both overlong
+        out = self.tmp / "out.pak"
+        with self.assertRaises(ValueError) as ctx:
+            build_single_pak_from_zip(z, out)
+        self.assertIn("Refusing to write an empty package", str(ctx.exception))
+        self.assertIn("too long", str(ctx.exception))
+        self.assertFalse(out.is_file())                     # no partial output
+
+    def test_existing_traversal_and_collision_checks_still_reject_unsafe_input(self):
+        """The overlong-name policy does NOT become a general 'ignore invalid files' switch:
+        traversal, collision, and other archive safety checks still raise."""
+        for bad in ("../evil", "/abs/evil", "C:/evil"):
+            with self.subTest(bad=bad):
+                z = self.tmp / "bad.zip"
+                write_zip(z, [(bad, b"x")])
+                with self.assertRaises(ValueError):
+                    build_single_pak_from_zip(z, self.tmp / "bad.pak")
+
+    def test_report_keeps_full_path_text_for_overlong_exclusion(self):
+        """The conversion report preserves the full path text of the excluded entry
+        (the GUI may shorten it visually but the stored record does not)."""
+        z = self.tmp / "src.zip"
+        write_zip(z, [("maps/keep.bsp", b"K"), (self.long_name, b"X")])
+        out = self.tmp / "out.pak"
+        info = build_single_pak_from_zip(z, out)
+        # The full path is in the sample (not truncated):
+        self.assertEqual(info["excluded"]["sample"][0]["path"], self.long_name)
+        self.assertEqual(len(info["excluded"]["sample"][0]["path"]), 63)
 
 
 class PakValidationTests(unittest.TestCase):
