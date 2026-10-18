@@ -737,7 +737,7 @@ class QuaddictedService:
             with self.db() as c:
                 synced_at = last_synced_at(c)
             age = human_age(synced_at) if synced_at else None
-            ctx = self.context(entries=[e.view() for e in found], known=known, total=total,
+            ctx = self.context(entries=[e.view() for e in found], known=known, matching=total,
                                q=query, kind=kind, mode=mode, sort=sort if sort in SORTS else "title",
                                page=page, pages=pages, age=age, submit_key=uuid.uuid4().hex,
                                max_items=int(self.cfg("BATCH_MAX_ITEMS", 50)))

@@ -7,7 +7,7 @@
     search and browsing do not query Quaddicted, and packages are downloaded only when you import them. Import, inspection,
     conversion and publishing go through exactly the same pipeline as the other import sources.</p>
 
-  {% if total == 0 and not synced_at %}
+  {% if index_total == 0 and not synced_at %}
   <div class="sev info">
     The local copy of the Quaddicted catalogue is empty. <form method="post" action="{{ url_for('quaddicted_sync') }}" style="display:inline">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">Fetch the catalogue now</button></form>
@@ -15,7 +15,7 @@
   </div>
   {% else %}
   <div class="sev info">
-    Local copy: <strong>{{ total }}</strong> entr{{ 'y' if total == 1 else 'ies' }}.
+    Local copy: <strong>{{ index_total }}</strong> entr{{ 'y' if index_total == 1 else 'ies' }}.
     {% if synced_at %}Last refreshed <span title="{{ synced_at }}">{{ age }}</span>{% else %}Never fully refreshed{% endif %}.
     <form method="post" action="{{ url_for('quaddicted_sync') }}" style="display:inline">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit" title="{{ min_sync_seconds }}s minimum between refreshes">Refresh now</button></form>
@@ -76,7 +76,7 @@
       </tbody>
     </table>
     <p class="small muted">
-      Showing {{ entries|length }} of {{ total }} matching entr{{ 'y' if total == 1 else 'ies' }} (local copy). Page {{ page }} of {{ pages }}.
+      Showing {{ entries|length }} of {{ matching }} matching entr{{ 'y' if matching == 1 else 'ies' }} (local copy). Page {{ page }} of {{ pages }}.
       {% if page > 1 %}<a href="{{ url_for('quaddicted_home', q=q, type=kind, mode=mode, sort=sort, page=page - 1) }}">Previous</a>{% endif %}
       {% if page < pages %}<a href="{{ url_for('quaddicted_home', q=q, type=kind, mode=mode, sort=sort, page=page + 1) }}">Next</a>{% endif %}
     </p>
