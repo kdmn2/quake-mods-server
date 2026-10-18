@@ -12,15 +12,22 @@
     <span class="mono">{{ entry.filename }}</span>{% endif %}</p>
 
   {% if entry.status %}
-    {% if entry.status.state == 'published' %}
+    {% set s = entry.status %}
+    {% if s.state == 'published' %}
     <div class="sev info">A published add-on was imported from this exact entry:
-      <a href="{{ url_for('addon_detail', addon_id=entry.status.addon_pk) }}">{{ entry.status.addon_id }}</a>.
+      <a href="{{ url_for('addon_detail', addon_id=s.addon_pk) }}">{{ s.addon_id }}</a>.
       Importing again would create a separate draft, not replace it — use the batch page or the add-on page for replacements.</div>
-    {% elif entry.status.state == 'draft' %}
+    {% elif s.state == 'draft' %}
     <div class="sev info">A draft was already created from this exact entry:
-      <a href="{{ url_for('addon_detail', addon_id=entry.status.addon_pk) }}">{{ entry.status.addon_id }}</a>.</div>
-    {% elif entry.status.state == 'queued' %}
-    <div class="sev info">This entry is already queued or being converted in a batch import.</div>
+      <a href="{{ url_for('addon_detail', addon_id=s.addon_pk) }}">{{ s.addon_id }}</a>.</div>
+    {% elif s.state == 'active' %}
+    <div class="sev info">This entry is <a href="{{ url_for('batch_page', batch_id=s.batch_id) }}">being imported in batch {{ s.batch_id }}</a>. Importing would duplicate it.</div>
+    {% elif s.state == 'review' %}
+    <div class="sev warning">A previous import is <a href="{{ s.review_url }}">waiting for review</a> (batch {{ s.batch_id }}). Continue it, discard it there, or import again below — that creates a new attempt.</div>
+    {% elif s.state == 'decision' %}
+    <div class="sev warning">A previous import in <a href="{{ url_for('batch_page', batch_id=s.batch_id, fragment='1') }}#item-{{ s.item_id }}">batch {{ s.batch_id }}</a> needs a decision (ID or directory conflict). Decide there, or import again below.</div>
+    {% elif s.state == 'retryable' %}
+    <div class="sev warning">A previous import attempt in <a href="{{ url_for('batch_page', batch_id=s.batch_id, fragment='1') }}#item-{{ s.item_id }}">batch {{ s.batch_id }}</a> failed. Retry it there, or import again below.</div>
     {% endif %}
   {% endif %}
 

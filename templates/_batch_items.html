@@ -3,13 +3,15 @@
     <thead><tr><th>#</th><th>Source</th><th>Status</th><th>Progress</th><th>Result</th><th></th></tr></thead>
     <tbody>
     {% for it in items %}
-    <tr>
+    <tr id="item-{{ it.id }}">
       <td>{{ it.position }}</td>
       <td>
         <div>{{ it.display }}</div>
-        <div class="small muted">{{ 'Remote link' if it.source_type == 'url' else 'Server folder' }}{% if it.final_name %} · {{ it.final_name }}{% endif %}{% if it.sha256 %} · SHA-256 {{ it.sha256 }}…{% endif %}</div>
+        <div class="small muted">{{ 'Remote link' if it.source_type == 'url' else 'Server folder' if it.source_type == 'folder' else 'Quaddicted' }}{% if it.final_name %} · {{ it.final_name }}{% endif %}{% if it.sha256 %} · SHA-256 {{ it.sha256 }}…{% endif %}</div>
       </td>
-      <td><span class="pill {{ it.state }}">{{ it.label }}</span>{% if it.attempts > 1 %} <span class="small muted">attempt {{ it.attempts }}</span>{% endif %}</td>
+      <td><span class="pill {{ it.state }}">{{ it.label }}</span>{% if it.attempts > 1 %} <span class="small muted">attempt {{ it.attempts }}</span>{% endif %}
+        {% if it.stale_review %}<div class="sev warning">This review has been waiting <strong>{{ it.updated_text }}</strong>; if it is abandoned, discard it below.</div>{% endif %}
+      </td>
       <td>
         {% if it.stage %}
           <div class="small">{{ it.stage }}</div>
@@ -22,6 +24,7 @@
           {% if it.message|length > 110 %}<details><summary>{{ it.message[:100] }}…</summary><div class="small">{{ it.message }}</div></details>
           {% else %}<div class="small {{ 'error' if it.state in ('failed', 'interrupted') else '' }}">{{ it.message }}</div>{% endif %}
         {% endif %}
+        {% if it.open_links %}{% for title, aid, url in it.open_links %}<div><a href="{{ url }}">Open existing add-on “{{ title }}” ({{ aid }})</a></div>{% endfor %}{% endif %}
         {% if it.addon_url %}<div><a href="{{ it.addon_url }}">{% if it.state == 'completed' %}Open the draft{% else %}Open the existing add-on{% endif %}</a></div>{% endif %}
         {% if it.review_url %}<div><a href="{{ it.review_url }}"><strong>Review and build</strong></a></div>{% endif %}
         {% for value, text in it.choices %}

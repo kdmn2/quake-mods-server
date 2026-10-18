@@ -31,7 +31,7 @@ from flask import abort, flash, jsonify, redirect, render_template, request, url
 from tools import batchstore as store
 from tools import localscan, netfetch
 from tools.jobs import JobCancelled, JobFailed, JobOutcome
-from tools.quaddicted import source_key as source_key_of
+from tools.quaddicted import source_key as source_key_of, human_age
 
 STATE_LABELS = {
     "queued": "Queued", "acquiring": "Fetching", "converting": "Converting", "awaiting_review": "Needs review", "needs_decision": "Needs a decision",
@@ -63,6 +63,14 @@ def quaddicted_source_meta(item) -> dict[str, Any]:
         return {}
 
 
+def _record_view(record) -> dict[str, Any] | None:
+    """Sanitised view of an existing add-on record for conflict displays (title/ID/directory/publication state)."""
+    if record is None:
+        return None
+    return {"pk": record["id"], "addon_id": record["addon_id"], "title": record["title"] or record["addon_id"],
+            "gamedir": record["gamedir"], "published": bool(record["published"])}
+
+
 def form_from_item(item, final_name: str, addon_id: str) -> dict[str, str]:
     """The draft's starting metadata. Upstream (Quaddicted) metadata is only a suggestion: it lands in editable form fields
     and never overwrites a record the administrator has already edited (replacement flows reuse the existing values)."""
@@ -82,6 +90,8 @@ def form_from_item(item, final_name: str, addon_id: str) -> dict[str, str]:
 
 
 class BatchService:
+    slugify = staticmethod(slugify)             # exposed for the Quaddicted preview (quaddicted.py must not import batch_import)
+
     def __init__(self, app, core):
         self.app = app
         self.core = core
@@ -125,7 +135,8 @@ class BatchService:
     def create_quaddicted_batch(self, prepared: list[dict[str, str]], submit_key: str | None) -> dict[str, Any]:
         """prepared items come from the Quaddicted service: one selected entry each, with the resolved canonical download URL.
         Duplicate detection (same entry already queued, same bytes already imported) works through source_key and
-        source_sha256 like every other source."""
+        source_sha256 like every other source. An item that is already being imported is reported, not queued again; an
+        empty batch is never created."""
         if not prepared:
             return {"error": "Nothing to import."}
         max_items = int(self.cfg("BATCH_MAX_ITEMS", 50))
@@ -140,14 +151,18 @@ class BatchService:
             c.execute("BEGIN IMMEDIATE")
             try:
                 batch_id = store.create_batch(c, "quaddicted", f"{len(prepared)} Quaddicted package(s)", submit_key)
-                item_ids, already = [], 0
+                item_ids, already = [], []
                 for pos, p in enumerate(prepared):
                     key = source_key_of(p["sha256"])
                     if store.active_for_source(c, key):
-                        already += 1
+                        already.append(p["display"])
                         continue
                     item_ids.append(store.add_item(c, batch_id, pos, "quaddicted", key, p["display"], source_url=p["url"],
                                                    source_json=p["source_json"]))
+                if not item_ids:
+                    c.execute("ROLLBACK")
+                    return {"error": "Everything selected is already queued or waiting for a decision in an earlier import; nothing was added.",
+                            "handled": already}
                 c.execute("COMMIT")
             except Exception:
                 c.execute("ROLLBACK")
@@ -173,17 +188,24 @@ class BatchService:
             c.execute("BEGIN IMMEDIATE")
             try:
                 batch_id = store.create_batch(c, "url", f"{len(accepted)} remote link(s)", submit_key)
-                item_ids = []
+                item_ids, already = [], []
                 for pos, (_, parsed) in enumerate(accepted):
+                    if store.active_for_source(c, netfetch.url_key(parsed.url)):
+                        already.append(netfetch.redact_url(parsed.url))
+                        continue
                     item_ids.append(store.add_item(c, batch_id, pos, "url", netfetch.url_key(parsed.url), netfetch.redact_url(parsed.url),
                                                    source_url=parsed.url, host=parsed.host))
+                if not item_ids:
+                    c.execute("ROLLBACK")
+                    return {"error": "Every link is already queued or waiting for a decision in an earlier import; nothing was added.",
+                            "handled": already}
                 c.execute("COMMIT")
             except Exception:
                 c.execute("ROLLBACK")
                 raise
         for item_id in item_ids:
             self._submit_acquire(item_id)
-        return {"batch_id": batch_id, "duplicates": dups}
+        return {"batch_id": batch_id, "duplicates": dups, "already_queued": already}
 
     def create_folder_batch(self, scan_id: str, selected: list[str], select_all: bool, submit_key: str | None) -> dict[str, Any]:
         with self.db() as c:
@@ -222,14 +244,18 @@ class BatchService:
             c.execute("BEGIN IMMEDIATE")
             try:
                 batch_id = store.create_batch(c, "folder", f"{len(chosen)} file(s) from {root.label}", submit_key)
-                item_ids, already = [], 0
+                item_ids, already = [], []
                 for pos, e in enumerate(chosen):
                     key = hashlib.sha256(f"folder\0{root.path}\0{e['rel']}".encode()).hexdigest()
                     if store.active_for_source(c, key):
-                        already += 1
+                        already.append(e["rel"])
                         continue
                     item_ids.append(store.add_item(c, batch_id, pos, "folder", key, f"{root.label}/{e['rel']}", folder_root=root.index, folder_rel=e["rel"],
                                                    src_size=e["size"], src_mtime_ns=e["mtime_ns"], src_ino=e["ino"], src_dev=e["dev"]))
+                if not item_ids:
+                    c.execute("ROLLBACK")
+                    return {"error": "Every selected file is already queued or waiting for a decision in an earlier import; nothing was added.",
+                            "handled": [f"{root.label}/{rel}" for rel in already]}
                 c.execute("COMMIT")
             except Exception:
                 c.execute("ROLLBACK")
@@ -377,7 +403,14 @@ class BatchService:
         base = slugify(final_name)
         reason = None
         with self.db() as c:
-            taken = c.execute("SELECT id, addon_id, gamedir FROM addons WHERE addon_id = ? OR gamedir = ? LIMIT 1", (base, base)).fetchone()
+            # an add-on ID and an install directory can both match — check each separately: they may point to different records
+            id_record = c.execute("SELECT id, addon_id, gamedir, title, published FROM addons WHERE addon_id = ? LIMIT 1", (base,)).fetchone()
+            dir_record = c.execute("SELECT id, addon_id, gamedir, title, published FROM addons WHERE gamedir = ? AND id != ? LIMIT 1",
+                                   (base, id_record["id"] if id_record else -1)).fetchone()
+            records = [r for r in (id_record, dir_record) if r]
+            taken = records[0] if records else None
+            crossed = ({"id_record": _record_view(id_record), "dir_record": _record_view(dir_record)}
+                       if id_record and dir_record and id_record["id"] != dir_record["id"] else None)
             prev_addon = c.execute("SELECT id, addon_id FROM addons WHERE id = ?", (previous["addon_pk"],)).fetchone() if previous else None
             if prev_addon and previous["sha256"] != item["sha256"]:
                 reason, existing = "changed", prev_addon
@@ -390,11 +423,15 @@ class BatchService:
             reason = None
         if reason and not item["force"]:
             self.core.save_import(token, "new", None, form, source, final_name, fmt, owns_source=True, keep_source=False, review=True, batch_item_id=item_id)
-            action = {"kind": reason, "existing_addon_pk": existing["id"], "existing_id": existing["addon_id"], "suggested_id": new_id}
+            action = {"kind": reason, "existing_addon_pk": existing["id"], "existing_id": existing["addon_id"], "suggested_id": new_id,
+                      "existing_records": crossed or None}
+            message = ("The content at this source changed since it was imported as add-on '%s'." % existing["addon_id"]) if reason == "changed" \
+                else f"An add-on with the ID or directory '{base}' already exists."
+            if crossed:
+                message += " Note: the ID and the install directory match different add-ons; both are listed below."
             with self.db() as c:
                 store.transition(c, item_id, ("acquiring",), "needs_decision", action_json=json.dumps(action), derived_json=json.dumps(form),
-                                 message=("The content at this source changed since it was imported as add-on '%s'." % existing["addon_id"]) if reason == "changed"
-                                 else f"An add-on with the ID or directory '{base}' already exists.")
+                                 message=message)
             return JobOutcome("Waiting for a decision.", "info")
         self.core.save_import(token, "new", None, form, source, final_name, fmt, owns_source=True, keep_source=False, review=False, batch_item_id=item_id)
         with self.db() as c:
@@ -624,6 +661,7 @@ class BatchService:
             "label": STATE_LABELS.get(state, state), "message": item["message"], "attempts": item["attempts"], "final_name": item["final_name"],
             "sha256": (item["sha256"] or "")[:12], "addon_url": url_for("addon_detail", addon_id=item["addon_pk"]) if item["addon_pk"] else None,
             "review_url": url_for("import_plan", token=item["import_token"]) if state in ("awaiting_review",) and item["import_token"] else None,
+            "updated_at": item["updated_at"], "stale_review": False,
             "stage": "", "done": 0, "total": 0, "percent": None, "choices": [], "can_retry": state in store.RETRYABLE,
             "can_cancel": state in store.ACTIVE + store.WAITING,
         }
@@ -634,12 +672,23 @@ class BatchService:
                 view["percent"] = round(100 * min(1, view["done"] / view["total"]))
         elif state == "queued":
             view["stage"] = "Waiting to start…"
+        view["stale_review"] = state in store.WAITING and (time.time() - item["updated_at"] > float(self.cfg("BATCH_REVIEW_MAX_AGE_DAYS", 7)) * 86400)
+        if view["stale_review"]:
+            view["updated_text"] = human_age(item["updated_at"])
         action = json.loads(item["action_json"] or "{}")
         if state == "needs_decision":
-            view["choices"] = [("new_id", f"Create a separate draft as '{action.get('suggested_id', '…')}'")]
+            incoming = action.get("existing_records")
+            view["conflict_records"] = incoming or None
+            if incoming:
+                view["open_links"] = [(r["title"], r["addon_id"], url_for("addon_detail", addon_id=r["pk"])) for r in incoming.values()]
+            elif action.get("existing_addon_pk"):
+                view["open_links"] = [(action.get("existing_id"), action.get("existing_id"),
+                                       url_for("addon_detail", addon_id=action["existing_addon_pk"]))]
+            choices = [("new_id", f"Create a separate draft as '{action.get('suggested_id', '…')}'")]
             if action.get("existing_addon_pk"):
-                view["choices"].append(("replace", f"Review as a replacement for '{action.get('existing_id')}'"))
-            view["choices"].append(("skip", "Skip this one"))
+                choices.append(("replace", f"Review as a replacement for '{action.get('existing_id')}'"))
+            choices.append(("skip", "Skip this one"))
+            view["choices"] = choices
         elif state == "skipped" and action.get("kind") in ("identical-source", "identical-output"):
             view["choices"] = [("import_anyway", "Import anyway as a separate draft")]
         return view
@@ -785,7 +834,8 @@ class BatchService:
                 flash(result["error"], "error")
                 return redirect(url_for("batch_scan_results", scan_id=scan_id) if scan_id else url_for("batch_home"))
             if result.get("already_queued"):
-                flash(f"{result['already_queued']} file(s) were already queued and were not added again.", "success")
+                n = len(result["already_queued"])
+                flash(f"{n} file(s) were already being imported and not added to this batch; see their original batch (listed under Recent batches).", "success")
             return redirect(url_for("batch_page", batch_id=result["batch_id"]))
 
         @app.route("/batches/<int:batch_id>")

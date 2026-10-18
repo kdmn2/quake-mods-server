@@ -404,15 +404,18 @@ imports record upstream provenance (entry ID, canonical page, upstream update ti
 
 ### Jobs, progress and recovery
 
+* Statuses are reachable from the Quaddicted page too: each catalogue entry shows its local state chip — *Not imported*, *Importing now*, *Needs review*, *Needs a decision*, *Failed before*, *Imported (draft/published)* — each linking to the batch, the review page, or the mod record, so a dead-end import warning never hides where to act. A review that has been waiting for days is flagged (suggesting discard; nothing is ever discarded automatically; bound: `BATCH_REVIEW_MAX_AGE_DAYS`, default 7).
+
 * Each package is its own item with its own state: *queued, fetching, converting, needs review, needs a decision, draft created, skipped, failed, cancelled, interrupted*. One failure never stops the others. The batch page shows source type, a safe description, progress (a percentage only where the total is known), the draft link and expandable errors, and keeps working after you close or refresh the page.
 * Work runs in two fixed-size lanes shared by **every** import source (browser uploads, publishing, URL batches, folder batches): `BATCH_DOWNLOAD_WORKERS` downloads/copies at once (default 2) and one conversion/publish at a time. A slow remote therefore never blocks conversions or publishing.
 * Per-item **Cancel** (and *Cancel all remaining*) removes only that item's staged files. A download that is stalled ends at the latest after `BATCH_READ_TIMEOUT` seconds of server silence. **Retry** and *Retry all failed* re-run an item from the start; a double click or a second tab cannot start it twice, and the database allows only one draft per item, so a retry (even after a crash right after the draft was saved) cannot create a duplicate.
 * **After a restart**, items that were queued or in flight are marked *interrupted* and their partial staging files are removed. Nothing is retried automatically: press Retry. Items waiting for review or a decision keep their staged package and survive the restart.
-* **When a package needs a person:** a release the converter cannot resolve by itself (ambiguous root, too many entries) becomes *needs review* with a link to the normal review page, which builds from the already-downloaded file. A conflict becomes *needs a decision*. Nothing is guessed or overwritten.
+* **When a package needs a person:** a release the converter cannot resolve by itself (ambiguous root, too many entries) becomes *needs review* with a link to the normal review page, which builds from the already-downloaded file; when the layout leaves an unrecognised top-level folder that belongs to the release, the review page also offers *Treat the archive root as the mod* (explicit, recorded as `selected-rooted`). A conflict becomes *needs a decision*, showing both the incoming package and the existing record(s) — ID and install directory are checked separately, and if they point at two different add-ons, both are listed with an *open* link. Nothing is guessed or overwritten.
 
 | Situation | What happens |
 | --- | --- |
 | Same link twice in one list | Imported once |
+| Same link submitted while an earlier import of it is queued or waiting | *Reported, not queued again*: the batch page's recent list tells you where the first attempt lives |
 | Same bytes already imported (any name or source) | *Skipped*, linked to the existing add-on; *Import anyway* creates a separate draft |
 | Different bytes convert to a package identical to an existing add-on | *Skipped* (nothing installed); *Import anyway* available |
 | Add-on ID / directory already exists | *Needs a decision*: separate draft with a new ID, review as a replacement, or skip |
@@ -445,6 +448,7 @@ All optional; defaults shown. Set them as container environment variables (Unrai
 | `BATCH_MAX_REDIRECTS` | 5 | Redirects followed |
 | `BATCH_MAX_ATTEMPTS` / `BATCH_RETRY_BASE` / `BATCH_RETRY_AFTER_MAX` | 3 / 2 s / 120 s | Download attempts, backoff base, longest `Retry-After` honoured |
 | `BATCH_RETENTION_DAYS` | 14 | How long finished batches (and any stored links) are kept |
+| `BATCH_REVIEW_MAX_AGE_DAYS` | 7 | Age after which a waiting review/decision is flagged as possibly abandoned (never auto-discarded) |
 
 ### Storage, backup and limits
 

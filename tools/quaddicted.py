@@ -497,27 +497,51 @@ def distinct_values(conn: sqlite3.Connection, column: str) -> list[str]:
 
 
 def imported_status(conn: sqlite3.Connection, shas: list[str]) -> dict[str, dict[str, Any]]:
-    """Which of these entries already exist locally: a completed draft (by source hash) or an active batch item."""
+    """For each entry: what exists locally, with the links an administrator needs.
+
+    States: queued/acquiring/converting -> "active"; awaiting_review/needs_decision -> "review"/"decision" (staged work
+    that blocks a new import until continued or discarded, never silently dropped); failed/cancelled/interrupted -> "retryable"
+    (a previous attempt failed; a new import is made possible); completed -> "draft"/"published"; skipped -> "skipped".
+    Returns per sha256: {state, addon_id?, addon_pk?, batch_id?, item_id?, review_url?}.
+    """
     from tools import batchstore as store  # noqa: PLC0415  (import inside to keep this module import-light)
+    from flask import url_for  # noqa: PLC0415
     out: dict[str, dict[str, Any]] = {}
     clean = [s for s in shas if _SHA.match(s or "")]
     for i in range(0, len(clean), 400):
         chunk = clean[i:i + 400]
         marks = ", ".join("?" * len(chunk))
         for row in conn.execute(f"SELECT source_sha256, id, addon_id, published FROM addons WHERE source_sha256 IN ({marks})", chunk).fetchall():
-            out[row["source_sha256"]] = {"state": "published" if row["published"] else "draft", "addon_id": row["addon_id"], "addon_pk": row["id"]}
-        keys = [hashlib.sha256(f"quaddicted\0{s}".encode()).hexdigest() for s in chunk]
+            out[row["source_sha256"]] = {"state": "published" if row["published"] else "draft",
+                                         "addon_id": row["addon_id"], "addon_pk": row["id"]}
+        keys = {hashlib.sha256(f"quaddicted\0{s}".encode()).hexdigest(): s for s in chunk}
         kmarks = ", ".join("?" * len(keys))
-        for row in conn.execute(f"SELECT source_key, state FROM batch_items WHERE source_key IN ({kmarks}) AND state NOT IN ('failed','cancelled','interrupted')", keys).fetchall():
-            sha = _sha_from_key(row["source_key"])
-            if sha and sha not in out:
-                out[sha] = {"state": "queued" if row["state"] != "skipped" else "skipped", "addon_id": None, "addon_pk": None}
+        for item in conn.execute(f"SELECT * FROM batch_items WHERE source_key IN ({kmarks}) AND state != 'cancelled' ORDER BY id DESC", tuple(keys)).fetchall():
+            sha = keys.get(item["source_key"])
+            if not sha or sha in out:
+                continue
+            base = {"batch_id": item["batch_id"], "item_id": item["id"],
+                    "item_url": url_for("batch_page", batch_id=item["batch_id"], fragment="1") + f"#item-{item['id']}"}
+            if item["state"] in store.ACTIVE:
+                info = {"state": "active", "label": "Importing now"}
+            elif item["state"] == "awaiting_review":
+                info = {"state": "review", "label": "Needs review", "review_url": url_for("import_plan", token=item["import_token"]) if item["import_token"] else None}
+            elif item["state"] == "needs_decision":
+                info = {"state": "decision", "label": "Needs a decision"}
+            elif item["state"] in store.RETRYABLE:
+                info = {"state": "retryable", "label": "Previous attempt failed"}
+            elif item["state"] == "skipped":
+                info = {"state": "skipped", "label": "Skipped before"}
+            else:                          # completed without an addon row (bookkeeping hiccup) is not a blocker
+                continue
+            out[sha] = {**base, **info, "addon_id": None, "addon_pk": None}
     return out
 
 
-def _sha_from_key(source_key: str) -> str | None:
-    prefix = "quaddicted\0"
-    return source_key.split("\0", 1)[1] if source_key.startswith(prefix) else None
+def conflict_view(record) -> dict[str, Any]:
+    """An existing add-on record as shown in the import preview (id/directory/title/publication state; escaped by Jinja)."""
+    return {"pk": record["id"], "addon_id": record["addon_id"], "title": record["title"] or record["addon_id"],
+            "gamedir": record["gamedir"], "published": bool(record["published"])}
 
 
 def source_key(sha256: str) -> str:
@@ -690,7 +714,7 @@ class QuaddictedService:
             synced_at = last_synced_at(c)
             types = distinct_values(c, "types_json")
             modes = distinct_values(c, "game_modes_json")
-        return {"total": total, "synced_at": synced_at, "types": types, "modes": modes, "page_size": PAGE_SIZE,
+        return {"total": total, "index_total": total, "synced_at": synced_at, "types": types, "modes": modes, "page_size": PAGE_SIZE,
                 "min_sync_seconds": int(SYNC_MIN_SECONDS), "api_reference": API_BASE, **extra}
 
     def sync_started_recently(self, conn) -> float:
@@ -763,19 +787,55 @@ class QuaddictedService:
             if not shas:
                 flash("Select at least one Quaddicted entry to import.", "error")
                 return redirect(url_for("quaddicted_home"))
-            result = self.import_prepared(shas)
-            if not result["prepared"]:
-                flash("Nothing could be imported: " + "; ".join(f"{s}: {reason}" for s, reason in result["problems"]), "error")
+            items = self.import_prepared(shas)
+            problems = items["problems"]
+            prepared = items["prepared"]
+            if request.form.get("preview"):
+                # O3: explicit preview — what would be queued, what is already active/waiting/retryable, and which
+                # add-on IDs/directories would conflict. Nothing is queued on this step.
+                with self.db() as c:
+                    known = imported_status(c, shas)
+                    conflicts: dict[str, list[dict[str, Any]]] = {}
+                    for sha in shas:
+                        entry = get_entry(c, sha)
+                        if entry is None:
+                            continue
+                        base = batch.slugify(entry.filename or entry.sha256[:12])
+                        hits = c.execute("SELECT id, addon_id, gamedir, title, published FROM addons WHERE addon_id = ? OR gamedir = ?", (base, base)).fetchall()
+                        if hits:
+                            conflicts[sha] = [conflict_view(r) for r in hits]
+                rows = []
+                for p in prepared:
+                    s = known.get(p["sha256"]) or {}
+                    state = s.get("state")
+                    hint = ("already being imported — it will not be added again" if state == "active" else
+                            "waiting for review in an earlier import — not added again" if state in ("review", "decision") else
+                            "a previous attempt failed — importing creates a fresh attempt" if state == "retryable" else
+                            "a draft already exists — the import becomes a skip/review decision" if state == "draft" else
+                            "a published add-on already exists — the import becomes a decision" if state == "published" else
+                            "new — will be queued")
+                    rows.append({"display": p["display"], "sha": p["sha256"], "hint": hint, "conflicts": conflicts.get(p["sha256"]),
+                                 "problems": [r for s, r in problems if s[:12] == p["sha256"][:12]]})
+                return render_template("quaddicted_confirm.html", rows=rows, problems=problems, total=len(shas),
+                                       submit_key=uuid.uuid4().hex, max_items=int(self.cfg("BATCH_MAX_ITEMS", 50)))
+            if not prepared:
+                flash("Nothing to import: " + "; ".join(f"{s[:12]}: {reason}" for s, reason in problems), "error")
                 return redirect(url_for("quaddicted_home"))
-            created = batch.create_quaddicted_batch(result["prepared"], request.form.get("submit_key") or None)
+            created = batch.create_quaddicted_batch(prepared, request.form.get("submit_key") or None)
             if "batch_id" not in created:
-                flash(created["error"], "error")
+                # Show what is already being handled instead of a dead end; the browse page's status column links each one.
+                handled = created.get("handled") or []
+                message = created["error"]
+                shown = "; ".join(handled[:8]) + (f" (and {len(handled) - 8} more)" if len(handled) > 8 else "")
+                flash(message + (" Already handled: " + shown if shown else ""), "warning" if handled else "error")
                 return redirect(url_for("quaddicted_home"))
-            if result["problems"]:
+            if problems:
                 flash("Some entries could not be imported: "
-                      + "; ".join(f"{s}: {reason}" for s, reason in result["problems"]), "warning")
+                      + "; ".join(f"{s[:12]}: {reason}" for s, reason in problems), "warning")
             if created.get("already_queued"):
-                flash(f"{created['already_queued']} selected entr{'y was' if created['already_queued'] == 1 else 'ies were'} already queued in an earlier import and were not added again.", "success")
+                n = len(created["already_queued"])
+                flash(f"{n} selected entr{'y was' if n == 1 else 'ies were'} already being imported and not added to this batch; "
+                      "the status column on the Quaddicted page links each one.", "success")
             return redirect(url_for("batch_page", batch_id=created["batch_id"]))
 
         @app.route("/quaddicted/sync", methods=["POST"])

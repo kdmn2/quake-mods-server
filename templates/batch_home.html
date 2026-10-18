@@ -58,7 +58,12 @@
   <h3>Recent batches</h3>
   <table class="table-sm">
     {% for b in recent %}
-    <tr><td><a href="{{ url_for('batch_page', batch_id=b.id) }}">#{{ b.id }} · {{ b.label }}</a></td>
+    {% set active_n = (b.counts.get('queued', 0) + b.counts.get('acquiring', 0) + b.counts.get('converting', 0)) %}
+    {% set waiting_n = (b.counts.get('awaiting_review', 0) + b.counts.get('needs_decision', 0)) %}
+    {% set failed_n = (b.counts.get('failed', 0) + b.counts.get('interrupted', 0)) %}
+    {% set skipped_n = (b.counts.get('skipped', 0) + b.counts.get('cancelled', 0)) %}
+    <tr><td><a href="{{ url_for('batch_page', batch_id=b.id) }}">#{{ b.id }} · {{ b.label }}</a>
+        <span class="small muted">— {{ b.counts.get('completed', 0) }} draft(s) created{% if active_n %}, {{ active_n }} in progress{% endif %}{% if waiting_n %}, {{ waiting_n }} waiting on you{% endif %}{% if failed_n %}, {{ failed_n }} failed{% endif %}{% if skipped_n %}, {{ skipped_n }} skipped/cancelled{% endif %}</span>
       <td>{% for state, label in labels.items() %}{% if b.counts.get(state) %}<span class="pill {{ state }}">{{ label }}: {{ b.counts[state] }}</span> {% endif %}{% endfor %}</td></tr>
     {% endfor %}
   </table>

@@ -1,0 +1,39 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="card">
+  <h2>Preview the import</h2>
+  <p class="small muted">{{ total }} entr{{ 'y' if total == 1 else 'ies' }} selected. Nothing has been queued yet — check the list, then confirm below.</p>
+  {% if problems %}
+  <div class="sev warning"><strong>These entries cannot be prepared (they are not part of the import):</strong>
+    <ul>{% for s, reason in problems[:20] %}<li><span class="mono">{{ s[:12] }}</span> — {{ reason }}</li>{% endfor %}</ul></div>
+  {% endif %}
+  <table class="table-sm">
+    <thead><tr><th>Package</th><th>What will happen</th><th>Conflicts</th></tr></thead>
+    <tbody>
+    {% for r in rows %}
+    <tr>
+      <td><span class="mono">{{ r.display }}</span><div class="small muted mono">{{ r.sha[:12 ] }}</div></td>
+      <td>{{ r.hint }}</td>
+      <td>
+        {% if r.conflicts %}
+          <ul class="small">{% for c in r.conflicts %}
+            <li>ID/directory <span class="mono">{{ c.addon_id }}</span>{{ '/' if c.gamedir != c.addon_id }}{% if c.gamedir != c.addon_id %} <span class="mono">{{ c.gamedir }}</span>{% endif %}
+              — “{{ c.title }}”{% if c.published %} (published){% else %} (draft){% endif %}
+              <a href="{{ url_for('addon_detail', addon_id=c.pk) }}">open</a></li>{% endfor %}</ul>
+        {% elif r.problems %}<span class="error small">{{ r.problems|join('; ') }}</span>
+        {% else %}<span class="small muted">None</span>{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  <form method="post" action="{{ url_for('quaddicted_import') }}" data-once>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="submit_key" value="{{ submit_key }}">
+    {% for r in rows %}<input type="hidden" name="sha" value="{{ r.sha }}">{% endfor %}
+    <button type="submit">Import {{ rows|length }} package(s) as drafts</button>
+    <a href="{{ url_for('quaddicted_home') }}" style="margin-left:12px">Back without importing</a>
+  </form>
+</div>
+{% endblock %}

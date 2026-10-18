@@ -23,6 +23,7 @@ from tools.quaddicted import (DESCRIPTION_MAX, Entry, UpstreamProblem, human_age
                               screenshot_url, sync_index)
 
 SVC = app_module.quaddicted_service
+BSV = app_module.batch_service
 UPSTREAM = "www.quaddicted.com"
 
 
@@ -129,8 +130,11 @@ class QuaddictedBase(BatchBase):
         data, expected = self.release_bytes(tag)
         sha = hashlib.sha256(data).hexdigest()
         self.site.serve(f"/files/by-sha256/{sha[:2]}/{sha}/{name}", data)
+        base = doc(sha)
+        base["tags"] = [t for t in base["tags"] if not t.startswith("filename=")] + [f"filename={name}"]
         # FakeNet serves plain HTTP; scheme changed accordingly (production always prefers the site's https links)
-        self.seed_entry(sha, filename=name, urls=[f"http://www.quaddicted.com/files/by-sha256/{sha[:2]}/{sha}/{name}"])
+        base["urls"] = [f"http://www.quaddicted.com/files/by-sha256/{sha[:2]}/{sha}/{name}"]
+        self.seed_entry(sha, **base)
         return sha, expected
 
     def import_selected(self, *shas: str, key: str | None = None) -> int:
@@ -459,10 +463,77 @@ class ImportTests(QuaddictedBase):
         self.assertEqual(self.states(bid), ["completed"])
         self.assertEqual(self.draft_count(), 2)
 
-    def test_unknown_sha_selection_is_refused_with_a_clear_problem(self):
-        res = self.post("/quaddicted/import", {"sha": [sha64(20)], "submit_key": "unknown"}, follow=True)
+    def test_retryable_previous_attempt_allows_a_fresh_import_and_links_the_old_job(self):
+        """R2/D: a previously failed import must not ban the entry; the page links the old attempt and a new import works."""
+        sha, expected = self.host_quaddicted_release("rte.zip", "RTE")
+        self.site.routes.pop(f"/files/by-sha256/{sha[:2]}/{sha}/rte.zip", None)   # the first attempt now 404s
+        bid = self.import_selected(sha)
+        self.assertEqual(self.states(bid), ["failed"])
+        html = self.c.get("/quaddicted").get_data(as_text=True)
+        self.assertIn("Failed before", html)
+        self.assertIn("retry there", html)
+        # a fresh import of the same entry (same bytes) succeeds
+        self.site.serve(f"/files/by-sha256/{sha[:2]}/{sha}/rte.zip", self.release_bytes("RTE")[0])
+        bid2 = self.import_selected(sha, key=f"fresh{time.time_ns()}")
+        self.assertEqual(self.states(bid2), ["completed"])
+        self.assertEqual(self.draft_count(), 1)
+
+    def test_entry_page_links_the_existing_draft(self):
+        """R1: the entry page shows what exists (draft/published with a link), not a dead end."""
+        sha, _ = self.host_quaddicted_release("rte.zip", "RTE")
+        bid = self.import_selected(sha)
+        self.assertEqual(self.states(bid), ["completed"])
+        html = self.c.get(f"/quaddicted/entry/{sha}").get_data(as_text=True)
+        self.assertIn("A draft was already created", html)
+        self.assertIn("/addons/", html)
+
+    def test_active_import_duplicate_submission_is_reported_and_nothing_duplicated(self):
+        """R4/B: an entry queued in an earlier batch is reported as already handled; no second item, no empty batch."""
+        sha, _ = self.host_quaddicted_release("rte.zip", "RTE")
+        prepared = SVC.import_prepared([sha])["prepared"]
+        # a queued item exists from a (suspended) earlier submission
+        from tools import batchstore as qstore
+        conn = get_db()
+        first = qstore.create_batch(conn, "quaddicted", "earlier", None)
+        qstore.add_item(conn, first, 0, "quaddicted", qd.source_key(sha), "rte.zip", source_url=prepared[0]["url"])
+        conn.commit()
+        conn.close()
+        outcome = BSV.create_quaddicted_batch(prepared, "second")
+        self.assertNotIn("batch_id", outcome)
+        self.assertIn("already queued", outcome["error"])
+        self.assertEqual(outcome.get("handled"), ["rte.zip"])
+        self.assertEqual(self.draft_count(), 0)
+
+    def test_import_preview_lists_state_and_conflicts_and_queues_nothing(self):
+        """O3: Preview shows what would be queued and which records conflict — without queueing anything."""
+        conn = get_db()
+        conn.execute("INSERT INTO addons (addon_id, title, gamedir, package_name, package_path, package_size, published, draft) "
+                     "VALUES ('rte', 'RTE existing', 'rte', 'rte.pak', '/x/rte.pak', 1, 1, 0)")
+        conn.commit()
+        conn.close()
+        # a catalogue entry with the same filename slug as the existing add-on (different source bytes)
+        other = self.seed_entry(sha64(40), filename="rte.zip", tags=["title=Other", "filename=rte.zip", "type=map"], urls=["http://www.quaddicted.com/x/rte.zip"])
+        # and a completed import (draft) of another entry
+        sha, _ = self.host_quaddicted_release("once.zip", "Once")
+        first = self.import_selected(sha)
+        self.assertEqual(self.states(first), ["completed"])
+        before = self.draft_count()
+        res = self.post("/quaddicted/import", {"sha": [sha, other["sha256"]], "preview": "1"})
         self.assertEqual(res.status_code, 200)
-        self.assertIn("Nothing could be imported", res.get_data(as_text=True))
+        html = res.get_data(as_text=True)
+        self.assertIn("draft already exists", html)                               # the completed one
+        self.assertIn("RTE existing", html)                                       # the conflicting record
+        self.assertIn("(published)", html)                                        # with publication state
+        # the preview itself queued nothing: count of add-on rows is unchanged
+        self.assertEqual(self.draft_count(), before)
+
+    def test_preview_then_double_key_returns_the_same_batch(self):
+        sha, _ = self.host_quaddicted_release("once.zip", "Once")
+        self.assertEqual(self.states(self.import_selected(sha)), ["completed"])
+        key = f"confirm{time.time_ns()}"
+        result = BSV.create_quaddicted_batch(SVC.import_prepared([sha])["prepared"], key)
+        first_id = result["batch_id"]
+        self.assertEqual(BSV.create_quaddicted_batch(SVC.import_prepared([sha])["prepared"], key).get("batch_id"), first_id)
 
     def test_internal_destinations_stay_refused(self):
         """A quaddicted-labelled URL that resolves to a private address is refused by the same protections."""
@@ -492,6 +563,73 @@ class ImportTests(QuaddictedBase):
         self.assertIn("No entries match", html)
 
     # ---- full journey (task §13 integration test) ----
+    def test_id_conflict_with_different_record_for_the_directory(self):
+        """R6/I: the incoming ID matches record A's ID; a different record B holds the install directory. No guessing."""
+        conn = get_db()
+        conn.execute("INSERT INTO addons (addon_id, title, gamedir, package_name, package_path, package_size, published, draft) "
+                     "VALUES ('base', 'A', 'base-orig', 'a.pak', '/x/a.pak', 1, 0, 1)")
+        conn.execute("INSERT INTO addons (addon_id, title, gamedir, package_name, package_path, package_size, published, draft) "
+                     "VALUES ('other', 'B', 'base', 'b.pak', '/x/b.pak', 1, 1, 0)")
+        conn.commit()
+        conn.close()
+        sha, _ = self.host_quaddicted_release("base.zip", "Incoming")
+        bid = self.import_selected(sha)
+        self.assertEqual(self.states(bid), ["needs_decision"])
+        item = self.status(bid)["items"][0]
+        self.assertIn("match different add-ons", item["message"])
+        self.assertIn("different add-ons", self.c.get(f"/batches/{bid}").get_data(as_text=True))
+        # the decision still names both records: create the suggested separate draft -> installs under a free ID
+        item_id = item["id"]
+        conn = get_db()
+        existing_titles = [r["addon_id"] for r in conn.execute("SELECT addon_id FROM addons").fetchall()]
+        conn.close()
+        res = self.post(f"/batches/items/{item_id}/resolve", {"choice": "new_id"})
+        self.assertEqual(res.status_code, 302, res.get_data(as_text=True)[:300])
+        self.assertTrue(jobs.wait_idle(20))
+        conn = get_db()
+        ids = sorted(r[0] for r in conn.execute("SELECT addon_id FROM addons").fetchall())
+        addon_id = [i for i in ids if i not in existing_titles][0]
+        row = conn.execute("SELECT * FROM addons WHERE addon_id = ?", (addon_id,)).fetchone()
+        conn.close()
+        self.assertNotEqual(row["gamedir"], "base")                              # 'base' belongs to record B; untouched
+        self.assertEqual(row["draft"], 1)
+
+    def test_directory_only_conflict_links_the_record_and_offers_choices(self):
+        """R6/I: incoming gamedir matches an existing record whose ID is different; decision offers open/replace/new-id/skip."""
+        conn = get_db()
+        conn.execute("INSERT INTO addons (addon_id, title, gamedir, package_name, package_path, package_size, published, draft) "
+                     "VALUES ('somenamewithnooverlap', 'Existing', 'rte', 'x.pak', '/x/x.pak', 1, 0, 1)")
+        conn.commit()
+        conn.close()
+        sha, _ = self.host_quaddicted_release("rte.zip", "Incoming")
+        bid = self.import_selected(sha)
+        self.assertEqual(self.states(bid), ["needs_decision"])
+        html = self.c.get(f"/batches/{bid}").get_data(as_text=True)
+        self.assertIn("&#39;rte&#39; already exists", html)              # quotes are HTML-escaped in the page
+        self.assertIn("Open existing add-on", html)                      # the R6 open link
+
+
+    def test_abandoned_review_is_highlighted_and_can_be_discarded(self):
+        """O1: a review waiting longer than the age bound is flagged; discarding is explicit."""
+        sha, _ = self.host_quaddicted_release("rte.zip", "RTE")
+        conn = get_db()
+        conn.execute("INSERT INTO addons (addon_id, title, gamedir, package_name, package_path, package_size, published, draft) "
+                     "VALUES ('rte', 'Existing', 'rte', 'x.pak', '/x/x.pak', 1, 0, 1)")
+        conn.commit()
+        conn.close()
+        bid = self.import_selected(sha)
+        item_id = self.status(bid)["items"][0]["id"]
+        old = time.time() - 8 * 86400
+        conn = get_db()
+        conn.execute("UPDATE batch_items SET updated_at = ? WHERE id = ?", (old, item_id))
+        conn.commit()
+        conn.close()
+        html = self.c.get(f"/batches/{bid}").get_data(as_text=True)
+        self.assertIn("waiting", html)
+        self.assertIn("Discard", html)                                           # the discard shortcut stays available
+        res = self.post(f"/batches/items/{item_id}/cancel")
+        self.assertEqual(res.status_code, 302)
+
     def test_end_to_end_quaddicted_to_draft_to_explicit_publish_to_download(self):
         sha, expected = self.host_quaddicted_release("pungfx.zip", "E2E-QD")
         # 1. select in the browse UI

@@ -56,7 +56,8 @@
       {% for e in entries %}
       <tr>
         <td><input type="checkbox" name="sha" value="{{ e.sha256 }}" class="pick"
-                   {% if known.get(e.sha256) and known[e.sha256].state in ('draft','published','queued') %}disabled title="Already handled locally"{% endif %}></td>
+                   {% if known.get(e.sha256) and known[e.sha256].state in ('active','review','decision') %}disabled
+                       title="Already being imported or waiting for review; use the status link"{% endif %}></td>
         <td><a href="{{ url_for('quaddicted_entry', sha=e.sha256) }}">{{ e.title }}</a>
           {% if e.filename %}<span class="small muted mono">{{ e.filename }}</span>{% endif %}</td>
         <td>{{ e.authors|join(', ') }}</td>
@@ -65,10 +66,21 @@
         <td>{{ e.bytes|filesize if e.bytes is not none else '—' }}</td>
         <td>
           {% if known.get(e.sha256) %}
-            {% if known[e.sha256].state == 'published' %}<span class="pill completed">Imported (published)</span>
-            {% elif known[e.sha256].state == 'draft' %}<span class="pill awaiting_review">Imported (draft)</span>
-            {% elif known[e.sha256].state == 'queued' %}<span class="pill acquiring">Already queued</span>
-            {% else %}<span class="small muted">Skipped before</span>{% endif %}
+            {% set s = known[e.sha256] %}
+            {% if s.state == 'published' %}<span class="pill completed">Imported (published)</span>
+              <a class="small" href="{{ url_for('addon_detail', addon_id=s.addon_pk) }}">open</a>
+            {% elif s.state == 'draft' %}<span class="pill awaiting_review">Imported (draft)</span>
+              <a class="small" href="{{ url_for('addon_detail', addon_id=s.addon_pk) }}">open</a>
+            {% elif s.state == 'active' %}<span class="pill acquiring">Importing now</span>
+              <a class="small" href="{{ url_for('batch_page', batch_id=s.batch_id) }}">batch {{ s.batch_id }}</a>
+            {% elif s.state == 'review' %}<span class="pill awaiting_review">Needs review</span>
+              {% if s.review_url %}<a class="small" href="{{ s.review_url }}">continue review</a>{% endif %}
+            {% elif s.state == 'decision' %}<span class="pill needs_decision">Needs a decision</span>
+              <a class="small" href="{{ url_for('batch_page', batch_id=s.batch_id, fragment='1') }}#item-{{ s.item_id }}">decide</a>
+            {% elif s.state == 'retryable' %}<span class="pill failed">Failed before</span>
+              <a class="small" href="{{ url_for('batch_page', batch_id=s.batch_id, fragment='1') }}#item-{{ s.item_id }}">retry there</a>
+            {% elif s.state == 'skipped' %}<span class="small muted">Skipped before</span>
+            {% endif %}
           {% else %}<span class="small muted">Not imported</span>{% endif %}
         </td>
       </tr>
@@ -85,6 +97,7 @@
       <button type="button" id="sel-none">Clear</button>
       <span id="sel-summary" class="small muted"></span>
       <button type="submit" id="import-selected" disabled>Import selected as drafts</button>
+      <button type="submit" id="preview-selected" disabled name="preview" value="1">Preview…</button>
       <span class="small muted">At most {{ max_items }} per batch.</span>
     </div>
   </div>
@@ -109,6 +122,7 @@
     var total = on.reduce(function (a, p) { return a + Number(p.getAttribute('data-size') || 0); }, 0);
     document.getElementById('sel-summary').textContent = on.length + ' selected';
     document.getElementById('import-selected').disabled = on.length === 0;
+    document.getElementById('preview-selected').disabled = on.length === 0;
   }
   document.getElementById('sel-all').onclick = function () { picks().forEach(function (p) { if (!p.disabled) p.checked = true; }); summary(); };
   document.getElementById('sel-none').onclick = function () { picks().forEach(function (p) { p.checked = false; }); summary(); };
