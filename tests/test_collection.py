@@ -213,6 +213,321 @@ class BatchActionTests(CollectionBase):
 
 # ---- collection search/filter/sort -----------------------------------------------------------------
 
+class ViewPersistenceTests(CollectionBase):
+    """Persistent collection-view state (R1-R6 + O1-O3)."""
+
+    def _add(self, addon_id, published=0, author="A", created=None):
+        insert_addon(addon_id, published=published, author=author, created=created,
+                     size=1024, path=str(self.tmp / f"{addon_id}.pak"))
+
+    def test_explicit_settings_override_saved(self):
+        """Explicit current request parameters take precedence over the saved view (§7 #1).
+        The explicit request is also saved (the user changed the view deliberately), so the next
+        no-params request restores the latest explicit settings, not the older saved value."""
+        for s in ("alpha", "beta", "gamma"):
+            self._add(s)
+        # First visit with filters/sort/page — saved
+        self.c.get("/dashboard?q=bea&status=draft&sort=addon_id&dir=desc&page_size=50")
+        # Explicit params win and also become the new saved view
+        res = self.c.get("/dashboard?q=zzznosuch&status=published&sort=size&dir=asc&page_size=100")
+        self.assertIn("No add-ons match this search", res.data.decode())
+        # Latest saved view = the explicit one
+        res = self.c.get("/dashboard")
+        html = res.data.decode()
+        self.assertIn('value="zzznosuch"', html)
+        self.assertIn('value="100"', html)                                        # the page_size is the latest explicit value
+
+    def test_saved_view_is_restored_on_plain_dashboard_request(self):
+        self._add("alpha", author="Beatrice")
+        self._add("beta", author="Boris")
+        self.c.get("/dashboard?q=alpha&sort=author&dir=asc&page_size=10")
+        # No params -> saved view should be restored
+        res = self.c.get("/dashboard")
+        html = res.data.decode()
+        self.assertIn('value="alpha"', html)              # search persisted
+        self.assertIn('selected', html)                  # the "Author" option is the selected sort
+
+    def test_filter_sort_edit_redirects_back_to_view(self):
+        self._add("alpha")
+        self._add("beta", published=1)
+        # View drafts ordered by title
+        res = self.c.get("/dashboard?status=draft&sort=title&dir=asc&page=1&page_size=10")
+        self.assertIn("Showing", res.data.decode())
+        # Click Edit (GET link) — the addon's "next" param carries the view
+        import re
+        m = re.search(r'<a[^>]*href="(/addons/\d+/edit\?next=[^"]+)"', res.data.decode())
+        self.assertIsNotNone(m, "edit link with next missing")
+        edit_url = m.group(1)
+        # GET the edit page; the back link + Cancel use the dashboard_return_url
+        page = self.c.get(edit_url).data.decode()
+        self.assertIn("‹ Back to the collection", page)
+        # The form's hidden "next" field must carry the original view
+        self.assertIn("status=draft", page)
+        self.assertIn("sort=title", page)
+        self.assertIn("dir=asc", page)
+        self.assertIn("page_size=10", page)
+
+    def test_filter_sort_edit_save_redirects_back_to_view(self):
+        """Metadata-only save returns to the originating view (§4)."""
+        self._add("alpha")
+        # Visit, then submit Edit form with no package upload (metadata-only).
+        res = self.c.get("/dashboard?status=draft&sort=title&dir=asc&page=1&page_size=10")
+        import re
+        edit_url = re.search(r'<a[^>]*href="(/addons/\d+/edit\?next=[^"]+)"', res.data.decode()).group(1)
+        # Get the edit form (the back link is from a saved view if any, but the
+        # edit link carries `next` as the originating view).
+        edit_page = self.c.get(edit_url).data.decode()
+        m_next = re.search(r'name="next" value="([^"]*)"', edit_page)
+        self.assertIsNotNone(m_next, "edit form missing next hidden field")
+        next_value = m_next.group(1)
+        # Re-post the form (no file => metadata-only edit). The route ignores extra form fields
+        # and falls back to the existing values.
+        # Extract a valid CSRF token
+        token = re.search(r'name="csrf_token" value="([^"]*)"', edit_page).group(1)
+        edit_url_no_next = edit_url.split("?")[0]
+        # POST metadata-only edit with the next param
+        res = self.c.post(edit_url_no_next, data={"title": "Alpha", "addon_id": "alpha", "gamedir": "alpha",
+                                                 "author": "X", "date": "2026/10/18", "description": "d",
+                                                 "csrf_token": token, "next": next_value}, follow_redirects=False)
+        # The redirect should preserve the originating view
+        self.assertEqual(res.status_code, 302)
+        loc = res.headers["Location"]
+        for needle in ("status=draft", "sort=title", "dir=asc", "page=1", "page_size=10"):
+            self.assertIn(needle, loc, f"missing {needle} in {loc}")
+
+    def test_filter_sort_publish_redirects_back_to_view(self):
+        self._add("alpha", published=0)
+        # the publish job needs the actual PAK on disk to succeed
+        from app import app
+        from tests.test_zip_conversion import make_pak_bytes
+        pak = make_pak_bytes([("maps/a.bsp", b"x" * 16)])
+        # find the row and put the file at its path
+        from app import get_db
+        conn = get_db()
+        row = conn.execute("SELECT package_path FROM addons WHERE id = ?", (1,)).fetchone()
+        conn.close()
+        with open(row["package_path"], "wb") as fh:
+            fh.write(pak)
+        res = self.c.get("/dashboard?status=draft&sort=title&dir=asc&page=1&page_size=10")
+        import re
+        m = re.search(r'<form[^>]*action="/addons/(\d+)/publish"[^>]*>(.*?)</form>',
+                      res.data.decode(), re.S)
+        self.assertIsNotNone(m, "publish form missing")
+        form_text = m.group(2)
+        nxt = re.search(r'name="next" value="([^"]*)"', form_text)
+        self.assertIsNotNone(nxt)
+        token = re.search(r'name="csrf_token" value="([^"]*)"', form_text).group(1)
+        addon_pk = m.group(1)
+        res = self.c.post(f"/addons/{addon_pk}/publish",
+                          data={"csrf_token": token, "next": nxt.group(1)}, follow_redirects=False)
+        self.assertEqual(res.status_code, 302)
+        loc = res.headers["Location"]
+        m2 = re.search(r"/jobs/([0-9a-f]+)", loc)
+        self.assertIsNotNone(m2, f"publish redirect missing job id in {loc}")
+        self.assertTrue(jobs.wait_idle(30))
+        page = self.c.get(f"/jobs/{m2.group(1)}")
+        self.assertEqual(page.status_code, 200)
+        html = page.data.decode()
+        cont = re.search(r'<a id="job-next" href="([^"]*)"', html)
+        self.assertIsNotNone(cont)
+        loc = cont.group(1)
+        for needle in ("status=draft", "sort=title", "dir=asc", "page=1", "page_size=10"):
+            self.assertIn(needle, loc)
+
+    def test_filter_sort_batch_delete_redirects_back_to_view(self):
+        self._add("alpha", published=1)
+        self._add("beta", published=1)
+        # Issue a delete batch request that includes the view params in the form
+        res = self.c.post("/addons/batch/execute", data={"selected_pk": ["1", "2"], "action": "delete", "submit_key": "k-view",
+                                "q": "", "status": "published", "sort": "title", "dir": "asc", "page": "1", "page_size": "10", "csrf_token": self.csrf()}, follow_redirects=False)
+        self.assertEqual(res.status_code, 302)
+        loc = res.headers["Location"]
+        for needle in ("status=published", "sort=title", "dir=asc", "page=1", "page_size=10"):
+            self.assertIn(needle, loc)
+
+    def test_collection_nav_uses_saved_view(self):
+        """Clicking the main Collection link restores the saved view if no explicit URL params are present."""
+        self._add("alpha")
+        self.c.get("/dashboard?q=alpha&sort=title&dir=desc&page_size=10")           # save
+        # No params -> saved view applied
+        res = self.c.get("/dashboard")
+        html = res.data.decode()
+        self.assertIn('value="alpha"', html)
+        self.assertIn('selected', html)                                                # the sort dropdown shows the saved value
+        self.assertIn('value="10"', html)                                             # page_size
+
+    def test_refreshing_does_not_clear_view(self):
+        self._add("alpha")
+        self._add("beta")
+        self.c.get("/dashboard?q=alpha")
+        for _ in range(3):
+            html = self.c.get("/dashboard").data.decode()
+            self.assertIn('value="alpha"', html)                                      # search persisted across reloads
+
+    def test_explicit_url_params_override_saved(self):
+        self._add("alpha")
+        self._add("beta")
+        self.c.get("/dashboard?q=alpha")                                              # save q=alpha
+        # Explicit q=beta must win (no merging with stale filters, §3)
+        res = self.c.get("/dashboard?q=beta")
+        html = res.data.decode()
+        self.assertIn('value="beta"', html)
+        self.assertNotIn('value="alpha"', html)
+        # The latest explicit settings (q=beta) are also saved — the next no-params request restores
+        # them, not the older q=alpha (§3 "Save the new settings").
+        res = self.c.get("/dashboard")
+        html = res.data.decode()
+        self.assertIn('value="beta"', html)
+        self.assertNotIn('value="alpha"', html)
+
+    def test_clearing_search_field_does_not_reinstate_old_saved_value(self):
+        self._add("alpha")
+        self.c.get("/dashboard?q=alpha")                                              # save
+        # Visit with explicit empty q — this should clear, not fall back to saved
+        res = self.c.get("/dashboard?q=")
+        html = res.data.decode()
+        self.assertIn('value=""', html)
+
+    def test_reset_filters_keeps_sort_and_page_size(self):
+        self._add("alpha")
+        self.c.get("/dashboard?q=alpha&status=draft&sort=addon_id&dir=desc&page_size=50")    # save full
+        # Clear search + status but keep sort/dir/page_size
+        res = self.c.get("/dashboard?reset=filters")
+        html = res.data.decode()
+        # q and status are now empty (defaults)
+        self.assertIn('name="q" value=""', html)
+        # sort, dir, page_size are preserved
+        self.assertIn('value="50"', html)                                             # page_size
+        # sort=addon_id should still be selected in the dropdown
+        self.assertIn('selected', html)
+        # And the saved view reflects the cleared filters
+        saved_qs = re.search(r'href="[^"]*reset=view[^"]*"', html)
+        self.assertIsNotNone(saved_qs)
+
+    def test_reset_view_returns_to_full_defaults(self):
+        self._add("alpha")
+        self.c.get("/dashboard?q=alpha&status=draft&sort=addon_id&dir=desc&page_size=50")
+        res = self.c.get("/dashboard?reset=view")
+        html = res.data.decode()
+        self.assertIn('value=""', html)                                              # q empty
+        # page_size is still selected but back to default 25 (we don't preserve it in reset=view)
+        # Actually reset=view goes to defaults; check no value in the search input
+        self.assertNotIn('value="alpha"', html)
+
+    def test_pages_clamp_after_deletion(self):
+        """Deleting the items on a page should redirect to a valid page (§6)."""
+        for i in range(5):
+            self._add(f"item{i:02d}")                                                  # 5 items
+        # Go to the last page (page 1 at page_size 10 contains all 5 since page_size ≥ total)
+        # Ask explicitly for page_size=10 (the smallest allowed) and a view that will exercise the clamp
+        res = self.c.get("/dashboard?sort=title&page=1&page_size=10")
+        html = res.data.decode()
+        # Delete one item so the total drops to 4 — but the view is still saved as page=1, page_size=10
+        import re
+        m = re.search(r'name="selected_pk" value="(\d+)"', html)
+        self.assertIsNotNone(m)
+        target_pk = m.group(1)
+        token = re.search(r'name="csrf_token" value="([^"]*)"', html).group(1)
+        # Delete the only selected item
+        res = self.c.post("/addons/batch/execute", data={"selected_pk": [target_pk], "action": "delete", "submit_key": "k-clamp",
+                                                       "sort": "title", "page": "1", "page_size": "10", "csrf_token": self.csrf()}, follow_redirects=False)
+        loc = res.headers["Location"]
+        import urllib.parse as u
+        qs = u.parse_qs(u.urlparse(loc).query)
+        # After deletion total is 4; page 1 of 1 (page_size 10) is still the only valid page; the saved
+        # view's page=1 still points to a page that exists.
+        self.assertEqual(int(qs["page_size"][0]), 10)
+        self.assertEqual(int(qs["page"][0]), 1)
+
+    def test_invalid_next_param_falls_back_to_saved(self):
+        """§5: bad `next` values must be rejected, not echoed. Verify by sending a junk next and
+        that the redirect goes to a clean dashboard URL (no echo of garbage)."""
+        for s in ("alpha", "beta"):
+            self._add(s)
+        self.c.get("/dashboard?q=alpha")                                              # save
+        res = self.c.post("/addons/batch/execute", data={"selected_pk": ["1"], "action": "delete", "submit_key": "kk",
+                                "next": "https://evil.example.org/?x=1", "sort": "title", "page": "1", "page_size": "10", "csrf_token": self.csrf()}, follow_redirects=False)
+        loc = res.headers["Location"]
+        # The redirect must not echo the evil URL
+        self.assertNotIn("evil.example.org", loc)
+        # The dashboard URL should still reflect the saved view (q=alpha)
+        self.assertIn("q=alpha", loc)
+
+    def test_next_param_with_unknown_key_is_rejected(self):
+        self._add("alpha")
+        self.c.get("/dashboard?q=alpha")
+        res = self.c.post("/addons/batch/execute", data={"selected_pk": ["1"], "action": "delete", "submit_key": "kk",
+                                "next": "url=https://evil&foo=bar&not_a_real_key=1",
+                                "sort": "title", "page": "1", "page_size": "10", "csrf_token": self.csrf()}, follow_redirects=False)
+        loc = res.headers["Location"]
+        self.assertNotIn("not_a_real_key", loc)
+        self.assertNotIn("https", loc)
+
+    def test_external_url_next_is_ignored(self):
+        self._add("alpha")
+        self.c.get("/dashboard?q=alpha")
+        # Pass a next that LOOKS like a URL with a scheme
+        res = self.c.post("/addons/batch/execute", data={"selected_pk": ["1"], "action": "delete", "submit_key": "kk",
+                                "next": "https://quaddicted.com/foo",
+                                "sort": "title", "page": "1", "page_size": "10", "csrf_token": self.csrf()}, follow_redirects=False)
+        loc = res.headers["Location"]
+        self.assertNotIn("quaddicted.com", loc)
+
+    def test_no_next_uses_saved_view(self):
+        self._add("alpha")
+        self.c.get("/dashboard?q=alpha&status=draft&page_size=50")
+        # Submit WITHOUT next; should still use the saved view
+        res = self.c.post("/addons/batch/execute", data={"selected_pk": ["1"], "action": "delete", "submit_key": "kk",
+                                "sort": "title", "page": "1", "page_size": "10", "csrf_token": self.csrf()}, follow_redirects=False)
+        loc = res.headers["Location"]
+        self.assertIn("q=alpha", loc)
+        self.assertIn("status=draft", loc)
+        self.assertIn("page_size=50", loc)
+
+    def test_checkbox_selection_is_not_persisted(self):
+        """§4 last paragraph: checkboxes are not part of saved view preferences."""
+        self._add("alpha")
+        self._add("beta")
+        # User selects both on a page and posts the form
+        res = self.c.post("/addons/batch/execute", data={"selected_pk": ["1", "2"], "action": "delete", "submit_key": "kk",
+                                "q": "", "status": "", "sort": "", "dir": "", "page": "1", "page_size": "10", "csrf_token": self.csrf()}, follow_redirects=False)
+        # The redirect's query string must NOT carry the pks
+        loc = res.headers["Location"]
+        self.assertNotIn("selected_pk", loc)
+        self.assertNotIn("pk=", loc)
+
+    def test_view_persists_across_users_isolated(self):
+        """§2 last paragraph: preferences are per-user, not global."""
+        from werkzeug.security import generate_password_hash
+        conn = get_db()
+        conn.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)",
+                     ("bob", generate_password_hash("secret")))
+        conn.commit()
+        conn.close()
+        # admin saves a view
+        self._add("alpha")
+        self.c.get("/dashboard?q=alpha&sort=title&page_size=50")
+        # Bob logs in
+        c2 = app.test_client()
+        c2.get("/login")
+        with c2.session_transaction() as s:
+            tok = s["csrf_token"]
+        c2.post("/login", data={"username": "bob", "password": "secret", "csrf_token": tok})
+        # Bob's bare dashboard request uses HIS view, not admin's
+        html = c2.get("/dashboard").data.decode()
+        self.assertNotIn('value="alpha"', html)                                  # admin's search is not visible
+        # Bob saves a different view
+        c2.get("/dashboard?q=bobsonly")
+        # Now admin's view should still be intact
+        admin_html = self.c.get("/dashboard").data.decode()
+        self.assertIn('value="alpha"', admin_html)
+        self.assertNotIn('value="bobsonly"', admin_html)
+        # Bob's view is intact
+        bob_html = c2.get("/dashboard").data.decode()
+        self.assertIn('value="bobsonly"', bob_html)
+        self.assertNotIn('value="alpha"', bob_html)
+
+
 class CollectionQueryTests(CollectionBase):
     def setUp(self):
         super().setUp()

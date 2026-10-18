@@ -29,7 +29,7 @@
       <td>{{ p.age_minutes }} min ago</td>
       <td><a href="{{ url_for('import_plan', token=p.token) }}">Review</a></td>
       <td><form style="display:inline" method="post" action="{{ url_for('import_cancel', token=p.token) }}">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="danger" type="submit">Discard</button></form></td>
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="next" value="{{ next }}"><button class="danger" type="submit">Discard</button></form></td>
     </tr>
     {% endfor %}
   </table>
@@ -66,14 +66,15 @@
         {% endfor %}
       </select></label>
     <button type="submit" style="width:auto;align-self:flex-end">Apply</button>
-    <a style="align-self:flex-end" class="small muted" href="{{ url_for('dashboard') }}">Clear filters</a>
+    <a style="align-self:flex-end" class="small muted" href="{{ url_for('dashboard', reset='filters') }}">Clear search &amp; filter</a>
+    <a style="align-self:flex-end" class="small muted" href="{{ url_for('dashboard', reset='view') }}">Reset view</a>
   </form>
 
   {% set has_filters = q or status_filter or sort or dir %}
   {% if not addons and total_rows == 0 and not has_filters %}
   <p>No add-ons yet. Upload one to get started.</p>
   {% elif not addons %}
-  <p>No add-ons match this search or filter. <a href="{{ url_for('dashboard') }}">Clear filters</a> to see all {{ total_rows }}.</p>
+  <p>No add-ons match this search or filter. <a href="{{ url_for('dashboard', reset='filters') }}">Clear search &amp; filter</a> to see all {{ total_rows }}.</p>
   {% else %}
   <p class="small muted">Showing {{ range_start }}–{{ range_end }} of {{ total_rows }} (page {{ page }} of {{ total_pages }})</p>
   <form method="post" action="{{ url_for('collection_batch_preview') }}" id="collection-form" data-once>
@@ -84,6 +85,7 @@
     <input type="hidden" name="dir" value="{{ dir or '' }}">
     <input type="hidden" name="page" value="{{ page }}">
     <input type="hidden" name="page_size" value="{{ page_size }}">
+    <input type="hidden" name="next" value="{{ next }}">
     <div id="batch-bar" class="sev info" style="display:none;align-items:center;gap:10px">
       <strong id="sel-count">0 selected</strong>
       <button type="submit" name="action" value="publish" class="small">Publish selected</button>
@@ -114,18 +116,27 @@
         <td><span {% if addon.package_size is not none %}title="{{ addon.package_size }} bytes"{% endif %}>
           {% if addon.package_size is not none %}{{ addon.package_size|filesize }}{% else %}—{% endif %}</span></td>
         <td>
-          <a href="{{ url_for('addon_detail', addon_id=addon.id) }}">View</a>
+          <a href="{{ url_for('addon_detail', addon_id=addon.id, next=next) }}">View</a>
+          <a class="small" href="{{ url_for('edit_addon', addon_id=addon.id, next=next) }}">Edit</a>
           {% if addon.published %}
           <form style="display:inline" method="post" action="{{ url_for('unpublish_addon', addon_id=addon.id) }}">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="next" value="{{ next }}">
             <button type="submit">Unpublish</button>
           </form>
           {% else %}
           <form style="display:inline" method="post" action="{{ url_for('publish_addon', addon_id=addon.id) }}">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="next" value="{{ next }}">
             <button type="submit">Publish</button>
           </form>
           {% endif %}
+          <form style="display:inline" method="post" action="{{ url_for('delete_addon', addon_id=addon.id) }}"
+                onsubmit="return confirm('Permanently delete this add-on? This cannot be undone.');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="next" value="{{ next }}">
+            <button type="submit" class="danger">Delete</button>
+          </form>
         </td>
       </tr>
       {% endfor %}

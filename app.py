@@ -512,6 +512,13 @@ def _job_response(job_id: str) -> Any:
     return jsonify({"redirect": target}) if _wants_json() else redirect(target)
 
 
+def _job_response_with_view(job_id: str, user_id: str, view: dict) -> Any:
+    """Return a job redirect; the job's outcome already carries the view (clamped, saved) so the final
+    "Continue" link restores the originating collection view."""
+    target = url_for("job_page", job_id=job_id)
+    return jsonify({"redirect": target}) if _wants_json() else redirect(target)
+
+
 def _form_failure(message: str, template: str = "addon_form.html", **ctx: Any) -> Any:
     if _wants_json():
         return jsonify({"error": message}), 400
@@ -556,6 +563,13 @@ def get_db() -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path), timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # WAL mode allows a writer to run alongside readers and reduces "database is locked" under
+    # brief contention (e.g. the per-action view save happening while a redirect-follow render
+    # reads through the context processor).
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.DatabaseError:
+        pass
     return conn
 
 
@@ -659,6 +673,10 @@ def init_db() -> None:
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_addons_batch_item ON addons(batch_item_id) WHERE batch_item_id IS NOT NULL")
     # submit keys of confirmed batch actions (publish); prevents reload-repeat from running a batch twice
     conn.execute("CREATE TABLE IF NOT EXISTS batch_keys (key TEXT PRIMARY KEY, job_id TEXT NOT NULL, created_at REAL)")
+    # per-user persisted collection view (search, filter, sort, page, page size).
+    # JSON text only; the value is a validated view dict produced by _validate_view. No CSRF/credentials/actions stored here.
+    conn.execute("CREATE TABLE IF NOT EXISTS user_collection_view ("
+                 "user_id TEXT PRIMARY KEY, view_json TEXT NOT NULL, updated_at REAL NOT NULL)")
     batchstore.init_schema(conn)
     jobs.init_schema(conn)
     quaddicted_module.init_schema(conn)
@@ -881,12 +899,17 @@ def ensure_csrf() -> None:
 
 @app.context_processor
 def inject_globals() -> Dict[str, Any]:
+    """Inject variables available to every template. The `dashboard_return_url` is the validated, encoded view
+    that lets item pages and forms return to the same collection view the admin left."""
+    user_id = session.get("username") or ""
+    saved = _load_saved_view(user_id) or _default_view()
     return {
         "public_base_url": app.config["BASE_URL"],
         "current_user": session.get("username"),
         "csrf_token": make_csrf_token(),
         "presets": PRESETS,
         "default_options": ConvertOptions(),
+        "dashboard_return_url": _dashboard_url_for_view(saved),
     }
 
 
@@ -1004,28 +1027,264 @@ def _collection_query(search: str, status: str, sort: str, direction: str):
             f"SELECT COUNT(*) FROM addons {where_clause}", params)
 
 
-@app.route("/dashboard")
-def dashboard() -> Any:
-    require_auth()
-    search = (request.args.get("q") or "").strip()[:150]
-    status = request.args.get("status") if request.args.get("status") in STATUS_FILTERS else ""
-    sort = request.args.get("sort") if request.args.get("sort") in SORT_FIELDS else ""
-    direction = request.args.get("dir") if request.args.get("dir") in ("asc", "desc") else ""
+# ---- persistent collection view (per authenticated user) --------------------------------------------
+# The view is the dashboard's filter/sort/page settings. It is persisted per user in the user_collection_view
+# table (NOT a global preference — different users keep different views). The precedence used by the dashboard is:
+#   1. Explicit current request parameters (or an explicit reset via ?reset=view / ?reset=filters)
+#   2. An `next` (originating-view) parameter returned from an item or action page, validated into a view dict
+#   3. The user's saved view from user_collection_view
+#   4. Application defaults
+# View parameters are validated with allowlists; values are bounded and never echoed back into action / CSRF
+# fields. The view is encoded into URLs only as the value of an `next` parameter, not a free-form URL.
+
+
+VIEW_KEYS = ("q", "status", "sort", "dir", "page", "page_size")
+
+
+def _default_view() -> dict[str, str]:
+    return {"q": "", "status": "", "sort": "", "dir": "", "page": "1", "page_size": str(COLLECTION_PAGE_SIZE_DEFAULT)}
+
+
+def _validate_view(raw: dict[str, Any] | None) -> dict[str, str]:
+    """Sanitise an arbitrary mapping into the dashboard view dict. Empty strings and invalid values fall back to defaults.
+    Reject keys that are not in VIEW_KEYS, and reject too-long values."""
+    raw = raw or {}
+    out = _default_view()
+    for k in VIEW_KEYS:
+        v = raw.get(k)
+        if v is None:
+            continue
+        s = str(v)
+        if k == "q":
+            s = s.strip()[:150]
+            out["q"] = s
+        elif k == "status":
+            out["status"] = s if s in STATUS_FILTERS else ""
+        elif k == "sort":
+            out["sort"] = s if s in SORT_FIELDS else ""
+        elif k == "dir":
+            out["dir"] = s if s in ("asc", "desc") else ""
+        elif k == "page":
+            try:
+                page = int(s)
+            except (TypeError, ValueError):
+                page = 1
+            out["page"] = str(max(1, page))
+        elif k == "page_size":
+            try:
+                size = int(s)
+            except (TypeError, ValueError):
+                size = COLLECTION_PAGE_SIZE_DEFAULT
+            if size not in COLLECTION_PAGE_SIZES:
+                size = COLLECTION_PAGE_SIZE_DEFAULT
+            out["page_size"] = str(size)
+    return out
+
+
+def _view_from_request(request) -> dict[str, str]:
+    """Read current request parameters (query or form) and validate."""
+    raw = {k: request.values.get(k) for k in VIEW_KEYS}
+    return _validate_view(raw)
+
+
+def _load_saved_view(user_id: str) -> dict[str, str] | None:
+    if not user_id:
+        return None
+    conn = get_db()
     try:
-        raw_page = int(request.args.get("page") or "1")
+        row = conn.execute("SELECT view_json FROM user_collection_view WHERE user_id = ?", (user_id,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    try:
+        data = json.loads(row["view_json"])
+    except (TypeError, ValueError):
+        return None
+    return _validate_view(data if isinstance(data, dict) else None)
+
+
+def _save_saved_view(user_id: str, view: dict[str, str]) -> None:
+    if not user_id:
+        return
+    # Retry briefly on the rare concurrent write/read race (autocommit under load). The hold is
+    # sub-second; a small bounded retry keeps the user-facing flow responsive without changing semantics.
+    import time as _time
+    for _attempt in range(5):
+        conn = get_db()
+        try:
+            with conn:
+                conn.execute("INSERT INTO user_collection_view (user_id, view_json, updated_at) VALUES (?, ?, ?) "
+                             "ON CONFLICT(user_id) DO UPDATE SET view_json = excluded.view_json, updated_at = excluded.updated_at",
+                             (user_id, json.dumps({k: view.get(k, "") for k in VIEW_KEYS}), _time.time()))
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc) or _attempt == 4:
+                raise
+            conn.close()
+            _time.sleep(0.05 * (2 ** _attempt))
+
+
+def _delete_saved_view(user_id: str) -> None:
+    if not user_id:
+        return
+    conn = get_db()
+    try:
+        with conn:
+            conn.execute("DELETE FROM user_collection_view WHERE user_id = ?", (user_id,))
+    finally:
+        conn.close()
+
+
+def _encode_view(view: dict[str, str]) -> str:
+    """Compact URL-encoded view for use as the `next` parameter. Empty values are omitted."""
+    from urllib.parse import urlencode
+    return urlencode({k: v for k, v in view.items() if v}, doseq=False)
+
+
+def _resolved_dashboard_view(user_id: str, request) -> dict[str, str]:
+    """Precedence: explicit request params > next (validated) > saved > defaults. Honors `?reset=...`."""
+    reset = (request.values.get("reset") or "").strip().lower()
+    saved = _load_saved_view(user_id)
+    if reset == "view":
+        _delete_saved_view(user_id)
+        return _default_view()
+    if reset == "filters":
+        cleared = {**(_load_saved_view(user_id) or _default_view())}
+        cleared["q"] = ""
+        cleared["status"] = ""
+        return _validate_view(cleared)
+    # explicit request overrides
+    if any(request.values.get(k) for k in VIEW_KEYS):
+        view = _view_from_request(request)
+    else:
+        # originating view, if present and valid
+        next_raw = (request.values.get("next") or "").strip()
+        next_view = _decode_view_param(next_raw)
+        if next_view is not None:
+            view = next_view
+        elif saved is not None:
+            view = saved
+        else:
+            view = _default_view()
+    return _validate_view(view)
+
+
+def _decode_view_param(raw: str) -> dict[str, str] | None:
+    """Validate a `next` parameter (compact key=value view). Empty/None means no `next`; invalid `next` returns None (caller falls back)."""
+    if not raw:
+        return None
+    from urllib.parse import parse_qsl
+    try:
+        pairs = parse_qsl(raw, keep_blank_values=True, strict_parsing=True)
     except ValueError:
-        raw_page = 1
+        return None
+    raw_dict = {k: v for k, v in pairs}
+    if any(k not in VIEW_KEYS for k in raw_dict):
+        return None
+    if any(len(v) > 150 for v in raw_dict.values()):
+        return None
+    return _validate_view(raw_dict)
+
+
+def _dashboard_url_for_view(view: dict[str, str]) -> str:
+    """Build the dashboard URL with the validated view. Always keeps the page (it is a meaningful bookmark
+    state even when it clamps back to 1) and the page_size; omits other defaults that the route would infer."""
+    keep_always = ("page", "page_size")
+    params = {k: v for k, v in view.items() if v and (k in keep_always or v != _default_view()[k])}
+    return url_for("dashboard", **params)
+
+
+def _clamp_view_to_total(view: dict[str, str], total_rows: int) -> dict[str, str]:
+    """Clamp the page in a view dict so it does not exceed the new total (e.g. after a delete removes
+    the last items on the last page). Saves the corrected view so navigation does not repeatedly
+    request an invalid page. Does not touch search/filter/sort settings."""
+    out = dict(view)
     try:
-        page_size = int(request.args.get("page_size") or COLLECTION_PAGE_SIZE_DEFAULT)
+        page_size = int(out.get("page_size") or COLLECTION_PAGE_SIZE_DEFAULT)
     except ValueError:
         page_size = COLLECTION_PAGE_SIZE_DEFAULT
     if page_size not in COLLECTION_PAGE_SIZES:
         page_size = COLLECTION_PAGE_SIZE_DEFAULT
+    total_pages = max(1, -(-total_rows // page_size))
+    try:
+        page = int(out.get("page") or "1")
+    except ValueError:
+        page = 1
+    if page < 1:
+        page = 1
+    if page > total_pages:
+        page = total_pages
+    out["page"] = str(page)
+    out["page_size"] = str(page_size)
+    return out
+
+
+def _dashboard_redirect_for(user_id: str, request) -> str:
+    """Build the dashboard URL to redirect to from an action. Honours the precedence rules above, but never
+    uses request.args for the "next" override (since action routes don't carry it — they carry the saved view only)."""
+    saved = _load_saved_view(user_id) or _default_view()
+    return _dashboard_url_for_view(saved)
+
+
+def _next_redirect(user_id: str, request, *, fallback_addon: int | None = None, keep_addon: bool = False):
+    """Resolve the redirect target after a successful action and return a Flask `redirect` Response.
+
+    Precedence for the target dashboard URL:
+      1. The action's `next` parameter (validated — must be a valid view dict, never an arbitrary URL).
+      2. The user's saved view.
+      3. The current request's view parameters (fallback, only if at least one was supplied).
+      4. The application defaults.
+
+    The view is clamped to the current filtered total so a change (e.g. last-item deletion) cannot leave the
+    user on a non-existent page. The clamped view is also persisted as the user's new saved view.
+
+    If `keep_addon` is true the redirect targets the add-on's detail page (with the same `next`).
+    If `fallback_addon` is given, that add-on's detail page is used as a final fallback when no view state is available.
+    """
+    next_raw = (request.values.get("next") or "").strip()
+    decoded = _decode_view_param(next_raw)
+    if decoded is not None:
+        view = decoded
+    else:
+        saved = _load_saved_view(user_id)
+        if saved is not None:
+            view = saved
+        elif any(request.values.get(k) for k in VIEW_KEYS):
+            view = _view_from_request(request)
+        else:
+            view = _default_view()
+    # Clamp to the current filtered total so the page exists.
+    conn = get_db()
+    try:
+        select_sql, count_sql, params = _collection_query(view["q"], view["status"], view["sort"], view["dir"])
+        total_after = conn.execute(count_sql, params).fetchone()[0]
+    finally:
+        conn.close()
+    view = _clamp_view_to_total(view, total_after)
+    _save_saved_view(user_id, view)
+    if keep_addon:
+        return redirect(url_for("addon_detail", addon_id=fallback_addon) + ("?next=" + next_raw if next_raw else ""))
+    return redirect(_dashboard_url_for_view(view))
+
+
+@app.route("/dashboard")
+def dashboard() -> Any:
+    require_auth()
+    user_id = session.get("username") or ""
+    view = _resolved_dashboard_view(user_id, request)
+    # Apply the view to the SQL builder
+    search = view["q"]
+    status = view["status"]
+    sort = view["sort"]
+    direction = view["dir"]
+    raw_page = int(view["page"])
+    page_size = int(view["page_size"])
     select_sql, count_sql, params = _collection_query(search, status, sort, direction)
     conn = get_db()
     try:
         total_rows = conn.execute(count_sql, params).fetchone()[0]
-        total_pages = max(1, -(-total_rows // page_size))      # ceil division (a unary minus on the numerator turns floor into ceiling; a space -(-a) // b would be wrong)
+        total_pages = max(1, -(-total_rows // page_size))      # ceil division
         page = max(1, min(raw_page, total_pages))
         offset = (page - 1) * page_size
         addons = conn.execute(select_sql, (*params, page_size, offset)).fetchall()
@@ -1036,12 +1295,20 @@ def dashboard() -> Any:
     range_end = offset + len(addons)
     pending_imports = [{"token": r["token"], "name": r["source_name"], "kind": r["kind"], "title": json.loads(r["form_json"]).get("title", ""),
                         "age_minutes": int((time.time() - r["created_at"]) / 60)} for r in pending]
-    view = {"addons": addons, "active_jobs": jobs.active(), "pending_imports": pending_imports,
-            "q": search, "status_filter": status, "sort": sort, "dir": direction,
-            "page": page, "page_size": page_size, "total_rows": total_rows, "total_pages": total_pages,
-            "range_start": range_start, "range_end": range_end,
-            "page_sizes": COLLECTION_PAGE_SIZES, "page_size_default": COLLECTION_PAGE_SIZE_DEFAULT}
-    return render_template("dashboard.html", **view)
+    # Persist the view (only when the user submitted a real change — i.e. any of the view params were
+    # in the request). Save BEFORE the render call so the dashboard's open connection has been
+    # closed and the context processor's read does not collide with a pending write.
+    if any(request.values.get(k) for k in VIEW_KEYS) and not (request.values.get("reset") or "").strip():
+        _save_saved_view(user_id, {k: view[k] for k in VIEW_KEYS})
+    # Build the `next` parameter for downstream pages: the validated view, URL-encoded.
+    next_param = _encode_view(view)
+    render_view = {"addons": addons, "active_jobs": jobs.active(), "pending_imports": pending_imports,
+                   "q": search, "status_filter": status, "sort": sort, "dir": direction,
+                   "page": page, "page_size": page_size, "total_rows": total_rows, "total_pages": total_pages,
+                   "range_start": range_start, "range_end": range_end,
+                   "page_sizes": COLLECTION_PAGE_SIZES, "page_size_default": COLLECTION_PAGE_SIZE_DEFAULT,
+                   "next": next_param, "view": view}
+    return render_template("dashboard.html", **render_view)
 
 
 def _read_addon_form(*, defaults: dict[str, Any] | None = None) -> dict[str, str]:
@@ -1144,12 +1411,13 @@ def _start_import(kind: str, addon_pk: int | None, form: dict[str, str], ctx: di
 @app.route("/addons/new", methods=["GET", "POST"])
 def add_addon() -> Any:
     require_auth()
+    next_param = request.values.get("next") or ""
     if request.method == "POST":
         form = _read_addon_form()
         if not form["title"] or not form["addon_id"] or not form["gamedir"]:
-            return _form_failure("Title, ID, and game dir are required.", mode="new")
-        return _start_import("new", None, form, {"mode": "new"})
-    return render_template("addon_form.html", mode="new")
+            return _form_failure("Title, ID, and game dir are required.", mode="new", next=next_param)
+        return _start_import("new", None, form, {"mode": "new", "next": next_param})
+    return render_template("addon_form.html", mode="new", next=next_param)
 
 
 def _addon_inspection(addon: sqlite3.Row) -> Dict[str, Any]:
@@ -1175,7 +1443,8 @@ def addon_detail(addon_id: int) -> Any:
     conn.close()
     if not addon:
         raise NotFound()
-    return render_template("addon_detail.html", addon=addon, inspection=_addon_inspection(addon))
+    return render_template("addon_detail.html", addon=addon, inspection=_addon_inspection(addon),
+                           next=request.values.get("next") or "")
 
 
 SUGGESTION_FIELDS = ("title", "author", "date", "description")
@@ -1187,6 +1456,7 @@ def apply_suggestion(addon_id: int, field: str) -> Any:
     require_auth()
     if field not in SUGGESTION_FIELDS:
         raise NotFound()
+    outcome: tuple[str, int] = ("noop", addon_id)
     with db_txn() as conn:
         addon = conn.execute("SELECT * FROM addons WHERE id = ?", (addon_id,)).fetchone()
         if not addon:
@@ -1195,25 +1465,39 @@ def apply_suggestion(addon_id: int, field: str) -> Any:
         suggestion = (inspection["report"] or {}).get("suggestions", {}).get(field)
         if not suggestion:
             flash(f"No {field} suggestion is available for this add-on.", "error")
-            return redirect(url_for("addon_detail", addon_id=addon_id))
-        value = suggestion["value"]
-        try:
-            if field == "date":
-                _validate_date(value)
-        except ValueError as exc:
-            flash(f"Suggested date rejected: {exc}", "error")
-            return redirect(url_for("addon_detail", addon_id=addon_id))
-        conn.execute(f"UPDATE addons SET {field} = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (value, addon_id))
-        published = bool(addon["published"])
-    if published:
+        else:
+            value = suggestion["value"]
+            try:
+                if field == "date":
+                    _validate_date(value)
+            except ValueError as exc:
+                flash(f"Suggested date rejected: {exc}", "error")
+            else:
+                conn.execute(f"UPDATE addons SET {field} = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (value, addon_id))
+                outcome = ("applied", addon_id)
+                flash(f"Set {field} from {suggestion['source']}.", "success")
+    # Heavy work (catalog) outside the write transaction to avoid blocking reads of the same DB.
+    if outcome[0] == "applied" and bool(_addon_published(addon_id)):
         generate_catalog()
-    flash(f"Set {field} from {suggestion['source']}.", "success")
-    return redirect(url_for("addon_detail", addon_id=addon_id))
+    return _next_redirect(session.get("username") or "", request, keep_addon=True, fallback_addon=addon_id)
+
+
+def _addon_published(addon_id: int) -> bool:
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT published FROM addons WHERE id = ?", (addon_id,)).fetchone()
+    finally:
+        conn.close()
+    return bool(row and row["published"])
+
+
+
 
 
 @app.route("/addons/<int:addon_id>/edit", methods=["GET", "POST"])
 def edit_addon(addon_id: int) -> Any:
     require_auth()
+    user_id = session.get("username") or ""
     conn = get_db()
     try:
         addon = conn.execute("SELECT * FROM addons WHERE id = ?", (addon_id,)).fetchone()
@@ -1221,7 +1505,10 @@ def edit_addon(addon_id: int) -> Any:
         conn.close()
     if not addon:
         raise NotFound()
-    ctx = {"mode": "edit", "addon": dict(addon), "package": {"filename": addon["package_name"], "available": bool(addon["package_path"] and Path(addon["package_path"]).is_file())}}
+    next_param = request.values.get("next") or ""
+    ctx = {"mode": "edit", "addon": dict(addon),
+           "package": {"filename": addon["package_name"], "available": bool(addon["package_path"] and Path(addon["package_path"]).is_file())},
+           "next": next_param}
     if request.method == "POST":
         form = _read_addon_form(defaults=dict(addon))
         if not form["title"] or not form["addon_id"] or not form["gamedir"]:
@@ -1249,7 +1536,7 @@ def edit_addon(addon_id: int) -> Any:
         if addon["published"]:
             generate_catalog()
         flash("Add-on updated.", "success")
-        return redirect(url_for("addon_detail", addon_id=addon_id))
+        return _next_redirect(user_id, request, keep_addon=True, fallback_addon=addon_id)
     return render_template("addon_form.html", **ctx)
 
 
@@ -1267,11 +1554,11 @@ def rebuild_addon(addon_id: int) -> Any:
     source = Path(addon["source_path"]) if addon["source_path"] else None
     if source is None or not source.is_file():
         flash("No source ZIP was kept for this add-on, so it cannot be rebuilt. Upload the ZIP again from Edit.", "error")
-        return redirect(url_for("addon_detail", addon_id=addon_id))
+        return _next_redirect(session.get("username") or "", request, keep_addon=True, fallback_addon=addon_id)
     fmt = detect_package_format(source)
     if fmt != "zip":
         flash("The kept source is not a ZIP file.", "error")
-        return redirect(url_for("addon_detail", addon_id=addon_id))
+        return _next_redirect(session.get("username") or "", request, keep_addon=True, fallback_addon=addon_id)
     token = uuid.uuid4().hex
     form = {k: (addon[k] or "") for k in FORM_FIELDS}
     _save_import(token, "replace", addon_id, form, source, addon["source_name"] or source.name, fmt, owns_source=False, keep_source=False, review=True)
@@ -1357,7 +1644,9 @@ def import_cancel(token: str) -> Any:
     imp = _import_or_404(token)
     _delete_import(token)
     flash("Import cancelled; the uploaded file was removed.", "success")
-    return redirect(url_for("edit_addon", addon_id=imp["addon_pk"]) if imp["addon_pk"] else url_for("dashboard"))
+    if imp and imp["addon_pk"]:
+        return _next_redirect(session.get("username") or "", request, keep_addon=True, fallback_addon=imp["addon_pk"])
+    return _next_redirect(session.get("username") or "", request)
 
 
 @app.route("/jobs/<job_id>")
@@ -1571,30 +1860,7 @@ def collection_batch_execute() -> Any:
     summary = f"Batch {action}: " + (", ".join(parts) or "nothing to change") + "."
     summary += " The public catalog was regenerated." if changed else " The catalog is unchanged."
     flash(summary, "success")
-    keep = {k: v for k, v in _view_query_strings(request).items() if v}
-    # clamp page after the change so a deletion on the last page does not land the user on a 404
-    page = int(keep.pop("page", "1") or "1")
-    page_size = int(keep.pop("page_size", str(COLLECTION_PAGE_SIZE_DEFAULT)) or str(COLLECTION_PAGE_SIZE_DEFAULT))
-    if page_size not in COLLECTION_PAGE_SIZES:
-        page_size = COLLECTION_PAGE_SIZE_DEFAULT
-    total_after = get_db().execute("SELECT COUNT(*) FROM addons").fetchone()[0] if False else 0
-    conn = get_db()
-    try:
-        # re-run the current filter to find the new total — keeps the page count consistent with the view
-        from flask import request as _req
-        with conn:
-            search = keep.get("q", "")
-            status = keep.get("status", "")
-            sort = keep.get("sort", "")
-            direction = keep.get("dir", "")
-            _select_sql, count_sql, params = _collection_query(search, status, sort, direction)
-            total_after = conn.execute(count_sql, params).fetchone()[0]
-    finally:
-        conn.close()
-    total_pages = max(1, -(-total_after // page_size))       # ceil division, same convention as the dashboard route
-    if page > total_pages:
-        page = total_pages
-    return redirect(url_for("dashboard", page=page, page_size=page_size, **keep))
+    return _next_redirect(session.get("username") or "", request)
 
 
 @app.route("/addons/<int:addon_id>/publish", methods=["POST"])
@@ -1607,7 +1873,71 @@ def publish_addon(addon_id: int) -> Any:
         conn.close()
     if not addon:
         raise NotFound()
-    return _job_response(jobs.submit("publish", f"Publish {addon['title']}", lambda progress: _run_publish(addon_id, progress)))
+    # Preserve the originating collection view through the job's eventual redirect.
+    user_id = session.get("username") or ""
+    next_raw = (request.values.get("next") or "").strip()
+    decoded = _decode_view_param(next_raw)
+    if decoded is not None:
+        view = decoded
+    else:
+        saved = _load_saved_view(user_id)
+        view = saved if saved is not None else _default_view()
+    conn = get_db()
+    try:
+        select_sql, count_sql, params = _collection_query(view["q"], view["status"], view["sort"], view["dir"])
+        total_after = conn.execute(count_sql, params).fetchone()[0]
+    finally:
+        conn.close()
+    view = _clamp_view_to_total(view, total_after)
+    _save_saved_view(user_id, view)
+    out_view = {k: v for k, v in view.items() if v}
+    return _job_response_with_view(
+        jobs.submit("publish", f"Publish {addon['title']}",
+                    lambda progress, _v=out_view: _run_publish_with_next(addon_id, progress, _v)),
+        user_id, out_view)
+
+
+def _run_publish_with_next(addon_id: int, progress, view: dict) -> str:
+    """Run the publish job and return a JobOutcome that carries the originating dashboard view."""
+    from tools.jobs import JobOutcome
+    conn = get_db()
+    try:
+        addon = conn.execute("SELECT * FROM addons WHERE id = ?", (addon_id,)).fetchone()
+    finally:
+        conn.close()
+    if not addon:
+        raise JobFailed("The add-on no longer exists.", "dashboard")
+    package_path = Path(addon["package_path"])
+    if not package_path.exists():
+        raise JobFailed("Publish failed: the package file is missing.", "dashboard")
+    progress.plan([("Checking package", 3), ("Copying to the public folder", 97)])
+    progress("Checking package", 0, 1)
+    validate_pak_paths(package_path)
+    progress("Checking package", 1, 1)
+    public_dir = _public_addons_dir()
+    public_file = public_dir / f"{addon['addon_id']}.pak"
+    tmp_file = public_dir / f".publish-{uuid.uuid4().hex}.tmp"
+    try:
+        sha, size = _copy_hashing(package_path, tmp_file, progress, "Copying to the public folder")
+        if addon["package_sha256"] and addon["package_sha256"] != sha:
+            raise ValueError("Stored package hash does not match the file on disk")
+        os.replace(tmp_file, public_file)
+    except (OSError, ValueError) as exc:
+        raise JobFailed(f"Publish failed: {exc}", "addon_detail", {"addon_id": addon_id}) from exc
+    finally:
+        tmp_file.unlink(missing_ok=True)
+    changed = 0
+    with db_txn() as conn:
+        changed = conn.execute(
+            "UPDATE addons SET published = 1, draft = 0, package_size = ?, package_sha256 = ?, package_mtime = ?, manifest_path = ?, "
+            "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (size, sha, int(package_path.stat().st_mtime), str(public_file), addon_id),
+        ).rowcount
+    if not changed:
+        public_file.unlink(missing_ok=True)
+        raise JobFailed("The add-on was deleted while it was being published.", "dashboard")
+    generate_catalog()
+    return JobOutcome("Add-on published and catalog regenerated.", "success", "dashboard", view, True)
 
 
 @app.route("/addons/<int:addon_id>/unpublish", methods=["POST"])
@@ -1621,7 +1951,7 @@ def unpublish_addon(addon_id: int) -> Any:
         flash("The add-on is already a draft.", "info")
     else:
         raise NotFound()
-    return redirect(url_for("dashboard"))
+    return _next_redirect(session.get("username") or "", request)
 
 
 @app.route("/addons/<int:addon_id>/delete", methods=["POST"])
@@ -1632,7 +1962,7 @@ def delete_addon(addon_id: int) -> Any:
         raise NotFound()
     generate_catalog()
     flash("Add-on deleted.", "success")
-    return redirect(url_for("dashboard"))
+    return _next_redirect(session.get("username") or "", request)
 
 
 @app.route("/content.json")

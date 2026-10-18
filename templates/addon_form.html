@@ -1,6 +1,7 @@
 {% extends 'base.html' %}
 {% block content %}
 <div class="card">
+  <p class="small"><a href="{{ dashboard_return_url }}">‹ Back to the collection</a></p>
   <h2>{% if mode == 'edit' %}Edit add-on{% else %}Add a new add-on{% endif %}</h2>
   {% if package %}
   <div class="card" style="margin:12px 0">
@@ -10,6 +11,7 @@
   {% endif %}
   <form method="post" enctype="multipart/form-data" id="addon-form">
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="next" value="{{ next }}">
     <p>
       <label>Title</label><br>
       <input name="title" value="{{ addon.title if addon else '' }}" required>
@@ -58,6 +60,7 @@
       {% with plan=None, imp=None, options=default_options, form={'title': '', 'gamedir': ''} %}{% include "_convert_options.html" %}{% endwith %}
     </div>
     <button type="submit" id="submit-btn">{% if mode == 'edit' %}Save{% else %}Upload{% endif %}</button>
+    <a href="{{ dashboard_return_url }}" style="margin-left:12px">Cancel</a>
     <div id="upload-box" hidden>
       <div class="progress"><div id="upload-bar"></div></div>
       <p id="upload-text" class="small"></p>

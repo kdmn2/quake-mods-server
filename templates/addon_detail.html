@@ -1,6 +1,7 @@
 {% extends 'base.html' %}
 {% block content %}
 <div class="card">
+  <p class="small"><a href="{{ dashboard_return_url }}">‹ Back to the collection</a></p>
   <h2>{{ addon.title }}</h2>
   <p><strong>ID:</strong> {{ addon.addon_id }}</p>
   <p><strong>Installation directory:</strong> {{ addon.gamedir }}</p>
@@ -14,27 +15,32 @@
     {% if addon.source_path %}kept on the server ({{ addon.source_name }}) —
     <form style="display:inline" method="post" action="{{ url_for('rebuild_addon', addon_id=addon.id) }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="next" value="{{ next }}">
       <button type="submit">Rebuild with different options…</button>
     </form>
     {% else %}not kept (choose “Keep the uploaded ZIP” when uploading to be able to rebuild later){% endif %}
   </p>
   <p class="small muted">You can also import a ZIP from an absolute server path on the add-on form if you prefer not to upload through the browser.</p>
   <div class="inline">
-    <a href="{{ url_for('edit_addon', addon_id=addon.id) }}"><button>Edit</button></a>
+    <a href="{{ url_for('edit_addon', addon_id=addon.id, next=next) }}"><button>Edit</button></a>
     {% if addon.published %}
     <form method="post" action="{{ url_for('unpublish_addon', addon_id=addon.id) }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="next" value="{{ next }}">
       <button type="submit">Unpublish</button>
     </form>
     {% else %}
     <form method="post" action="{{ url_for('publish_addon', addon_id=addon.id) }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="next" value="{{ next }}">
       <button type="submit">Publish</button>
     </form>
     {% endif %}
-    <form method="post" action="{{ url_for('delete_addon', addon_id=addon.id) }}">
+    <form method="post" action="{{ url_for('delete_addon', addon_id=addon.id) }}"
+          onsubmit="return confirm('Permanently delete this add-on? This cannot be undone.');">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-      <button class="danger" type="submit">Delete</button>
+      <input type="hidden" name="next" value="{{ next }}">
+      <button type="submit" class="danger">Delete</button>
     </form>
   </div>
 </div>
@@ -73,6 +79,7 @@
         <td>
           <form method="post" action="{{ url_for('apply_suggestion', addon_id=addon.id, field=field) }}">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <input type="hidden" name="next" value="{{ next }}">
             <button type="submit">Apply</button>
           </form>
         </td>
