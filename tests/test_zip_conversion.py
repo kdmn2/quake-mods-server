@@ -199,6 +199,23 @@ class ZipConversionTests(unittest.TestCase):
         self.assertRejected([("moda/maps/a.bsp", b"a"), ("modb/maps/b.bsp", b"b")], "ambiguous")
         self.assertRejected([("pak0.pak", make_pak_bytes([("a", b"a")])), ("modb/maps/b.bsp", b"b")], "ambiguous")
 
+    def test_bot_navigation_directory_is_game_content_not_a_second_root(self):
+        """Layout observed in mc_retrojam3.zip (and 5 other releases in the Quaddicted catalogue): bots/navigation/*.nav
+        beside maps/, gfx/, docs/ and src/. The bots/ folder is runtime data for bots, so the release is rooted."""
+        lessons = b"how to install"
+        members = [
+            ("maps/mc_rj3_one.bsp", b"first BSP"), ("maps/mc_rj3_one.lit", b"lighting"),
+            ("gfx/conback.lmp", b"conback"), ("bots/navigation/mc_rj3_one.nav", b"nav"),
+            ("docs/mc_rj3_one.txt", lessons), ("src/mc_rj3_one.map", b"map source"),
+            ("mapdb.json", b'{"maps": {}}'), ("mc_retrojam3_readme.txt", b"readme"),
+            ("Remastered Map Center Retrojam3.lnk", b"windows shortcut"), ("descript.ion", b"descript"),
+        ]
+        got, info, _ = self.convert(members, name="mc_retrojam3.zip")
+        self.assertEqual(info["root_mapping"], "rooted")
+        self.assertEqual(info["wrapper"], None)
+        # every member is kept with its exact path and bytes, root-level files included
+        self.assertEqual(got, dict(members))
+
     def test_macosx_resource_forks_are_ignored(self):
         got, _, _ = self.convert([("mod/maps/m.bsp", b"m"), ("__MACOSX/mod/._m.bsp", b"junk")])
         self.assertEqual(got, {"maps/m.bsp": b"m"})
@@ -207,6 +224,20 @@ class ZipConversionTests(unittest.TestCase):
         a = classify_release_layout(["maps/a", "progs.dat", "pun.txt"])
         b = classify_release_layout(["pun.txt", "progs.dat", "maps/a"])
         self.assertEqual(a, b)
+
+    def test_blockers_name_the_unrecognised_directories(self):
+        """A rejection must say why: which top-level folders were unmatched, and what was matched."""
+        layout = classify_release_layout(["maps/a.bsp", "botdir/x.nav", "docs/readme.txt", "readme.txt"])
+        self.assertEqual(layout["root_mapping"], "ambiguous")
+        self.assertEqual(layout["unknown_dirs"], ["botdir"])
+        z = self.tmp / "amb.zip"
+        write_zip(z, [("maps/a.bsp", b"a"), ("botdir/x.nav", b"n"), ("progs.dat", b"p")])
+        with self.assertRaises(ValueError) as ctx:
+            build_single_pak_from_zip(z, self.tmp / "amb.pak")
+        message = str(ctx.exception)
+        self.assertIn("botdir", message)
+        self.assertIn("maps", message)
+        self.assertIn("Treat the archive root as the mod", message)
 
     def test_inspect_reports_stripped_paths_without_decompressing(self):
         z = self.tmp / "i.zip"

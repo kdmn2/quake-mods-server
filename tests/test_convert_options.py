@@ -207,7 +207,8 @@ class RootSelectionTests(Base):
         z = self.zip(self.AMBIG())
         with self.assertRaises(ValueError) as ctx:
             build_single_pak_from_zip(z, self.tmp / "x.pak")
-        self.assertIn("ambiguous root mapping", str(ctx.exception))
+        self.assertIn("unrecognised top-level directories: moda, modb", str(ctx.exception))
+        self.assertIn("Treat the archive root as the mod", str(ctx.exception))
 
     def test_selected_root_is_stripped_and_the_rest_recorded_as_excluded(self):
         got, info, _, _ = self.build(self.AMBIG(), ConvertOptions(root="moda"))
@@ -230,9 +231,33 @@ class RootSelectionTests(Base):
     def test_plan_for_an_ambiguous_release_offers_the_choices(self):
         plan = plan_zip_release(self.zip(self.AMBIG()))
         self.assertEqual(plan["top_level_dirs"], ["moda", "modb"])
-        self.assertTrue(any("ambiguous root mapping" in b for b in plan["blockers"]))
+        self.assertTrue(any("ambiguous" in b for b in plan["blockers"]))
         plan = plan_zip_release(self.zip(self.AMBIG()), ConvertOptions(root="modb"))
         self.assertEqual((plan["blockers"], plan["entries"], plan["wrapper"]), ([], 1, "modb"))
+
+    def test_rooted_choice_keeps_every_top_level_folder_as_it_is(self):
+        """The administrator's explicit fallback when the unrecognised folders belong to the release."""
+        got, info, _, _ = self.build(self.AMBIG(), ConvertOptions(rooted=True))
+        self.assertEqual(got, {"moda/maps/a.bsp": b"a", "moda/readme.txt": b"ra", "modb/maps/b.bsp": b"b", "notes.txt": b"n"})
+        self.assertEqual((info["root_mapping"], info["wrapper"]), ("selected-rooted", None))
+        self.assertFalse(info["excluded"] and info["excluded"]["total"])
+
+    def test_rooted_choice_builds_after_the_plan_preview_clears_the_blocker(self):
+        z = self.zip(self.AMBIG())
+        plan = plan_zip_release(z, ConvertOptions(rooted=True))
+        self.assertEqual((plan["root_mapping"], plan["blockers"], plan["entries"]), ("selected-rooted", [], 4))
+
+    def test_root_and_rooted_choice_are_mutually_exclusive(self):
+        with self.assertRaises(ValueError) as ctx:
+            ConvertOptions.from_dict({"root": "moda", "rooted": True})
+        self.assertIn("not both", str(ctx.exception))
+        got, info, _, _ = self.build(self.AMBIG(), ConvertOptions(root="moda", rooted=False))
+        self.assertEqual(info["root_mapping"], "selected")
+
+    def test_rooted_choice_is_recorded_in_the_options_and_not_implicit(self):
+        _, info, _, _ = self.build(self.AMBIG(), ConvertOptions(rooted=True))
+        self.assertTrue(info["options"]["rooted"])
+        self.assertEqual(info["root_mapping"], "selected-rooted")
 
 
 class PlanTests(Base):

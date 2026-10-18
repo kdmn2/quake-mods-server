@@ -39,6 +39,7 @@ class ConvertOptions:
     exclude_presets: tuple[str, ...] = ()
     exclude_patterns: tuple[str, ...] = ()
     root: str | None = None
+    rooted: bool = False                            # administrator: treat the archive root as the mod root (keep every top-level folder)
     reencode_textures: bool = False
     reencode_skyboxes: bool = False
     mapdb: tuple[str, str] | None = None            # (episode name, episode dir) written only if the release has no mapdb.json
@@ -56,6 +57,7 @@ class ConvertOptions:
     def to_dict(self) -> dict[str, Any]:
         return {
             "exclude_presets": list(self.exclude_presets), "exclude_patterns": list(self.exclude_patterns), "root": self.root,
+            "rooted": self.rooted,
             "reencode_textures": self.reencode_textures, "reencode_skyboxes": self.reencode_skyboxes,
             "mapdb": list(self.mapdb) if self.mapdb else None,
         }
@@ -77,6 +79,9 @@ class ConvertOptions:
             root = None
         elif not isinstance(root, str) or "/" in root or root in (".", "..") or "\0" in root or len(root) > 120:
             raise ValueError("Invalid root directory selection")
+        rooted = bool(raw.get("rooted"))
+        if root and rooted:
+            raise ValueError("Choose either one root folder or “treat the archive root as the mod”, not both")
         mapdb = raw.get("mapdb")
         mapdb_t: tuple[str, str] | None = None
         if mapdb:
@@ -86,7 +91,7 @@ class ConvertOptions:
             if not name or not d or len(name) > 200 or "\0" in name + d:
                 raise ValueError("The generated mapdb.json needs a non-empty name and directory")
             mapdb_t = (name, d)
-        return cls(tuple(dict.fromkeys(presets)), tuple(dict.fromkeys(patterns)), root,
+        return cls(tuple(dict.fromkeys(presets)), tuple(dict.fromkeys(patterns)), root, rooted,
                    bool(raw.get("reencode_textures")), bool(raw.get("reencode_skyboxes")), mapdb_t)
 
 
@@ -146,6 +151,7 @@ def options_from_form(form: Any, defaults: dict[str, str] | None = None) -> Conv
         "exclude_presets": form.getlist("exclude_presets"),
         "exclude_patterns": form.get("exclude_patterns", ""),
         "root": form.get("root", ""),
+        "rooted": form.get("rooted", ""),
         "reencode_textures": form.get("reencode_textures"),
         "reencode_skyboxes": form.get("reencode_skyboxes"),
         "mapdb": mapdb,

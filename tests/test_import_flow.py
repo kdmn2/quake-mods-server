@@ -386,12 +386,12 @@ class ReviewFlowTests(FlowBase):
         self.assertEqual(self.status(self.job_id_from(res))["state"], "done")
         token = self.last_import()["token"]
         html = self.c.get(f"/imports/{token}").get_data(as_text=True)
-        self.assertIn("ambiguous root mapping", html)
+        self.assertIn("ambiguous layout", html)
         self.assertRegex(html, r'<button type="submit"[^>]*formaction="[^"]*build"[^>]*disabled')
         # building anyway is refused by the converter too, and the upload is kept for another try
         st = self.status(self.job_id_from(self.post(f"/imports/{token}/build", {})))
         self.assertEqual(st["state"], "failed")
-        self.assertIn("ambiguous root mapping", st["message"])
+        self.assertIn("ambiguous layout", st["message"])
         self.assertEqual(st["next_url"], f"/imports/{token}")
         self.assertIsNotNone(self.last_import())
         st = self.status(self.job_id_from(self.post(f"/imports/{token}/build", {"root": "modb"})))
@@ -799,6 +799,60 @@ class FormOptionsTests(FlowBase):
         got = parse_pak(Path(self.row("swap")["package_path"]))
         self.assertIn("gfx/t.png", got)
         self.assertNotIn("maps/b.map", got)
+
+
+class Retrojam3LayoutFlow(FlowBase):
+    """End-to-end for the layout observed in mc_retrojam3.zip: rooted content beside docs/, src/, bots/, root files.
+    The expected package content is written down literally below — independently of the resolver under test."""
+
+    MEMBERS = {
+        "maps/mc_rj3_one.bsp": b"FIRST BSP", "maps/mc_rj3_one.lit": b"LIGHTING",
+        "gfx/conback.lmp": b"CONBACK", "bots/navigation/mc_rj3_one.nav": b"NAV DATA",
+        "docs/mc_rj3_one.txt": b"install doc", "src/mc_rj3_one.map": b"map source",
+        "mapdb.json": b'{"maps": {"mc_rj3_one": {"title": "One"}}}',
+        "mc_retrojam3_readme.txt": b"Title : Retrojam 3\nAuthor : MC\n", "descript.ion": b"idx",
+    }
+
+    def test_layout_to_draft_to_explicit_publish_to_download(self):
+        z = self.tmp / "mc_retrojam3.zip"
+        write_zip(z, list(self.MEMBERS.items()))
+        job_id = self.job_id_from(self.start_upload(z, "mc_retrojam3"))          # no review: build straight to a draft
+        st = self.finish(job_id)
+        self.assertEqual(st["state"], "done", st)
+        # draft (not published), and the package holds exactly the members, byte for byte
+        self.assertEqual(self.c.get("/addons/mc_retrojam3.pak").status_code, 404)
+        self.publish("mc_retrojam3")
+        entry = [e for e in self.catalog() if e["gamedir"] == "mc_retrojam3"][0]
+        served = self.c.get("/" + entry["download"]).data
+        out = self.tmp / "served.pak"
+        out.write_bytes(served)
+        self.assertEqual(parse_pak(out), self.MEMBERS)
+        self.assertEqual(entry["size"], len(served))
+
+    def test_review_page_offers_the_rooted_fallback_and_records_it(self):
+        # genuine ambiguity: the review flow must resolve it without a re-upload
+        z = self.tmp / "tworoots.zip"
+        write_zip(z, [("moda/maps/a.bsp", b"a"), ("modb/maps/b.bsp", b"b")])
+        plan_job = self.job_id_from(self.start_upload(z, "tworoots", review="1"))
+        self.assertEqual(self.finish(plan_job)["state"], "done")                 # a preview was made
+        token = self.last_import()["token"]
+        plan = json.loads(self.last_import()["plan_json"])
+        self.assertTrue(any("ambiguous" in b for b in plan["blockers"]))
+        html = self.c.get(f"/imports/{token}").get_data(as_text=True)
+        self.assertIn("Treat the archive root as the mod", html)
+        res = self.post(f"/imports/{token}/plan", {"rooted": "1"})
+        self.assertEqual(res.status_code, 302)
+        html = self.c.get(f"/imports/{token}").get_data(as_text=True)
+        self.assertIn("selected-rooted", html)
+        job2 = self.job_id_from(self.post(f"/imports/{token}/build", {"rooted": "1"}))
+        st = self.finish(job2)
+        self.assertEqual(st["state"], "done", st)
+        got = parse_pak(self.row("tworoots")["package_path"])
+        # the explicit rooted fallback keeps everything, at its archive paths, byte for byte
+        self.assertEqual(got, {"moda/maps/a.bsp": b"a", "modb/maps/b.bsp": b"b"})
+        rec = json.loads(self.row("tworoots")["conversion_report"])
+        self.assertEqual(rec["root_mapping"], "selected-rooted")
+        self.assertTrue(rec["options"]["rooted"])
 
 
 class HousekeepingTests(FlowBase):

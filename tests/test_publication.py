@@ -118,7 +118,7 @@ class PublicationTests(PublicationBase):
         bad = self.tmp / "bad.zip"
         write_zip(bad, [("moda/maps/a", b"a"), ("modb/maps/b", b"b")])
         res = self.upload("pub", bad.read_bytes(), filename="bad.zip", path=f"/addons/{row['id']}/edit")
-        self.assertIn(b"ambiguous root mapping", res.data)
+        self.assertIn(b"ambiguous layout", res.data)
         self.assertEqual(self.c.get("/addons/pub.pak").data, PAK_A)
         self.assertEqual(Path(row["package_path"]).read_bytes(), PAK_A)
         self.assertEqual(self.catalog()[0]["size"], len(PAK_A))

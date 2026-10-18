@@ -606,10 +606,10 @@ class ReviewTests(BatchBase):
         bid = self.batch_id(self.submit_urls(self.url("/amb")))
         item = self.status(bid)["items"][0]
         self.assertEqual(item["state"], "awaiting_review")
-        self.assertIn("ambiguous root mapping", item["message"])
+        self.assertIn("ambiguous layout", item["message"])
         self.assertEqual(self.draft_count(), 0)
         page = self.c.get(item["review_url"]).get_data(as_text=True)
-        self.assertIn("ambiguous root mapping", page)
+        self.assertIn("ambiguous layout", page)
         self.assertIn('value="moda"', page)
         token = item["review_url"].rsplit("/", 1)[-1]
         self.post(f"/imports/{token}/build", {"root": "modb"})

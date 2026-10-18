@@ -415,7 +415,7 @@ class AdminWorkflowTests(unittest.TestCase):
             content_type="multipart/form-data",
             follow_redirects=True,
         )
-        self.assertIn(b"ambiguous root mapping", res.data)
+        self.assertIn(b"ambiguous layout", res.data)
 
     def test_zip_conversion_is_order_invariant(self):
         from tools.catalog import build_single_pak_from_zip
@@ -485,7 +485,7 @@ class AdminWorkflowTests(unittest.TestCase):
             content_type="multipart/form-data",
             follow_redirects=True,
         )
-        self.assertIn(b"ambiguous root mapping", res.data)
+        self.assertIn(b"ambiguous layout", res.data)
 
     def test_zip_release_allows_pak_only(self):
         self._login()

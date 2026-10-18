@@ -14,7 +14,7 @@
   <div class="sev warning">
     <strong>This package cannot be built as it is:</strong>
     <ul>{% for b in plan.blockers %}<li>{{ b }}</li>{% endfor %}</ul>
-    {% if plan.top_level_dirs and plan.root_mapping == 'ambiguous' %}Choose which folder is the mod under “Root folder”, then update the preview.{% endif %}
+    {% if plan.top_level_dirs and plan.root_mapping == 'ambiguous' %}See “Root folder”: choose one folder as the mod, or tick “Treat the archive root as the mod” to keep everything and build; then update the preview.{% endif %}
   </div>
   {% endif %}
   <table class="table-sm">

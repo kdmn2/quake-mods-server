@@ -101,6 +101,9 @@ MAX_PAK_BYTES = 2**31 - 1       # filepos/filelen are signed 32-bit in the engin
 CONTENT_DIRS = frozenset({
     "maps", "progs", "sound", "music", "gfx", "models", "textures", "sprites", "env",
     "demos", "demo", "video", "glsl", "particles", "skins", "cdtracks", "locs", "localization",
+    "bots",  # bot navigation data (.nav, e.g. bots/navigation/); read from the game directory at runtime.
+             # Evidence: of the 1947-entry Quaddicted catalogue (checked 2026-10-18), every archive shipping a
+             # top-level bots/ directory (6) has it beside maps/ and other game content, never as a lone wrapper.
 })
 AUX_DIRS = frozenset({"doc", "docs", "documentation", "source", "sources", "src", "mapsrc", "extras", "screenshots", "images"})
 NUMBERED_PAK_RE = re.compile(r"^pak(0|[1-9][0-9]*)\.pak$", re.IGNORECASE)
@@ -181,10 +184,11 @@ def _normalize_zip_member_path(name: str) -> str:
 def classify_release_layout(paths: Iterable[str]) -> dict[str, Any]:
     """Infer the release root from member paths only. File inclusion is decided elsewhere.
 
-    Top-level directories are content (maps/, sound/, ...), auxiliary (docs/, src/, ...) or other.
+    Top-level directories are content (maps/, sound/, bots/, ...), auxiliary (docs/, src/, ...) or other.
     rooted    - no "other" directory; content, auxiliary dirs and root-level files are kept as they are.
     wrapper   - exactly one "other" directory and no root-level game files/content dirs; it is stripped.
     ambiguous - several "other" directories, or one "other" directory mixed with game content beside it.
+                `unknown_dirs` names the unrecognized directories so the error can say exactly why.
     """
     paths = list(paths)
     root_files = sorted(p for p in paths if "/" not in p)
@@ -193,13 +197,14 @@ def classify_release_layout(paths: Iterable[str]) -> dict[str, Any]:
     has_game_root = any(d.lower() in CONTENT_DIRS for d in top_dirs) or any(
         NUMBERED_PAK_RE.match(f) or f.lower() == "progs.dat" for f in root_files)
     result: dict[str, Any] = {"root_mapping": "ambiguous", "wrapper_dirs": [], "has_wrapper": False,
-                              "root_level_files": root_files, "top_level_dirs": top_dirs}
+                              "root_level_files": root_files, "top_level_dirs": top_dirs, "unknown_dirs": other}
     if not paths:
         return result
     if not other:
         result["root_mapping"] = "rooted"
     elif len(other) == 1 and not has_game_root:
-        result.update(root_mapping="wrapper", wrapper_dirs=other, has_wrapper=True)
+        result["root_mapping"], result["wrapper_dirs"], result["has_wrapper"] = "wrapper", other, True
+        result["unknown_dirs"] = []
     return result
 
 
@@ -375,22 +380,41 @@ def _resolve_release(source: Path, zf: zipfile.ZipFile, tmpdir: Path, options: C
                          for i, n in members if not n.startswith(prefix)]
         res.layout = {"root_mapping": "selected", "wrapper_dirs": [options.root], "has_wrapper": True, "top_level_dirs": sorted(top)}
     else:
-        layout = classify_release_layout(name for _, name in members)
-        res.layout = layout
-        eff = list(members)
-        if layout["root_mapping"] == "ambiguous":
-            _block(res, strict, "ZIP release has ambiguous root mapping; provide a single wrapper directory or already-rooted game content", review=True)
+        if options.rooted:
+            top = sorted({n.split("/", 1)[0] for _, n in members if "/" in n})
+            # The administrator explicitly decided the archive root is the mod root (the review page offers this when
+            # the layout leaves an unrecognised top-level directory). Nothing is dropped: every member keeps its path.
+            res.layout = {"root_mapping": "selected-rooted", "wrapper_dirs": [], "has_wrapper": False,
+                          "root_level_files": sorted(n for _, n in members if "/" not in n),
+                          "top_level_dirs": top, "unknown_dirs": [], "selected": True}
+            eff = list(members)
         else:
-            try:
-                eff = _strip_wrapper(layout, members)
-            except ValueError as exc:
-                _block(res, strict, str(exc))
+            layout = classify_release_layout(name for _, name in members)
+            res.layout = layout
+            eff = list(members)
+            if layout["root_mapping"] == "ambiguous":
+                content = sorted(d for d in layout["top_level_dirs"] if d.lower() in CONTENT_DIRS)
+                aux = sorted(d for d in layout["top_level_dirs"] if d.lower() in AUX_DIRS)
+                unknown = layout.get("unknown_dirs") or []
+                detail = (f"unrecognised top-level directories: {', '.join(unknown)}"
+                          + (" (each could be a mod root)" if len(unknown) > 1 else "")
+                          if unknown else f"several candidate roots: {', '.join(sorted(set(layout['top_level_dirs'])))}")
+                others = [m for m in (("content", content), ("auxiliary", aux)) if m[1]]
+                if others:
+                    detail += "; " + ", ".join(f"{label} directories: {', '.join(dirs)}" for label, dirs in others)
+                _block(res, strict, f"ZIP release has an ambiguous layout ({detail}). Under “Root folder”, choose one directory, "
+                                    f"or tick “Treat the archive root as the mod” to keep every top-level folder as it is, then update the preview.", review=True)
             else:
-                names = [n for _, n in eff]
-                inner_dirs = {n.split("/", 1)[0] for n in names if "/" in n}
-                if layout["has_wrapper"] and len(inner_dirs) == 1 and not any("/" not in n for n in names) \
-                        and next(iter(inner_dirs)).lower() not in CONTENT_DIRS | AUX_DIRS:
-                    _block(res, strict, f"ZIP release has nested wrapper directories ({layout['wrapper_dirs'][0]}/{next(iter(inner_dirs))}/); ambiguous root mapping", review=True)
+                try:
+                    eff = _strip_wrapper(layout, members)
+                except ValueError as exc:
+                    _block(res, strict, str(exc))
+                else:
+                    names = [n for _, n in eff]
+                    inner_dirs = {n.split("/", 1)[0] for n in names if "/" in n}
+                    if layout["has_wrapper"] and len(inner_dirs) == 1 and not any("/" not in n for n in names) \
+                            and next(iter(inner_dirs)).lower() not in CONTENT_DIRS | AUX_DIRS:
+                        _block(res, strict, f"ZIP release has nested wrapper directories ({layout['wrapper_dirs'][0]}/{next(iter(inner_dirs))}/); ambiguous root mapping", review=True)
     res.effective_count = len(eff)
     patterns = options.patterns()
 

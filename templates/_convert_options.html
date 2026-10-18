@@ -8,13 +8,18 @@
     {% elif plan.top_level_dirs %}
     <div class="opt">
       <h4>Root folder</h4>
-      <p class="small muted">Normally detected automatically. Choose a folder to treat it as the mod and leave everything outside it out of the package (needed when the ZIP holds several mods).</p>
+      <p class="small muted">Normally detected automatically. Choose a folder to treat it as the mod and leave everything outside it out of the package (needed when the ZIP holds several mods).
+        The following top-level folders were found: {% for d in plan.top_level_dirs %}{% if not loop.first %}, {% endif %}<span class="mono">{{ d }}/</span>{% endfor %}.</p>
       <select name="root">
-        <option value="">Automatic{% if plan and plan.root_mapping and plan.root_mapping != 'selected' %} ({{ plan.root_mapping }}){% endif %}</option>
+        <option value="">Automatic{% if plan and plan.root_mapping and plan.root_mapping != 'selected' and plan.root_mapping != 'selected-rooted' %} ({{ plan.root_mapping }}){% endif %}</option>
         {% for d in plan.top_level_dirs %}<option value="{{ d }}" {% if options.root == d %}selected{% endif %}>{{ d }}/</option>{% endfor %}
       </select>
+      {% if plan.root_mapping == 'ambiguous' %}
+      <label style="display:block;margin-top:8px"><input type="checkbox" name="rooted" value="1" {% if options.rooted %}checked{% endif %}>
+        Treat the archive root as the mod — keep every top-level folder as it is (choose this when the unrecognised folders are part of the release, e.g. <span class="mono">bots/</span> navigation files)</label>
+      {% elif options.rooted %}<input type="hidden" name="rooted" value="1">{% endif %}
     </div>
-    {% endif %}
+    {% elif options.rooted %}<input type="hidden" name="rooted" value="1">{% endif %}
 
     <div class="opt">
       <h4>Leave out files Ironwail does not need</h4>

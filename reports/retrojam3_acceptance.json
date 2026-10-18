@@ -1,0 +1,16 @@
+{
+  "archive": "mc_retrojam3.zip",
+  "input_sha256": "28efa4c614cce3a4a470433b56cb3f3972474caa26b2cf12e82dcc9c698416fe",
+  "mapping": "rooted (automatic; bots/ recognized as game content)",
+  "artifact_sha256": "c92f7757ac8bb9023920981dc744c3a51d8d6dee3724acbe305ec6e4d4f46b7c",
+  "artifact_size": 90241026,
+  "entry_count": 58,
+  "expected_count": 58,
+  "missing": [],
+  "unexpected": [],
+  "mismatched_hashes": [],
+  "overrides": 0,
+  "exclusions": 0,
+  "verified": true,
+  "note": "upload -> build job -> draft -> publish job -> artifact fetched back; parsed independently of the converter"
+}
