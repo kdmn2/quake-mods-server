@@ -24,6 +24,7 @@
     <div class="opt">
       <h4>Leave out files Ironwail does not need</h4>
       <p class="small muted">Removes content from the package. The preview lists exactly what goes.</p>
+      <input type="hidden" name="exclude_presets_submitted" value="1">
       {% for key, preset in presets.items() %}
       {% set stat = plan.preset_stats[key] if plan else None %}
       <label><input type="checkbox" name="exclude_presets" value="{{ key }}" {% if key in options.exclude_presets %}checked{% endif %}>
@@ -45,9 +46,11 @@
       </p>
       {% set cand = plan.image_candidates if plan else None %}
       <label><input type="checkbox" name="reencode_textures" value="1" {% if options.reencode_textures %}checked{% endif %}>
-        Textures and other images{% if cand %} — {{ cand.textures.files }} TGA file(s), {{ cand.textures.bytes|filesize }}{% endif %}</label><br>
+        Textures and other images{% if cand %} — {{ cand.textures.files }} TGA file(s), {{ cand.textures.bytes|filesize }}{% endif %}</label>
+      <input type="hidden" name="reencode_textures" value="0"><br>
       <label><input type="checkbox" name="reencode_skyboxes" value="1" {% if options.reencode_skyboxes %}checked{% endif %}>
         Skybox faces (<span class="mono">gfx/env/</span>){% if cand %} — {{ cand.skyboxes.files }} TGA file(s), {{ cand.skyboxes.bytes|filesize }}{% endif %}</label>
+      <input type="hidden" name="reencode_skyboxes" value="0">
       <div class="small muted" style="margin-left:24px">Maps load PNG skyboxes normally. The only visible difference is that Ironwail's console tab-completion for the <code>sky</code> command lists TGA skyboxes only (host_cmd.c, SkyList_AddFile), so converted skies will not be suggested there.</div>
     </div>
 

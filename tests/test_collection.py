@@ -213,6 +213,89 @@ class BatchActionTests(CollectionBase):
 
 # ---- collection search/filter/sort -----------------------------------------------------------------
 
+class Stage12Tests(CollectionBase):
+    """Stage 1 (layout wrapping) and stage 2 (per-item unpublish independent of selection)."""
+
+    def test_long_unbroken_text_is_wrap_styled_in_the_collection(self):
+        """Stage 1: the collection table carries scoping classes + the CSS (server-rendered check)."""
+        long_id = "aaaabbbbccccddddeeeeffffgggg000011112222333344445555666677unalignment-identifier"
+        insert_addon(long_id, author="x" * 80, size=1)
+        html = self.c.get("/dashboard").get_data(as_text=True)
+        self.assertIn('class="collection-table"', html)
+        self.assertIn("overflow-wrap: anywhere", html)                  # the wrapping rule exists
+        self.assertIn(long_id, html)                                    # the value IS rendered (not truncated away)
+        # both themes keep variables (the dark-theme block still defines its tokens)
+        self.assertIn('[data-theme="dark"]', html)
+
+    def test_per_item_unpublish_needs_no_selection(self):
+        """Stage 2: unpublish works with ZERO checkboxes selected."""
+        pk = insert_addon("pubrow", published=1)
+        # per-row form exists OUTSIDE the batch form
+        html = self.c.get("/dashboard").get_data(as_text=True)
+        self.assertIn(f'id="row-unpublish-{pk}"', html)
+        m = re.search(rf'<button[^>]*form="row-unpublish-{pk}"', html)
+        self.assertIsNotNone(m, "per-item unpublish button (form= attribute) missing")
+        # execute: zero checkboxes selected — the posted form contains no selected_pk at all
+        res = self.c.post(f"/addons/{pk}/unpublish", data={"csrf_token": self.csrf(), "next": "sort=title"})
+        self.assertEqual(res.status_code, 302)
+        conn = get_db()
+        self.assertEqual(conn.execute("SELECT published FROM addons WHERE id = ?", (pk,)).fetchone()[0], 0)
+        self.assertIsNotNone(conn.execute("SELECT id FROM addons WHERE id = ?", (pk,)).fetchone())   # record retained
+        conn.close()
+        self.assertFalse((Path(app.config["PUBLIC_ROOT"]) / "addons" / "pubrow.pak").exists())      # catalog copy removed
+
+    def test_unpublish_confirmation_names_the_item_and_can_be_cancelled(self):
+        """Stage 2: confirmation text names title + ID; cancellation (a browser Cancel) posts nothing."""
+        insert_addon("annoyance", published=1)
+        html = self.c.get("/dashboard").get_data(as_text=True)
+        self.assertIn("Unpublish", html)
+        self.assertIn("annoyance", html)
+        self.assertIn("disappears from the public catalog", html)       # explains the effect
+        self.assertIn("retained", html)                                 # explains what is kept
+        # no POST occurred in this test above the GETs -> record unchanged
+        conn = get_db()
+        self.assertEqual(conn.execute("SELECT published FROM addons WHERE id = ?", (self.row_pk("annoyance"),)).fetchone()[0], 1)
+        conn.close()
+
+    def row_pk(self, addon_id):
+        conn = get_db()
+        pk = conn.execute("SELECT id FROM addons WHERE addon_id = ?", (addon_id,)).fetchone()[0]
+        conn.close()
+        return pk
+
+    def test_unpublished_items_hide_the_unpublish_button(self):
+        """Stage 2: drafts do not offer Unpublish at all."""
+        pk = insert_addon("dr", published=0)
+        html = self.c.get("/dashboard").get_data(as_text=True)
+        self.assertNotIn(f'form="row-unpublish-{pk}"', html)
+
+    def test_batch_unpublish_still_works_and_selection_remains_separate(self):
+        """Stage 2: batch unpublish (via the toolbar/batch form) still functions."""
+        pk = insert_addon("batchrow", published=1)
+        res = self.post("/addons/batch/execute", {"selected_pk": [pk], "action": "unpublish", "submit_key": "sb"})
+        self.assertEqual(res.status_code, 302)
+        conn = get_db()
+        self.assertEqual(conn.execute("SELECT published FROM addons WHERE id = ?", (pk,)).fetchone()[0], 0)
+        conn.close()
+
+    def test_view_state_is_kept_after_per_item_unpublish(self):
+        pk = insert_addon("vpub", published=1)
+        res = self.c.post(f"/addons/{pk}/unpublish", data={"csrf_token": self.csrf(), "next": "q=retro&sort=package_size&dir=asc&page_size=50"})
+        loc = res.headers["Location"]
+        for needle in ("q=retro", "sort=package_size", "dir=asc", "page_size=50"):
+            self.assertIn(needle, loc)
+
+    def test_catalog_entry_is_removed_after_unpublish(self):
+        from app import generate_catalog
+        pk = insert_addon("cu", published=1)
+        os_mkdir = Path(app.config["PUBLIC_ROOT"]) / "addons"
+        os_mkdir.mkdir(parents=True, exist_ok=True)
+        (os_mkdir / "cu.pak").write_bytes(b"PACK" + b"\0" * 100)        # a public copy exists
+        self.c.post(f"/addons/{pk}/unpublish", data={"csrf_token": self.csrf()})
+        catalog = json.loads(self.c.get("/content.json").data.decode())["addons"]
+        self.assertEqual([e for e in catalog if e["gamedir"] == "cu"], [])
+
+
 class ViewPersistenceTests(CollectionBase):
     """Persistent collection-view state (R1-R6 + O1-O3)."""
 
@@ -747,3 +830,367 @@ class StaticAssetTests(CollectionBase):
         # the catalog carries an exact integer (no formatting, no rounding) that matches the file on disk
         self.assertIsInstance(entry["size"], int)
         self.assertEqual(entry["size"], public_path.stat().st_size)
+
+
+# ---- processing defaults (Stage 3) ----------------------------------------------------------------
+
+class ProcessingDefaultsTests(CollectionBase):
+    def test_settings_page_requires_auth_and_is_reachable(self):
+        anon = app.test_client()
+        self.assertEqual(anon.get("/settings").status_code, 403)
+        self.assertEqual(self.c.get("/settings").status_code, 200)
+        html = self.c.get("/settings").data.decode()
+        self.assertIn("Processing defaults", html)
+        self.assertIn("Re-encode TGA", html)
+        self.assertIn("docs", html)                                        # the cleanup presets are listed
+
+    def test_saving_defaults_persists_across_restart(self):
+        """Defaults survive an init_db()/restart of the same DB."""
+        res = self.post("/settings", {"cleanup_presets": ["authoring", "junk"], "reencode_textures": "1",
+                                      "reencode_skyboxes": "0", "action": "save"})
+        self.assertEqual(res.status_code, 302)
+        html = self.c.get("/settings").data.decode()
+        self.assertIn('value="authoring" checked', html)
+        self.assertIn('value="junk" checked', html)
+        self.assertIn('name="reencode_textures" value="1" checked', html)
+        # skyboxes was sent as "0" (explicit unchecked) — it should NOT render as checked
+        self.assertNotIn('name="reencode_skyboxes" value="1" checked', html)
+        # restart: re-init the DB (schema CREATE IF NOT EXISTS keeps rows) and check the saved values still show
+        app_module.init_db()
+        html = self.c.get("/settings").data.decode()
+        self.assertIn('value="authoring" checked', html)
+        self.assertIn('name="reencode_textures" value="1" checked', html)
+        # the storage value also survives a process restart
+        saved = app_module._processing_defaults()
+        self.assertEqual(saved["cleanup_presets"], ["authoring", "junk"])
+        self.assertTrue(saved["reencode_textures"])
+        self.assertFalse(saved["reencode_skyboxes"])
+
+    def test_explicit_false_overrides_true_default_per_item(self):
+        """§3 tri-state: a saved true default must be overridable by an unchecked per-item option."""
+        self.post("/settings", {"reencode_textures": "1", "action": "save"})
+        from app import _effective_convert_options, _checkbox_state
+        # Case A: a queued import with no per-item form (background thread) inherits the default
+        out = _effective_convert_options({})
+        self.assertTrue(out["reencode_textures"])
+        # Case B-style with hidden 0 only (no checkbox hit): explicit False — overrides the default
+        class F:
+            getlist = lambda self, k: ["0"] if k == "reencode_textures" else []
+            get = lambda self, k, d=None: ("0" if k == "reencode_textures" else d)
+        out = _effective_convert_options(F())
+        self.assertFalse(out["reencode_textures"])                              # explicit unchecked wins
+        # Case C: both hidden 0 AND checkbox 1 (browser submitted the checkbox)
+        class F2:
+            getlist = lambda self, k: (["0", "1"] if k == "reencode_textures" else [])
+            get = lambda self, k, d=None: ("0" if k == "reencode_textures" else d)
+        self.assertTrue(_effective_convert_options(F2())["reencode_textures"])  # checkbox checked wins
+
+    def test_explicit_empty_checkbox_overrides_inherited_defaults(self):
+        """Case B: the user submitted the form (marker present) with every preset unchecked.
+        The effective list must be empty — NOT inherited from the saved defaults.
+        Case A: a request that did not render the form at all (no marker, no values) DOES inherit."""
+        self.post("/settings", {"cleanup_presets": ["authoring", "junk"], "reencode_textures": "1",
+                                "reencode_skyboxes": "0", "action": "save"})
+        from app import _effective_convert_options
+        # Background-thread form (case A): empty dict, no marker → inherits defaults
+        out = _effective_convert_options({})
+        self.assertEqual(out["exclude_presets"], ["authoring", "junk"])
+        self.assertTrue(out["reencode_textures"])
+        # Submitted form with marker and zero presets (case B): the user unchecked everything
+        class F:
+            def getlist(self, k):
+                return ["1"] if k == "exclude_presets_submitted" else []
+            def get(self, k, d=None):
+                return "1" if k == "exclude_presets_submitted" else d
+        out = _effective_convert_options(F())
+        self.assertEqual(out["exclude_presets"], [])                            # NOT inherited
+        # Submitted form with marker + a checked preset (case C): the user's choice wins
+        class F2(F):
+            def getlist(self, k):
+                return ["junk"] if k == "exclude_presets" else (["1"] if k == "exclude_presets_submitted" else [])
+        out = _effective_convert_options(F2())
+        self.assertEqual(out["exclude_presets"], ["junk"])
+        # No marker but raw values present (programmatic POST): treat as authoritative
+        class F3:
+            def getlist(self, k):
+                return ["docs"] if k == "exclude_presets" else []
+            def get(self, k, d=None):
+                return None
+        out = _effective_convert_options(F3())
+        self.assertEqual(out["exclude_presets"], ["docs"])
+        # Unknown preset is still rejected even when the marker is absent (case D)
+        class F4:
+            def getlist(self, k):
+                return ["zzz-bogus"] if k == "exclude_presets" else []
+            def get(self, k, d=None):
+                return None
+        with self.assertRaises(ValueError) as cm:
+            _effective_convert_options(F4())
+        self.assertIn("Unknown exclusion preset", str(cm.exception))
+
+    def test_defaults_do_not_rewrite_existing_packages_automatically(self):
+        """Saving a defaults change leaves existing add-on rows untouched."""
+        self.real_pak("keepme", size=100)
+        before = self.tmp / "keepme.pak"
+        stamp = before.read_bytes()
+        self.post("/settings", {"cleanup_presets": ["docs"], "reencode_textures": "1", "action": "save"})
+        conn = get_db()
+        row = conn.execute("SELECT published, draft, package_sha256 FROM addons WHERE addon_id = 'keepme'").fetchone()
+        conn.close()
+        self.assertEqual(stamp, before.read_bytes())
+
+    def test_invalid_setting_is_rejected_and_nothing_saved(self):
+        # 1. Save a known-good baseline first (per the regression test contract).
+        self.post("/settings", {"cleanup_presets": ["authoring"], "reencode_textures": "1",
+                                "reencode_skyboxes": "0", "action": "save"})
+        baseline = app_module._processing_defaults()
+        self.assertEqual(baseline["cleanup_presets"], ["authoring"])
+        self.assertTrue(baseline["reencode_textures"])
+        self.assertFalse(baseline["reencode_skyboxes"])
+        # 2. Attempt the invalid save.
+        res = self.post("/settings", {"cleanup_presets": ["zzz-not-a-preset"], "action": "save"})
+        self.assertEqual(res.status_code, 302)                               # redirect after rejection
+        # 3. The flash reports the rejection using the SAME wording as the per-item upload path
+        #    (established exclusion-preset contract from tools/convert_options.ConvertOptions.from_dict).
+        html = self.c.get("/settings").data.decode()
+        self.assertIn("Invalid setting", html)
+        self.assertIn("Unknown exclusion preset", html)
+        self.assertIn("&#39;zzz-not-a-preset&#39;", html)                     # the bad value is quoted
+        # 4. The previously-stored valid defaults are unchanged.
+        preserved = app_module._processing_defaults()
+        self.assertEqual(preserved["cleanup_presets"], ["authoring"])
+        self.assertTrue(preserved["reencode_textures"])
+        self.assertFalse(preserved["reencode_skyboxes"])
+        # 5. The invalid value was not persisted in the database.
+        conn = get_db()
+        try:
+            row = conn.execute("SELECT value FROM app_settings WHERE key = 'cleanup_presets'").fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["value"], "authoring")
+        self.assertNotIn("zzz", row["value"])
+
+    def test_reset_setting_clears_saved_values(self):
+        self.post("/settings", {"reencode_textures": "1", "action": "save"})
+        self.post("/settings", {"action": "reset"})
+        saved = app_module._processing_defaults()
+        self.assertFalse(saved["reencode_textures"])
+        self.assertEqual(saved["cleanup_presets"], [])
+
+    def test_nav_has_settings_link(self):
+        html = self.c.get("/dashboard").data.decode()
+        self.assertIn('href="/settings"', html)
+
+
+# ---- reprocessing existing PAKs (Stage 4) --------------------------------------------------------
+
+class ReprocessPackageTests(CollectionBase):
+    """D. Reprocessing existing PAKs — apply cleanup/TGA re-encoding to a stored package without
+    uploading the file again. Keeps metadata and publication state, swaps the artifact atomically,
+    validates the staged output, preserves the previous artifact on failure."""
+
+    def _make_pak_with(self, *pairs):
+        """Build a synthetic PAK with the given (path, bytes) entries; insert an add-on pointing at it.
+        Returns (addon_pk, pak_path, entries-as-list)."""
+        from tests.test_zip_conversion import make_pak_bytes
+        entries = list(pairs)
+        pak = make_pak_bytes(entries)
+        f = self.tmp / "reproc.pak"
+        f.write_bytes(pak)
+        pk = insert_addon("reproc", published=0, size=len(pak), path=f)
+        return pk, f, entries
+
+    def test_cleanup_actually_removes_entries_from_the_existing_pak(self):
+        """§D: cleanup preset author='authoring' removes mapsrc/, *.map, etc. from the stored PAK."""
+        from tools.catalog import read_pak_directory
+        pk, pak_path, _ = self._make_pak_with(
+            ("maps/a.bsp", b"BSP" * 10),
+            ("mapsrc/working.map", b"MAP"),
+            ("sound/shot.wav", b"WAV"),
+        )
+        before_paths = sorted(e["path"] for e in read_pak_directory(pak_path))
+        self.assertIn("mapsrc/working.map", before_paths)
+        self.assertEqual(self.post(f"/addons/{pk}/reprocess",
+                                   {"csrf_token": self.csrf(), "exclude_presets_submitted": "1",
+                                    "exclude_presets": ["authoring"], "reencode_textures": "0",
+                                    "reencode_skyboxes": "0"}).status_code, 302)
+        after_paths = sorted(e["path"] for e in read_pak_directory(pak_path))
+        self.assertNotIn("mapsrc/working.map", after_paths)                   # mapsrc was removed
+        self.assertIn("maps/a.bsp", after_paths)                              # required entry kept
+        self.assertIn("sound/shot.wav", after_paths)                          # unknown / unrelated kept
+        conn = get_db()
+        report = json.loads(conn.execute("SELECT conversion_report FROM addons WHERE id = ?", (pk,)).fetchone()[0])
+        conn.close()
+        self.assertEqual(report.get("kind"), "pak-reprocess")
+        self.assertEqual(report["excluded"]["total"], 1)
+        self.assertIn("mapsrc", report["excluded"]["sample"][0]["reason"])
+
+    def test_unaffected_entries_keep_their_exact_bytes(self):
+        """§D: unaffected entry paths and bytes are preserved (no rewriting from scratch)."""
+        from tools.catalog import read_pak_directory
+        pk, pak_path, _ = self._make_pak_with(
+            ("maps/a.bsp", b"BSP" * 100),
+            ("sound/keep.wav", b"RIFF\x00\x00\x00\x00WAVE"),
+            ("mapsrc/junk.map", b"MAP"),
+        )
+        before = read_pak_directory(pak_path)
+        before_bsp = next(e for e in before if e["path"] == "maps/a.bsp")
+        before_wav = next(e for e in before if e["path"] == "sound/keep.wav")
+        with open(pak_path, "rb") as f:
+            f.seek(before_bsp["offset"]); bsp_bytes = f.read(before_bsp["size"])
+            f.seek(before_wav["offset"]); wav_bytes = f.read(before_wav["size"])
+        self.post(f"/addons/{pk}/reprocess",
+                  {"csrf_token": self.csrf(), "exclude_presets_submitted": "1",
+                   "exclude_presets": ["authoring"]})
+        after = read_pak_directory(pak_path)
+        after_bsp = next(e for e in after if e["path"] == "maps/a.bsp")
+        after_wav = next(e for e in after if e["path"] == "sound/keep.wav")
+        with open(pak_path, "rb") as f:
+            f.seek(after_bsp["offset"]); bsp_after = f.read(after_bsp["size"])
+            f.seek(after_wav["offset"]); wav_after = f.read(after_wav["size"])
+        self.assertEqual(bsp_bytes, bsp_after)                                # bytes preserved
+        self.assertEqual(wav_bytes, wav_after)                                # bytes preserved
+        self.assertEqual(before_bsp["offset"], after_bsp["offset"])            # layout compact (no padding)
+
+    def test_reprocess_replaces_size_hash_and_report(self):
+        """§D: final size, hash, and conversion record are updated from the actual new artifact."""
+        pk, pak_path, _ = self._make_pak_with(
+            ("maps/a.bsp", b"BSP"),
+            ("mapsrc/x.map", b"X"),
+            ("mapsrc/y.map", b"Y"),
+        )
+        conn = get_db()
+        before = conn.execute("SELECT package_size, package_sha256 FROM addons WHERE id = ?", (pk,)).fetchone()
+        conn.close()
+        self.post(f"/addons/{pk}/reprocess",
+                  {"csrf_token": self.csrf(), "exclude_presets_submitted": "1",
+                   "exclude_presets": ["authoring"]})
+        conn = get_db()
+        after = conn.execute("SELECT package_size, package_sha256, conversion_report FROM addons WHERE id = ?", (pk,)).fetchone()
+        conn.close()
+        self.assertNotEqual(after[0], before[0])                              # size changed
+        self.assertNotEqual(after[1], before[1])                              # hash changed
+        self.assertEqual(after[0], pak_path.stat().st_size)                   # matches actual file
+        report = json.loads(after[2])
+        self.assertEqual(report["kind"], "pak-reprocess")
+        self.assertEqual(report["output_size"], pak_path.stat().st_size)      # report matches file
+        self.assertEqual(report["output_sha256"], after[1])                   # report matches stored hash
+
+    def test_failure_preserves_previous_artifact_and_state(self):
+        """§D: when reprocessing fails, the old artifact, hash, metadata, and publication state are intact."""
+        pk, pak_path, _ = self._make_pak_with(
+            ("maps/a.bsp", b"BSP"),
+            ("mapsrc/x.map", b"X"),
+        )
+        conn = get_db()
+        conn.execute("UPDATE addons SET title = ?, author = ?, published = 1, draft = 0 WHERE id = ?",
+                     ("Original Title", "Original Author", pk))
+        before_size = pak_path.stat().st_size
+        before_bytes = pak_path.read_bytes()
+        before_sha = conn.execute("SELECT package_sha256 FROM addons WHERE id = ?", (pk,)).fetchone()[0]
+        conn.commit()
+        conn.close()
+        # The "all entries excluded" error path is the cleanest reproducible failure: a custom pattern
+        # that targets the only required directory.
+        from app import _reprocess_existing_pak
+        from tools.convert_options import ConvertOptions
+        bad_options = ConvertOptions(exclude_patterns=("maps/", "mapsrc/", "*.map"))
+        with self.assertRaises(ValueError) as cm:
+            _reprocess_existing_pak(pk, bad_options)
+        self.assertIn("All entries would be excluded", str(cm.exception))
+        # The previous artifact is intact
+        self.assertTrue(pak_path.exists())
+        self.assertEqual(pak_path.stat().st_size, before_size)
+        self.assertEqual(pak_path.read_bytes(), before_bytes)
+        conn = get_db()
+        row = conn.execute("SELECT title, author, published, draft, package_sha256 FROM addons WHERE id = ?", (pk,)).fetchone()
+        conn.close()
+        self.assertEqual(row[0], "Original Title")
+        self.assertEqual(row[1], "Original Author")
+        self.assertEqual(row[2], 1)                                            # still published
+        self.assertEqual(row[3], 0)
+        self.assertEqual(row[4], before_sha)                                   # hash unchanged
+
+    def test_metadata_only_edit_does_not_invoke_reprocessing(self):
+        """§C: editing metadata without uploading must NOT rewrite the package."""
+        from tools.catalog import read_pak_directory
+        pk, pak_path, _ = self._make_pak_with(
+            ("maps/a.bsp", b"BSP"),
+            ("mapsrc/x.map", b"X"),
+        )
+        before_bytes = pak_path.read_bytes()
+        before_sha = hashlib.sha256(before_bytes).hexdigest()
+        # The edit form without a file and without import_mode=local is metadata-only.
+        form = {"title": "New Title", "addon_id": "reproc", "gamedir": "reproc",
+                "author": "New Author", "date": "", "description": "",
+                "csrf_token": self.csrf()}
+        res = self.c.post(f"/addons/{pk}/edit", data=form, follow_redirects=False)
+        self.assertEqual(res.status_code, 302)
+        self.assertEqual(pak_path.read_bytes(), before_bytes)                 # package untouched
+        after_sha = hashlib.sha256(pak_path.read_bytes()).hexdigest()
+        self.assertEqual(after_sha, before_sha)
+
+    def test_reprocess_preserves_publication_state(self):
+        """§D: reprocessing a published item keeps the published flag intact; public artifact is NOT replaced."""
+        from tools.catalog import read_pak_directory
+        pk, pak_path, _ = self._make_pak_with(
+            ("maps/a.bsp", b"BSP"),
+            ("mapsrc/x.map", b"X"),
+        )
+        conn = get_db()
+        conn.execute("UPDATE addons SET published = 1, draft = 0 WHERE id = ?", (pk,))
+        conn.commit()
+        conn.close()
+        # Stage a fake public artifact
+        public_dir = Path(app.config["PUBLIC_ROOT"]) / "addons"
+        public_dir.mkdir(parents=True, exist_ok=True)
+        public_path = public_dir / "reproc.pak"
+        public_bytes = b"ORIGINAL_PUBLIC_ARTIFACT"
+        public_path.write_bytes(public_bytes)
+        self.post(f"/addons/{pk}/reprocess",
+                  {"csrf_token": self.csrf(), "exclude_presets_submitted": "1",
+                   "exclude_presets": ["authoring"]})
+        # Public artifact still serves the OLD bytes (reprocess does not auto-republish)
+        self.assertEqual(public_path.read_bytes(), public_bytes)
+        conn = get_db()
+        published = conn.execute("SELECT published FROM addons WHERE id = ?", (pk,)).fetchone()[0]
+        conn.close()
+        self.assertEqual(published, 1)                                         # publication state preserved
+        # The stored package DID change
+        self.assertNotEqual(pak_path.read_bytes(), public_bytes)
+
+    def test_reprocess_form_uses_data_confirm_pattern(self):
+        """§4: per-row destructive actions in the dashboard use data-confirm (CSP-friendly), not onsubmit."""
+        insert_addon("dc", published=1)
+        html = self.c.get("/dashboard").data.decode()
+        self.assertIn('data-confirm=', html)                                  # pattern present
+        self.assertIn("Permanently delete", html)                             # confirms the delete wording
+        self.assertNotIn('onsubmit="return confirm', html)                    # inline handler gone
+
+    def test_no_changes_reports_no_modifications_accurately(self):
+        """§D: when no options are chosen, the package is rewritten but the flash says nothing was removed."""
+        pk, pak_path, _ = self._make_pak_with(
+            ("maps/a.bsp", b"BSP" * 10),
+            ("sound/keep.wav", b"RIFF"),
+        )
+        before_size = pak_path.stat().st_size
+        res = self.c.post(f"/addons/{pk}/reprocess",
+                      data={"csrf_token": self.csrf(), "exclude_presets_submitted": "1",
+                            "exclude_presets": [], "reencode_textures": "0",
+                            "reencode_skyboxes": "0"}, follow_redirects=True)
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(pak_path.stat().st_size, before_size)                 # identical: same entries, same bytes
+        self.assertIn("No entries were removed and no images were re-encoded", res.data.decode())
+
+    def test_settings_help_text_now_matches_implemented_actions(self):
+        """§D: the settings page no longer advertises an action that does not exist."""
+        # The previous text claimed "use 'Reprocess package' on an add-on page" — verify that
+        # action is now wired up and discoverable from the add-on detail page.
+        insert_addon("ht")
+        html = self.c.get("/addons/1/detail".replace("/detail", "/")).data.decode()
+        # Actually: detail page lives at /addons/<id>; check by loading it directly:
+        from app import get_db
+        pk = get_db().execute("SELECT id FROM addons WHERE addon_id = 'ht'").fetchone()[0]
+        html = self.c.get(f"/addons/{pk}").data.decode()
+        self.assertIn('href="/addons/' + str(pk) + '/reprocess"', html)

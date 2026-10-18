@@ -692,6 +692,205 @@ def _reencode_images(winners: dict[str, _Win], options: ConvertOptions, tmpdir: 
 repack_zip_to_pak = build_single_pak_from_zip
 
 
+def build_single_pak_from_pak(source: Path, target: Path, *, options: ConvertOptions | None = None,
+                              progress: Progress | None = None, workdir: Path | None = None) -> dict[str, Any]:
+    """Reprocess an existing PAK with the same options the ZIP path supports (cleanup presets, custom patterns,
+    TGA re-encoding). The original PAK is the source — no upload, no re-extraction, no nested-PAK problem.
+
+    Properties guaranteed here:
+      - Unaffected entries keep their exact bytes (read straight from the source PAK, copied into the target).
+      - Excluded entries are removed (the report names each one with the matching pattern).
+      - Supported TGAs are re-encoded to PNG (lossless, pixel-verified) under the same rules as the ZIP path.
+      - The original PAK is NEVER written; the target is written via a sibling tmp file and os.replace'd.
+        On any error before os.replace, the source PAK is untouched.
+      - The output is a single PAK. No second PAK is nested inside.
+
+    Returns a dict shaped like the ZIP-path return value (`entries`, `sha256`, `size`, `paths`,
+    `manifest`, `excluded`, `reencoded`) so the caller can build a conversion record consistently.
+    """
+    from tools.convert_options import first_match, PRESETS  # local import keeps the module graph honest
+
+    options = options or ConvertOptions()
+    source = Path(source)
+    target = Path(target)
+    if not source.is_file():
+        raise FileNotFoundError(f"Source PAK not found: {source}")
+    if detect_package_format(source) != "pak":
+        raise ValueError(f"{source.name!r} is not a Quake PAK file")
+    emit = progress or (lambda *_: None)
+
+    entries = read_pak_directory(source)                                      # validated by _check_pak_entry_name
+    if not entries:
+        raise ValueError(f"{source.name!r} has no entries")
+    # Within one PAK the engine keeps the first occurrence of a name; mirror that for the output.
+    winners: dict[str, dict[str, Any]] = {}
+    duplicate_paths: list[str] = []
+    for e in entries:
+        if e["path"] in winners:
+            duplicate_paths.append(e["path"])
+            continue
+        winners[e["path"]] = e
+
+    excluded: list[dict[str, Any]] = []
+    patterns = options.patterns()
+    excluded_names: set[str] = set()
+    for name, entry in winners.items():
+        hit = first_match(patterns, name) if patterns else None
+        if hit:
+            excluded.append({"path": name, "reason": f"{hit[1]} ({hit[0]})", "size": entry["size"]})
+            excluded_names.add(name)
+    for name in excluded_names:
+        del winners[name]
+    if not winners:
+        raise ValueError("All entries would be excluded; nothing to write")
+
+    reencode_ctx = _reencode_images_from_pak(source, winners, options, workdir or source.parent, emit)
+    if reencode_ctx:
+        reencoded, _reencode_tmp = reencode_ctx
+    else:
+        reencoded, _reencode_tmp = None, None
+    manifest: list[dict[str, Any]] = []
+    try:
+        manifest = _do_reprocess_write(source, winners, target, emit)
+    finally:
+        if _reencode_tmp is not None:
+            _reencode_tmp.cleanup()
+    final_size = target.stat().st_size
+    order = sorted(winners)
+    return {
+        "entries": len(order), "size": final_size, "sha256": _compute_sha256(target, progress, "Checking package"),
+        "paths": order, "manifest": manifest, "overrides": [], "root_mapping": "pak-input", "wrapper": None,
+        "embedded_paks": [], "loose_files": 0,
+        "options": options.to_dict() if not options.is_default else None,
+        "excluded": _summarise_excluded(excluded) if excluded else None,
+        "reencoded": reencoded, "generated": None,
+        "source_kind": "pak-input", "source_pak": source.name, "duplicate_entries": duplicate_paths,
+    }
+
+
+def _do_reprocess_write(source: Path, winners: dict[str, dict[str, Any]], target: Path,
+                        emit: Progress) -> list[dict[str, Any]]:
+    """Write the target PAK. Returns the manifest. Split out so the reencode temp dir can outlive the write
+    attempt; the caller is responsible for the cleanup of any external temp dirs."""
+    order = sorted(winners)
+    _validate_reprocess_entries([(n, winners[n]["size"]) for n in order])
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_out = target.with_name(target.name + ".tmp")
+    manifest: list[dict[str, Any]] = []
+    try:
+        with open(source, "rb") as src_fh, open(tmp_out, "wb") as out:
+            out.write(b"PACK" + b"\0" * 8)
+            records = bytearray()
+            out_total = sum(winners[n]["size"] for n in order)
+            written = 0
+            emit("Writing package", 0, out_total)
+            for name in order:
+                w = winners[name]
+                if w.get("file"):                                                   # re-encoded file written to a tmp path
+                    file_pos = out.tell()
+                    digest = hashlib.sha256()
+                    with open(w["file"], "rb") as fh:
+                        remaining = w["size"]
+                        while remaining:
+                            chunk = fh.read(min(_COPY_CHUNK, remaining))
+                            if not chunk:
+                                raise ValueError(f"Source for {name!r} is truncated")
+                            digest.update(chunk)
+                            out.write(chunk)
+                            remaining -= len(chunk)
+                            written += len(chunk)
+                            emit("Writing package", written, out_total)
+                else:
+                    file_pos = out.tell()
+                    src_fh.seek(w["offset"])
+                    digest = hashlib.sha256()
+                    remaining = w["size"]
+                    while remaining:
+                        chunk = src_fh.read(min(_COPY_CHUNK, remaining))
+                        if not chunk:
+                            raise ValueError(f"Source for {name!r} is truncated")
+                        digest.update(chunk)
+                        out.write(chunk)
+                        remaining -= len(chunk)
+                        written += len(chunk)
+                        emit("Writing package", written, out_total)
+                if out.tell() > MAX_PAK_BYTES:
+                    raise ValueError(f"Resulting PAK exceeds {MAX_PAK_BYTES} bytes (32-bit PAK offsets)")
+                records += name.encode("utf-8").ljust(56, b"\0") + struct.pack("<II", file_pos, w["size"])
+                manifest.append({"path": name, "size": w["size"], "sha256": digest.hexdigest(),
+                                 "source": "pak-entry" if not w.get("file") else f"reencoded:{w.get('label', 'pak-entry')}"})
+            dir_offset = out.tell()
+            out.write(records)
+            if out.tell() > MAX_PAK_BYTES:
+                raise ValueError(f"Resulting PAK exceeds {MAX_PAK_BYTES} bytes (32-bit PAK offsets)")
+            out.seek(4)
+            out.write(struct.pack("<II", dir_offset, len(records)))
+        os.replace(tmp_out, target)
+    finally:
+        tmp_out.unlink(missing_ok=True)
+    return manifest
+
+
+def _validate_reprocess_entries(entries: list[tuple[str, int]]) -> None:
+    """Validate the names that will end up in the new PAK (Ironwail's structural rules)."""
+    seen: set[str] = {}
+    for name, _ in entries:
+        _check_pak_entry_name(name, "reprocessed PAK")
+        if name.lower() in seen:
+            raise ValueError(f"Paths differ only by letter case: {seen[name.lower()]!r} and {name!r}")
+        seen[name.lower()] = name
+    if len(entries) > MAX_PAK_ENTRIES:
+        raise ValueError(f"Reprocessed PAK would have {len(entries)} entries; Ironwail allows at most {MAX_PAK_ENTRIES}")
+
+
+def _reencode_images_from_pak(source: Path, winners: dict[str, dict[str, Any]], options: ConvertOptions,
+                              workdir: Path, emit: Progress) -> tuple[dict[str, Any], tempfile.TemporaryDirectory] | None:
+    """Opt-in lossless TGA -> PNG over an existing PAK. Mirrors ``_reencode_images`` for the ZIP path.
+
+    Returns (report, tempdir-context) — the caller MUST consume the context AFTER the write loop
+    because the encoded PNG files live inside the tempdir and the write loop reads them. The temp
+    dir is cleaned up when the returned context exits.
+    """
+    if not (options.reencode_textures or options.reencode_skyboxes):
+        return None
+    from tools import imagepack
+
+    cands = _image_candidates(winners, options)
+    todo = (cands["textures"] if options.reencode_textures else []) + (cands["skyboxes"] if options.reencode_skyboxes else [])
+    done_files: list[dict[str, Any]] = []
+    skipped: dict[str, int] = {}
+    before = after = 0
+    tmp_ctx = tempfile.TemporaryDirectory(prefix="quake-reproc-", dir=str(workdir))
+    tmpdir = Path(tmp_ctx.name)
+    emit("Re-encoding images", 0, len(todo))
+    with open(source, "rb") as src_fh:
+        for i, name in enumerate(sorted(todo)):
+            w = winners[name]
+            src_fh.seek(w["offset"])
+            data = src_fh.read(w["size"])
+            try:
+                png, info = imagepack.tga_to_png(data, compress_level=6)
+            except imagepack.Skip as skip:
+                skipped[skip.reason] = skipped.get(skip.reason, 0) + 1
+            else:
+                new_name = name[:-4] + ".png"
+                if new_name in winners:
+                    skipped["duplicate-png"] = skipped.get("duplicate-png", 0) + 1
+                    emit("Re-encoding images", i + 1, len(todo))
+                    continue
+                dest = tmpdir / f"png-{i}.bin"
+                dest.write_bytes(png)
+                del winners[name]
+                winners[new_name] = {"path": new_name, "offset": 0, "size": len(png), "file": dest, "label": w.get("label", "pak-entry")}
+                before += len(data)
+                after += len(png)
+                done_files.append({"path": name, "to": new_name, "before": len(data), "after": len(png)})
+            emit("Re-encoding images", i + 1, len(todo))
+    return ({"converted": len(done_files), "bytes_before": before, "bytes_after": after, "skipped": skipped,
+             "textures": options.reencode_textures, "skyboxes": options.reencode_skyboxes, "libraries": imagepack.versions(),
+             "files": done_files[:200], "files_total": len(done_files)}, tmp_ctx)
+
+
 def validate_package(path: Path, sha256: str | None = None) -> Dict[str, Any]:
     """Structural validation. Pass `sha256` when the caller already hashed these exact bytes to avoid reading them again."""
     path = Path(path)

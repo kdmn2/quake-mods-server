@@ -23,6 +23,7 @@
   <p class="small muted">You can also import a ZIP from an absolute server path on the add-on form if you prefer not to upload through the browser.</p>
   <div class="inline">
     <a href="{{ url_for('edit_addon', addon_id=addon.id, next=next) }}"><button>Edit</button></a>
+    <a href="{{ url_for('reprocess_addon', addon_id=addon.id) }}"><button>Reprocess package…</button></a>
     {% if addon.published %}
     <form method="post" action="{{ url_for('unpublish_addon', addon_id=addon.id) }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

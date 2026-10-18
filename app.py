@@ -18,13 +18,13 @@ from types import SimpleNamespace
 from pathlib import Path
 from typing import Any, Dict, Iterator, Tuple
 
-from flask import Flask, flash, jsonify, redirect, render_template, request, send_from_directory, session, url_for
+from flask import Flask, flash, has_request_context, jsonify, redirect, render_template, request, send_from_directory, session, url_for
 from werkzeug.exceptions import BadRequest, Forbidden, NotFound, RequestEntityTooLarge
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 
-from tools.catalog import (ReleaseNeedsReview, _compute_sha256 as _sha256_file, _validate_date, build_single_pak_from_zip, detect_package_format,
-                           plan_zip_release, validate_package, validate_pak_paths)
+from tools.catalog import (ReleaseNeedsReview, _compute_sha256 as _sha256_file, _validate_date, build_single_pak_from_pak,
+                           build_single_pak_from_zip, detect_package_format, plan_zip_release, validate_package, validate_pak_paths)
 from tools.convert_options import PRESETS, ConvertOptions, options_from_form
 from tools import batchstore, quaddicted as quaddicted_module
 from tools.batch_import import BatchService
@@ -165,8 +165,23 @@ def _delete_import(token: str) -> None:
             shutil.rmtree(staging, ignore_errors=True)
 
 
+def _current_convert_form() -> dict[str, Any]:
+    """The form for option resolution: the real request form when inside one, otherwise an empty mapping
+    (e.g. batch-item snapshots taken on background threads) so the saved defaults apply."""
+    try:
+        if has_request_context():
+            return request.form
+    except Exception:
+        pass
+    return {}
+
+
 def _save_import(token: str, kind: str, addon_pk: int | None, form: dict[str, str], source: Path, name: str, fmt: str,
                  owns_source: bool, keep_source: bool, review: bool, options: ConvertOptions | None = None, batch_item_id: int | None = None) -> None:
+    # Snapshot the EFFECTIVE options when the import is queued: an explicit per-item form value wins (tri-state);
+    # otherwise the saved processing defaults at queue time apply. A later defaults change cannot alter this job.
+    if options is None:
+        options = _convert_options_from_resolved(_effective_convert_options(_current_convert_form()))
     conn = get_db()
     try:
         conn.execute(
@@ -677,6 +692,9 @@ def init_db() -> None:
     # JSON text only; the value is a validated view dict produced by _validate_view. No CSRF/credentials/actions stored here.
     conn.execute("CREATE TABLE IF NOT EXISTS user_collection_view ("
                  "user_id TEXT PRIMARY KEY, view_json TEXT NOT NULL, updated_at REAL NOT NULL)")
+    # processing defaults (key/value): cleanup presets + texture re-encoding, applied when a per-item
+    # option is not explicitly supplied. Values are validated by _validate_processing_defaults.
+    conn.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at REAL)")
     batchstore.init_schema(conn)
     jobs.init_schema(conn)
     quaddicted_module.init_schema(conn)
@@ -1187,12 +1205,188 @@ def _decode_view_param(raw: str) -> dict[str, str] | None:
     return _validate_view(raw_dict)
 
 
-def _dashboard_url_for_view(view: dict[str, str]) -> str:
-    """Build the dashboard URL with the validated view. Always keeps the page (it is a meaningful bookmark
-    state even when it clamps back to 1) and the page_size; omits other defaults that the route would infer."""
-    keep_always = ("page", "page_size")
-    params = {k: v for k, v in view.items() if v and (k in keep_always or v != _default_view()[k])}
-    return url_for("dashboard", **params)
+# ---- processing defaults (Stage 3) --------------------------------------------------------------------
+# Persisted defaults for the package-processing options (cleanup presets, TGA re-encoding). Stored in the
+# app_settings table so they survive restarts and are server-side (not browser storage). The defaults are
+# applied only where an option is NOT explicitly supplied (tri-state); an explicitly unchecked option
+# overrides a saved true default. Changing a default never rewrites existing packages automatically.
+
+
+def _tri_state(value: Any) -> bool | None:
+    """Read a checkbox-style option as tri-state: True (checked/1), False (explicit 0), None (not supplied)."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return None if not value else _tri_state(value[0])
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("1", "true", "on", "yes"):
+        return True
+    if text in ("0", "false", "off", "no"):
+        return False
+    return None                                        # anything else: not explicitly supplied
+
+
+def _checkbox_state(form, key: str) -> bool | None:
+    """Tri-state read for a checkbox option that uses the HTML ``<input type="hidden" value="0">`` +
+    ``<input type="checkbox" value="1">`` pair. The hidden partner always appears first in the form,
+    so ``form.get(key)`` would always return "0" and miss the checked state. ``getlist`` returns both
+    values in source order; the presence of a "1" anywhere means the user checked the box."""
+    if form is None:
+        return None
+    values: list[Any]
+    if hasattr(form, "getlist"):
+        values = form.getlist(key)
+    else:
+        v = form.get(key)
+        if v is None:
+            return None
+        values = [v]
+    if not values:
+        return None
+    # treat each value via _tri_state and combine — if any is True, the checkbox was checked
+    states = [_tri_state(v) for v in values]
+    if any(s is True for s in states):
+        return True
+    if any(s is False for s in states):
+        return False
+    return None
+
+
+def _validate_options_text(names: Any, valid: tuple[str, ...], max_count: int) -> str:
+    """Validate a comma/comma-separated option list against an allowlist. Returns a storeable string.
+
+    Raises the SAME wording as tools/convert_options.ConvertOptions.from_dict so the rejection
+    contract for invalid presets is consistent across the per-item upload path and the settings
+    save path: ``"Unknown exclusion preset: 'name'"``."""
+    items = [str(n).strip() for n in (names if isinstance(names, (list, tuple)) else [names]) if str(n).strip()]
+    bad = [n for n in items if n not in valid]
+    if bad:
+        raise ValueError(f"Unknown exclusion preset: {bad[0]!r}")
+    seen = list(dict.fromkeys(items))[:max_count]
+    return ",".join(seen)
+
+
+PROCESSING_DEFAULT_KEYS = ("cleanup_presets", "reencode_textures", "reencode_skyboxes")
+
+
+def _processing_defaults() -> dict[str, Any]:
+    conn = get_db()
+    try:
+        rows = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM app_settings WHERE key IN (?, ?, ?)",
+                                                           PROCESSING_DEFAULT_KEYS).fetchall()}
+    finally:
+        conn.close()
+    out = {"cleanup_presets": [], "reencode_textures": False, "reencode_skyboxes": False}
+    raw_presets = rows.get("cleanup_presets")
+    if raw_presets:
+        out["cleanup_presets"] = [p for p in raw_presets.split(",") if p in PRESETS]
+    value = _tri_state(rows.get("reencode_textures"))
+    if value is not None:
+        out["reencode_textures"] = value
+    value = _tri_state(rows.get("reencode_skyboxes"))
+    if value is not None:
+        out["reencode_skyboxes"] = value
+    return out
+
+
+def _save_processing_defaults(presets: str, textures: bool | None, skyboxes: bool | None) -> None:
+    conn = get_db()
+    try:
+        with conn:
+            if presets is not None:
+                conn.execute("INSERT INTO app_settings (key, value, updated_at) VALUES ('cleanup_presets', ?, ?) "
+                             "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at", (presets, time.time()))
+            for key, value in (("reencode_textures", textures), ("reencode_skyboxes", skyboxes)):
+                if value is not None:
+                    conn.execute("INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?) "
+                                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                                 (key, "1" if value else "0", time.time()))
+    finally:
+        conn.close()
+
+
+def _effective_convert_options(form) -> dict[str, Any]:
+    """Resolve the conversion options with precedence:
+      1. explicit per-item form setting (tri-state: checked / explicit-0 / absent),
+      2. the saved processing defaults,
+      3. the application fallback (unspecified keys stay None; ConvertOptions defaults apply).
+    Returns a RAW dict for options_from_form(overrides=...) / _convert_options_from_resolved.
+
+    The four cases for ``exclude_presets``:
+      A. No per-item override supplied (background-thread snapshot, no marker, no values)
+         → inherit the saved defaults. The user did not touch the form.
+      B. The form was rendered and the user deliberately unchecked every preset
+         (marker present, no values) → apply no presets.
+      C. The user selected one or more presets (marker present or absent, values present)
+         → use that explicit selection, validated.
+      D. An explicit unknown preset → rejected with the established exclusion-preset wording.
+
+    The hidden ``exclude_presets_submitted=1`` marker is emitted by ``_convert_options.html``
+    exactly so that case B (explicit empty) is distinguishable from case A (no form at all).
+    Without it, an all-unchecked form would silently inherit defaults, contradicting the
+    per-item-overrides-default contract.
+    """
+    form = form or {}
+    saved = _processing_defaults()
+    if hasattr(form, "getlist"):
+        raw_presets = form.getlist("exclude_presets")
+    else:
+        value = form.get("exclude_presets")
+        if value is None:
+            raw_presets = []
+        elif isinstance(value, (list, tuple)):
+            raw_presets = list(value)
+        else:
+            raw_presets = [value]
+    has_marker = _tri_state(form.get("exclude_presets_submitted")) is True
+    if not has_marker and not raw_presets:
+        presets = list(saved["cleanup_presets"])              # case A: inherit defaults
+    else:
+        presets = [str(p).strip() for p in raw_presets if str(p).strip()]
+        unknown = [p for p in presets if p not in PRESETS]
+        if unknown:
+            raise ValueError(f"Unknown exclusion preset: {unknown[0]!r}")
+    reenc_t = _checkbox_state(form, "reencode_textures")
+    reenc_s = _checkbox_state(form, "reencode_skyboxes")
+    textures = reenc_t if reenc_t is not None else saved["reencode_textures"]
+    skyboxes = reenc_s if reenc_s is not None else saved["reencode_skyboxes"]
+    return {"exclude_presets": list(dict.fromkeys(presets))[:len(PRESETS)],
+            "reencode_textures": textures, "reencode_skyboxes": skyboxes}
+
+
+def _convert_options_from_resolved(resolved: dict[str, Any]) -> ConvertOptions:
+    """Turned into ConvertOptions for queued jobs with no per-item form (batch/folder/Quaddicted imports)."""
+    return ConvertOptions.from_dict(resolved)
+
+
+@app.route("/settings", methods=["GET", "POST"])
+def settings_page() -> Any:
+    require_auth()
+    if request.method == "POST":
+        action = request.form.get("action", "save")
+        try:
+            if action == "reset":
+                conn = get_db()
+                try:
+                    with conn:
+                        conn.execute("DELETE FROM app_settings WHERE key IN (?, ?, ?)", PROCESSING_DEFAULT_KEYS)
+                finally:
+                    conn.close()
+                flash("Processing defaults reset to application defaults.", "success")
+            else:
+                presets = _validate_options_text(request.form.getlist("cleanup_presets"), tuple(PRESETS), len(PRESETS))
+                textures = _tri_state(request.form.get("reencode_textures"))
+                skyboxes = _tri_state(request.form.get("reencode_skyboxes"))
+                _save_processing_defaults(presets or "", textures, skyboxes)
+                flash("Processing defaults saved. New imports use them unless an option is set explicitly for the item; existing packages are unchanged.", "success")
+        except ValueError as exc:
+            flash(f"Invalid setting: {exc}", "error")
+        return redirect(url_for("settings_page"))
+    saved = _processing_defaults()
+    return render_template("settings.html", saved=saved, presets=PRESETS)
+
 
 
 def _clamp_view_to_total(view: dict[str, str], total_rows: int) -> dict[str, str]:
@@ -1218,6 +1412,14 @@ def _clamp_view_to_total(view: dict[str, str], total_rows: int) -> dict[str, str
     out["page"] = str(page)
     out["page_size"] = str(page_size)
     return out
+
+
+def _dashboard_url_for_view(view: dict[str, str]) -> str:
+    """Build the dashboard URL with the validated view. Always keeps the page (it is a meaningful bookmark
+    state even when it clamps back to 1) and the page_size; omits other defaults that the route would infer."""
+    keep_always = ("page", "page_size")
+    params = {k: v for k, v in view.items() if v and (k in keep_always or v != _default_view()[k])}
+    return url_for("dashboard", **params)
 
 
 def _dashboard_redirect_for(user_id: str, request) -> str:
@@ -1370,7 +1572,9 @@ def _start_import(kind: str, addon_pk: int | None, form: dict[str, str], ctx: di
     template = "addon_form.html"
     owned = False
     try:
-        options = options_from_form(request.form, defaults=form)          # validate before anything is staged
+        # Effective options (tri-state merge: explicit per-item values override saved defaults); validated first.
+        overrides = _effective_convert_options(request.form)
+        options = options_from_form(request.form, defaults=form, overrides=overrides)
     except ValueError as exc:
         return _form_failure(f"Options rejected: {exc}", template, **ctx)
     try:
@@ -1564,6 +1768,135 @@ def rebuild_addon(addon_id: int) -> Any:
     _save_import(token, "replace", addon_id, form, source, addon["source_name"] or source.name, fmt, owns_source=False, keep_source=False, review=True)
     job_id = jobs.submit("plan", f"Preview of {source.name}", lambda progress: _run_plan(token, progress))
     return _job_response(job_id)
+
+
+def _reprocess_existing_pak(addon_pk: int, options: ConvertOptions) -> dict[str, Any]:
+    """Run ``build_single_pak_from_pak`` against an existing add-on's stored PAK and atomically
+    replace it on success. The previous artifact, references, metadata, and publication state are
+    preserved until the new package has been validated; on any failure, the old artifact is
+    retained untouched.
+
+    The package is rewritten in place via a sibling tmp file + ``os.replace``; the public download
+    for a published item is NOT rewritten here — the existing draft/publication model handles that
+    separately via the existing Publish flow, so an unconfirmed reprocess never silently changes
+    what Ironwail clients download.
+    """
+    from tools.catalog import build_single_pak_from_pak
+
+    conn = get_db()
+    try:
+        addon = conn.execute("SELECT * FROM addons WHERE id = ?", (addon_pk,)).fetchone()
+    finally:
+        conn.close()
+    if not addon:
+        raise NotFound()
+    pkg_path = Path(addon["package_path"]) if addon["package_path"] else None
+    if pkg_path is None or not pkg_path.is_file():
+        raise ValueError("This add-on has no stored PAK to reprocess.")
+    # Snapshot the relevant fields BEFORE we touch anything so a failed run leaves them unchanged.
+    before = {
+        "size": addon["package_size"], "sha256": addon["package_sha256"],
+        "report": addon["conversion_report"], "package_path": str(pkg_path),
+    }
+    # Stage to a sibling of the target so the atomic replace can rename in place.
+    staging = pkg_path.parent / (pkg_path.name + f".reprocess-{uuid.uuid4().hex}.pak")
+    try:
+        info = build_single_pak_from_pak(pkg_path, staging, options=options, progress=lambda *_: None,
+                                         workdir=pkg_path.parent)
+    except (OSError, ValueError) as exc:
+        # Cleanup partial output and re-raise with a clear message; the previous artifact is intact.
+        if staging.exists():
+            staging.unlink(missing_ok=True)
+        raise ValueError(f"Reprocessing failed: {exc}") from exc
+    # Independent structural validation (the helper already validates; this catches any drift).
+    package = validate_package(staging)
+    record = _summarize_reprocess(info, options)
+    # Atomic swap of the source PAK with the new staged artifact. If the replace fails, the previous
+    # artifact remains in place and the database is left untouched.
+    try:
+        os.replace(staging, pkg_path)
+    except OSError as exc:
+        staging.unlink(missing_ok=True)
+        raise ValueError(f"Could not replace the package atomically: {exc}") from exc
+    # Update artifact references; metadata identity (title/author/etc.) and published flag are NOT touched.
+    conn = get_db()
+    try:
+        with db_txn() as c:
+            c.execute(
+                "UPDATE addons SET package_size = ?, package_sha256 = ?, package_mtime = ?, "
+                "conversion_report = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (package["size"], package["sha256"], package["mtime"], json.dumps(record, sort_keys=True), addon_pk),
+            )
+    finally:
+        conn.close()
+    return {"info": info, "package": package, "record": record, "before": before, "staging": str(staging)}
+
+
+def _summarize_reprocess(info: dict[str, Any], options: ConvertOptions) -> dict[str, Any]:
+    """Compact, bounded conversion record for a PAK reprocess (stored with the add-on)."""
+    from tools.pak_report import REPORT_VERSION
+    return {
+        "report_version": REPORT_VERSION, "kind": "pak-reprocess",
+        "entries": info.get("entries"), "output_sha256": info.get("sha256"), "output_size": info.get("size"),
+        "paths": info.get("paths", []),
+        "excluded": info.get("excluded"), "reencoded": info.get("reencoded"),
+        "options": options.to_dict() if not options.is_default else None,
+        "duplicate_entries_in_source": info.get("duplicate_entries", []),
+    }
+
+
+@app.route("/addons/<int:addon_id>/reprocess", methods=["GET", "POST"])
+def reprocess_addon(addon_id: int) -> Any:
+    """Show the reprocess form (GET) or apply the chosen options to the stored PAK (POST).
+
+    Works without a kept source ZIP — the existing PAK is the input. Public download stays at
+    the previous artifact until the add-on is explicitly re-published. On any error the stored
+    PAK, its hash, its size, and its conversion record are left untouched.
+    """
+    require_auth()
+    conn = get_db()
+    try:
+        addon = conn.execute("SELECT * FROM addons WHERE id = ?", (addon_id,)).fetchone()
+    finally:
+        conn.close()
+    if not addon:
+        raise NotFound()
+    pkg_path = Path(addon["package_path"]) if addon["package_path"] else None
+    if pkg_path is None or not pkg_path.is_file():
+        flash("This add-on has no stored PAK to reprocess.", "error")
+        return _next_redirect(session.get("username") or "", request, keep_addon=True, fallback_addon=addon_id)
+    if request.method == "POST":
+        try:
+            overrides = _effective_convert_options(request.form)
+            options = options_from_form(request.form, overrides=overrides)
+        except ValueError as exc:
+            flash(f"Options rejected: {exc}", "error")
+            return redirect(url_for("reprocess_addon", addon_id=addon_id))
+        try:
+            outcome = _reprocess_existing_pak(addon_id, options)
+        except ValueError as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("reprocess_addon", addon_id=addon_id))
+        excl = outcome["info"].get("excluded") or {}
+        reenc = outcome["info"].get("reencoded") or {}
+        msg_parts = [f"Reprocessed: {outcome['info']['entries']} entries, "
+                     f"{outcome['package']['size']} bytes (SHA-256 {outcome['package']['sha256'][:12]}…)."]
+        if excl.get("total"):
+            msg_parts.append(f"Removed {excl['total']} file(s) ({excl.get('bytes', 0)} bytes).")
+        if reenc.get("converted"):
+            msg_parts.append(f"Re-encoded {reenc['converted']} TGA image(s) → PNG.")
+        if not (excl.get("total") or reenc.get("converted")):
+            msg_parts.append("No entries were removed and no images were re-encoded; the package is identical except for rewritten tables.")
+        if addon["published"]:
+            msg_parts.append("The public download still serves the previous artifact until you click Publish again.")
+        flash(" ".join(msg_parts), "success")
+        return redirect(url_for("addon_detail", addon_id=addon_id))
+    # GET — show the form (reuse the conversion-options partial, with the add-on's existing data).
+    from app import FORM_FIELDS  # noqa: F401 — silence linters about unused
+    inspection = _addon_inspection(addon) if hasattr(app, "url_map") else {"report": None, "conversion": None, "error": None}
+    return render_template("addon_reprocess.html", addon=dict(addon), inspection=inspection,
+                           presets=PRESETS, plan=None, options=ConvertOptions(),
+                           form={k: (addon[k] or "") for k in FORM_FIELDS})
 
 
 @app.route("/imports/<token>")

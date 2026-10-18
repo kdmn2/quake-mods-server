@@ -198,5 +198,146 @@ class PublicationTests(PublicationBase):
         self.assertIsNone(self.row("big"))
 
 
+# ---- integration: ZIP upload -> draft -> reprocess -> publish -> download (Stage 3) -------------
+
+class ReprocessThenPublishIntegration(PublicationBase):
+    """Full lifecycle on isolated storage:
+
+      1. Upload a ZIP with a mix of keepable content and authoring/junk/docs entries.
+      2. The package lands as an unpublished draft.
+      3. Reprocess the stored PAK in place with cleanup=authoring AND reencode_textures=1.
+      4. Verify the staged output (independently inspected) shows the expected removals and the
+         expected bytes of the kept content.
+      5. Publish the result.
+      6. Download the public artifact and verify final bytes for the kept content + the PNG conversion.
+      7. Confirm that a metadata-only edit between steps did NOT trigger another conversion.
+    """
+
+    def _zip_with_mixed_content(self):
+        """A ZIP that maps cleanly to a PAK with maps/, gfx/, and authoring/junk entries."""
+        from io import BytesIO
+        import zipfile
+        # TGA: 8x8 24bpp top-left so PNG conversion produces a smaller file
+        tga = bytes([0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 8, 0, 24, 32]) + (b"\x00\x00\xFF" * 8) * 8
+        zbuf = BytesIO()
+        with zipfile.ZipFile(zbuf, "w") as zf:
+            zf.writestr("maps/start.bsp", b"BSP-DATA-START")
+            zf.writestr("maps/end.bsp", b"BSP-DATA-END")
+            zf.writestr("gfx/wall.tga", tga)
+            zf.writestr("mapsrc/working.map", b"working.map content")
+            zf.writestr("src/progs.qc", b"// progs.qc")
+            zf.writestr("Thumbs.db", b"thumbs")
+        return zbuf.getvalue()
+
+    def test_full_lifecycle_reprocess_then_publish(self):
+        zip_bytes = self._zip_with_mixed_content()
+        res = self.upload("lifecycle", zip_bytes, filename="lifecycle.zip", path="/addons/new")
+        self.assertEqual(res.status_code, 200)
+        row = self.row("lifecycle")
+        self.assertIsNotNone(row)
+        self.assertEqual(row["published"], 0)
+        self.assertEqual(row["draft"], 1)
+        original_sha = row["package_sha256"]
+
+        # The as-uploaded PAK keeps every loose file (no cleanup is applied by default for ZIPs)
+        from tools.catalog import read_pak_directory
+        entries_before = sorted(e["path"] for e in read_pak_directory(Path(row["package_path"])))
+        self.assertIn("maps/start.bsp", entries_before)
+        self.assertIn("mapsrc/working.map", entries_before)                        # authoring junk still present
+        self.assertIn("src/progs.qc", entries_before)
+        self.assertIn("Thumbs.db", entries_before)
+        self.assertIn("gfx/wall.tga", entries_before)                                # TGA still a TGA
+
+        # Reprocess in place: apply 'authoring' cleanup AND reencode_textures
+        res = self.c.post(f"/addons/{row['id']}/reprocess",
+                          data={"csrf_token": self.csrf(), "exclude_presets_submitted": "1",
+                                "exclude_presets": ["authoring"], "reencode_textures": "1",
+                                "reencode_skyboxes": "0"})
+        self.assertEqual(res.status_code, 302)
+        row_after_reproc = self.row("lifecycle")
+        self.assertNotEqual(row_after_reproc["package_sha256"], original_sha)
+
+        # Independently inspect: required entries kept with correct bytes; authoring entries removed; TGA→PNG
+        entries_after = sorted(e["path"] for e in read_pak_directory(Path(row_after_reproc["package_path"])))
+        self.assertIn("maps/start.bsp", entries_after)
+        self.assertIn("maps/end.bsp", entries_after)
+        self.assertNotIn("mapsrc/working.map", entries_after)                     # authoring preset
+        self.assertNotIn("src/progs.qc", entries_after)                            # authoring preset (src/)
+        self.assertIn("Thumbs.db", entries_after)                                  # 'junk' preset NOT selected — kept
+        self.assertNotIn("gfx/wall.tga", entries_after)                            # replaced by PNG
+        self.assertIn("gfx/wall.png", entries_after)
+        with open(row_after_reproc["package_path"], "rb") as f:
+            for name, expected in [("maps/start.bsp", b"BSP-DATA-START"), ("maps/end.bsp", b"BSP-DATA-END")]:
+                entry = next(e for e in read_pak_directory(Path(row_after_reproc["package_path"])) if e["path"] == name)
+                f.seek(entry["offset"])
+                self.assertEqual(f.read(entry["size"]), expected, f"bytes of {name} changed!")
+
+        # Metadata-only edit does not re-run conversion (sanity check before publish)
+        pre_pub_sha = row_after_reproc["package_sha256"]
+        res = self.c.post(f"/addons/{row['id']}/edit",
+                          data={"title": "Lifecycle renamed", "addon_id": "lifecycle", "gamedir": "lifecycle",
+                                "author": "T", "date": "", "description": "", "csrf_token": self.csrf()})
+        self.assertEqual(res.status_code, 302)
+        self.assertEqual(self.row("lifecycle")["package_sha256"], pre_pub_sha)    # no re-conversion
+        self.assertEqual(self.row("lifecycle")["title"], "Lifecycle renamed")       # metadata updated
+
+        # Publish
+        pub_res = self.c.post(f"/addons/{row['id']}/publish", data={"csrf_token": self.csrf()}, follow_redirects=True)
+        self.assertEqual(pub_res.status_code, 200)
+        self.assertEqual(self.row("lifecycle")["published"], 1)
+        self.assertEqual(self.row("lifecycle")["draft"], 0)
+
+        # Download the public artifact and verify the FINAL bytes match expectations
+        cat = self.catalog()
+        entry = next(e for e in cat if e["gamedir"] == "lifecycle")
+        download = self.c.get("/" + entry["download"]).data
+        self.assertEqual(len(download), entry["size"])                              # catalog size matches download
+        # parse_pak reads from a path; dump the download to a sibling tempfile for inspection
+        download_path = self.tmp / "lifecycle-download.pak"
+        download_path.write_bytes(download)
+        downloaded_entries = parse_pak(download_path)
+        self.assertIn("maps/start.bsp", downloaded_entries)
+        self.assertIn("maps/end.bsp", downloaded_entries)
+        self.assertEqual(downloaded_entries["maps/start.bsp"], b"BSP-DATA-START")  # bytes preserved end-to-end
+        self.assertEqual(downloaded_entries["maps/end.bsp"], b"BSP-DATA-END")
+        self.assertIn("gfx/wall.png", downloaded_entries)
+        self.assertNotIn("gfx/wall.tga", downloaded_entries)                       # TGA replaced by PNG in the served file
+        self.assertNotIn("mapsrc/working.map", downloaded_entries)                  # authoring removed in served file
+        self.assertNotIn("src/progs.qc", downloaded_entries)                        # authoring removed in served file
+
+        # Verify the conversion report records the actual operation
+        report = json.loads(self.row("lifecycle")["conversion_report"])
+        self.assertEqual(report["kind"], "pak-reprocess")
+        reenc = report.get("reencoded") or {}
+        self.assertGreaterEqual(reenc.get("converted", 0), 1)
+        excl = report.get("excluded") or {}
+        self.assertGreaterEqual(excl.get("total", 0), 2)                            # mapsrc + src at minimum
+
+    def test_reprocess_failure_keeps_old_artifact_and_publication(self):
+        """§D failure semantics: a structural failure mid-reprocess leaves the artifact, hash,
+        publication state, and metadata untouched."""
+        pak = make_pak_bytes([("maps/a.bsp", b"BSPDATA")])
+        res = self.upload("keep", pak)
+        self.assertEqual(res.status_code, 200)
+        row = self.row("keep")
+        before_size = Path(row["package_path"]).stat().st_size
+        before_bytes = Path(row["package_path"]).read_bytes()
+        before_sha = row["package_sha256"]
+        before_title = row["title"]
+        # Use the helper directly with an options object that excludes everything
+        from app import _reprocess_existing_pak
+        from tools.convert_options import ConvertOptions
+        with self.assertRaises(ValueError):
+            _reprocess_existing_pak(row["id"], ConvertOptions(exclude_patterns=("*.bsp",)))
+        # Everything is unchanged
+        self.assertEqual(Path(row["package_path"]).stat().st_size, before_size)
+        self.assertEqual(Path(row["package_path"]).read_bytes(), before_bytes)
+        after = self.row("keep")
+        self.assertEqual(after["package_sha256"], before_sha)
+        self.assertEqual(after["title"], before_title)
+        self.assertEqual(after["published"], 0)
+        self.assertEqual(after["draft"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

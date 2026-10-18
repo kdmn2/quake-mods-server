@@ -110,6 +110,16 @@
     .table-sm td, .table-sm th { padding: 5px 8px; font-size: 13px; }
     pre { background: var(--bg-inset); border: 1px solid var(--border); border-radius: 6px; padding: 8px; overflow-x: auto; color: var(--text); }
     #batch-bar { background: var(--info-bg); }
+    /* Collection table: long titles/IDs/authors wrap inside their cells instead of stretching the
+       layout sideways; controls stay usable. Scoped to the collection table so other pages' tables
+       (which hold short fixed-ish values) keep their look. overflow-wrap:anywhere makes the min-content
+       width of long unbroken strings tiny, so the table's automatic column sizing stays balanced. */
+    .collection-table td, .collection-table th { overflow-wrap: anywhere; word-break: normal; vertical-align: top; }
+    .collection-table .cell-status, .collection-table .cell-size { white-space: nowrap; }
+    .collection-table input[type="checkbox"] { width: auto; margin-top: 0; }
+    @media (max-width: 700px) {                    /* narrow screens: keep the table readable */
+      .collection-table td, .collection-table th { padding: 6px 4px; }
+    }
     [data-theme="dark"] ::placeholder { color: var(--text-muted); }
   </style>
 </head>
@@ -127,6 +137,7 @@
         <a href="{{ url_for('batch_home') }}">Batch import</a>
         <a href="{{ url_for('quaddicted_home') }}">Quaddicted</a>
         <a href="{{ url_for('add_addon') }}">Upload</a>
+        <a href="{{ url_for('settings_page') }}">Settings</a>
         <a href="{{ url_for('logout') }}">Logout</a>
       {% endif %}
       <button class="theme-btn" type="button" id="theme-switch" data-theme-switch

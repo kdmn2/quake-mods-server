@@ -1,0 +1,36 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="card">
+  <p class="small"><a href="{{ url_for('dashboard') }}">‹ Back to the collection</a></p>
+  <h2>Settings — Processing defaults</h2>
+  <p class="small muted">These defaults are stored server-side and survive restarts. They apply to imports
+    <strong>when the option is not set explicitly for that item</strong>: an unchecked per-item option overrides a saved
+    default. Saved changes never rewrite existing packages automatically — use “Reprocess package” on an add-on page to
+    apply these to a stored package.</p>
+
+  <form method="post" action="{{ url_for('settings_page') }}" data-once>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="opt">
+      <h4>Cleanup — remove files the verified policy classifies as unnecessary</h4>
+      {% for key, preset in presets.items() %}
+      <label><input type="checkbox" name="cleanup_presets" value="{{ key }}" {% if key in saved.cleanup_presets %}checked{% endif %}>
+        {{ preset.label }}</label>
+      <div class="small muted" style="margin:0 0 6px 24px">{{ preset.help }}</div>
+      {% endfor %}
+      <div class="small muted">Documentation removal (root-level readme/txt/pdf) is part of the “docs” preset above — it is
+        left out only when that preset is selected. Unknown or unrecognized file types are never removed by these rules.</div>
+    </div>
+    <div class="opt">
+      <h4>Re-encode TGA images as PNG (lossless, verified identical pixels)</h4>
+      <label><input type="checkbox" name="reencode_textures" value="1" {% if saved.reencode_textures %}checked{% endif %}> Textures</label>
+      <label style="margin-left:16px"><input type="checkbox" name="reencode_skyboxes" value="1" {% if saved.reencode_skyboxes %}checked{% endif %}> Skyboxes</label>
+      <div class="small muted">Only truecolor TGAs whose PNG conversion can be *verified byte-for-byte identical after
+        decoding* are converted; anything the verifier cannot prove identical stays TGA. Ironwail loads .png before .tga with
+        the same decoder, so converted files are indistinguishable in the engine. Side effect: the package bytes change.</div>
+    </div>
+    <button type="submit">Save defaults</button>
+    <button type="submit" name="action" value="reset" class="danger" style="margin-left:12px"
+            title="Removes the saved defaults; per-item settings continue to work as before">Reset to application defaults</button>
+  </form>
+</div>
+{% endblock %}

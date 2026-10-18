@@ -1,0 +1,29 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="card">
+  <p class="small"><a href="{{ url_for('addon_detail', addon_id=addon.id) }}">‹ Back to the add-on</a></p>
+  <h2>Reprocess package — {{ addon.title }}</h2>
+  <p class="small muted">Re-process the stored PAK in place. Works without a kept source ZIP. The package's
+    title, ID, author, description, and publication state are preserved; only the file contents change.
+    Unaffected entries keep their exact bytes. The public download is unchanged until you explicitly Publish again.</p>
+
+  <p><strong>Source:</strong> {{ addon.package_name }} ({{ addon.package_size }} bytes, SHA-256
+    <span class="mono small">{{ addon.package_sha256[:16] }}…</span>)</p>
+  {% if inspection.report %}
+  <p class="small muted">Inspection: <strong>{{ inspection.report.entries }}</strong> entries,
+    {{ '%.1f'|format(inspection.report.payload_bytes / 1048576) }} MiB.</p>
+  {% endif %}
+
+  <form method="post" action="{{ url_for('reprocess_addon', addon_id=addon.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="card" style="margin:12px 0">
+      <h3>Processing options</h3>
+      {% include "_convert_options.html" %}
+    </div>
+    <button type="submit">Reprocess</button>
+    <a href="{{ url_for('addon_detail', addon_id=addon.id) }}" style="margin-left:12px">Cancel</a>
+    <p class="small muted" style="margin-top:12px">If every checkbox is left as the default, the package is
+      rewritten with the same entries and bytes — useful when the underlying format needs refreshing.</p>
+  </form>
+</div>
+{% endblock %}

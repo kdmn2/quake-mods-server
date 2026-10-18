@@ -93,50 +93,39 @@
       <button type="submit" name="action" value="delete" class="danger small">Delete selected…</button>
       <span class="small muted">A confirmation page follows; nothing is changed there.</span>
     </div>
-    <table>
+    <table class="collection-table">
       <thead>
         <tr>
-          <th><input type="checkbox" id="sel-all" aria-label="Select or clear all add-ons in this view"></th>
+          <th class="cell-select"><input type="checkbox" id="sel-all" aria-label="Select or clear all add-ons in this view"></th>
           <th>Title</th>
           <th>ID</th>
           <th>Dir</th>
-          <th>Status</th>
-          <th>Size</th>
+          <th class="cell-status">Status</th>
+          <th class="cell-size">Size</th>
           <th>Actions</th>
         </tr>
       </thead>
       <tbody>
       {% for addon in addons %}
       <tr>
-        <td><input type="checkbox" name="selected_pk" value="{{ addon.id }}" class="pick" aria-label="Select {{ addon.title }}"></td>
+        <td class="cell-select"><input type="checkbox" name="selected_pk" value="{{ addon.id }}" class="pick" aria-label="Select {{ addon.title }}"></td>
         <td>{{ addon.title }}</td>
         <td>{{ addon.addon_id }}</td>
         <td>{{ addon.gamedir }}</td>
-        <td>{% if addon.published %}Published{% else %}Draft{% endif %}</td>
-        <td><span {% if addon.package_size is not none %}title="{{ addon.package_size }} bytes"{% endif %}>
+        <td class="cell-status">{% if addon.published %}Published{% else %}Draft{% endif %}</td>
+        <td class="cell-size"><span {% if addon.package_size is not none %}title="{{ addon.package_size }} bytes"{% endif %}>
           {% if addon.package_size is not none %}{{ addon.package_size|filesize }}{% else %}—{% endif %}</span></td>
         <td>
           <a href="{{ url_for('addon_detail', addon_id=addon.id, next=next) }}">View</a>
           <a class="small" href="{{ url_for('edit_addon', addon_id=addon.id, next=next) }}">Edit</a>
           {% if addon.published %}
-          <form style="display:inline" method="post" action="{{ url_for('unpublish_addon', addon_id=addon.id) }}">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <input type="hidden" name="next" value="{{ next }}">
-            <button type="submit">Unpublish</button>
-          </form>
-          {% else %}
-          <form style="display:inline" method="post" action="{{ url_for('publish_addon', addon_id=addon.id) }}">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <input type="hidden" name="next" value="{{ next }}">
-            <button type="submit">Publish</button>
-          </form>
+          <button class="row-forms" type="submit" form="row-unpublish-{{ addon.id }}" formaction="{{ url_for('unpublish_addon', addon_id=addon.id) }}"
+                  title="Make {{ addon.addon_id }} a draft (removes it from the public catalog)">Unpublish</button>
           {% endif %}
-          <form style="display:inline" method="post" action="{{ url_for('delete_addon', addon_id=addon.id) }}"
-                onsubmit="return confirm('Permanently delete this add-on? This cannot be undone.');">
-            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <input type="hidden" name="next" value="{{ next }}">
-            <button type="submit" class="danger">Delete</button>
-          </form>
+          <button class="row-forms" type="submit" form="row-publish-{{ addon.id }}" formaction="{{ url_for('publish_addon', addon_id=addon.id) }}"
+                  title="Publish {{ addon.addon_id }}">Publish</button>
+          <button class="row-forms danger" type="submit" form="row-delete-{{ addon.id }}" formaction="{{ url_for('delete_addon', addon_id=addon.id) }}"
+                  title="Permanently delete {{ addon.addon_id }}">Delete</button>
         </td>
       </tr>
       {% endfor %}
@@ -154,6 +143,25 @@
       {% endif %}
     </div>
   </form>
+  {# Per-row action forms live OUTSIDE the selection form (valid HTML): the buttons above reference them
+     with the form= attribute. They work without JavaScript and are never disabled by the batch selection.
+     Confirmation uses the same data-confirm pattern as batch_view.html; collection.js wires it up
+     so we don't depend on inline onsubmit handlers (CSP-friendly). #}
+  {% for addon in addons %}
+  <div hidden>
+    <form id="row-unpublish-{{ addon.id }}" method="post" action="{{ url_for('unpublish_addon', addon_id=addon.id) }}" data-once
+          data-confirm='Unpublish “{{ addon.title|e }}” ({{ addon.addon_id|e }})? It disappears from the public catalog; the stored package and record are retained.'>
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="next" value="{{ next }}">
+    </form>
+    <form id="row-publish-{{ addon.id }}" method="post" action="{{ url_for('publish_addon', addon_id=addon.id) }}" data-once>
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="next" value="{{ next }}">
+    </form>
+    <form id="row-delete-{{ addon.id }}" method="post" action="{{ url_for('delete_addon', addon_id=addon.id) }}" data-once
+          data-confirm='Permanently delete “{{ addon.title|e }}” ({{ addon.addon_id|e }})? The record, package and public download are removed. This cannot be undone.'>
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="next" value="{{ next }}">
+    </form>
+  </div>
+  {% endfor %}
   {% endif %}
 </div>
 <script src="{{ url_for('static', filename='collection.js') }}"></script>
