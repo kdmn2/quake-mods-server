@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Ironwail Add-on Manager — original icon: an add-on crate with an arrow, on a blue tile.
+       Original work; no third-party or Quake logo elements. -->
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#195ac8"/>
+  <path d="M15 26v17a2 2 0 0 0 2 2h30a2 2 0 0 0 2-2V26" fill="none" stroke="#ffffff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M12 26h40" stroke="#ffffff" stroke-width="5" stroke-linecap="round"/>
+  <path d="M32 40V20" stroke="#ffd15c" stroke-width="6" stroke-linecap="round"/>
+  <path d="M23.5 28.5 32 19l8.5 9.5" fill="none" stroke="#ffd15c" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

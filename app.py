@@ -456,6 +456,14 @@ def _run_plan(token: str, progress: Progress) -> JobOutcome:
 
 
 def _run_publish(addon_pk: int, progress: Progress) -> JobOutcome:
+    _publish_one(addon_pk, progress)
+    generate_catalog()
+    return JobOutcome("Add-on published and catalog regenerated.", "success", "dashboard")
+
+
+def _publish_one(addon_pk: int, progress: Progress, *, catalog: bool = True) -> str:
+    """Copy one add-on's package into the public folder after validation, and mark it published.
+    Shared by the single publish route and batch publishing (which defers the catalog regeneration)."""
     conn = get_db()
     try:
         addon = conn.execute("SELECT * FROM addons WHERE id = ?", (addon_pk,)).fetchone()
@@ -482,14 +490,17 @@ def _run_publish(addon_pk: int, progress: Progress) -> JobOutcome:
         raise JobFailed(f"Publish failed: {exc}", "addon_detail", {"addon_id": addon_pk}) from exc
     finally:
         tmp_file.unlink(missing_ok=True)
+    changed = 0
     with db_txn() as conn:
-        conn.execute(
+        changed = conn.execute(
             "UPDATE addons SET published = 1, draft = 0, package_size = ?, package_sha256 = ?, package_mtime = ?, manifest_path = ?, "
             "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (size, sha, int(package_path.stat().st_mtime), str(public_file), addon_pk),
-        )
-    generate_catalog()
-    return JobOutcome("Add-on published and catalog regenerated.", "success", "dashboard")
+        ).rowcount
+    if not changed:                       # the record was deleted while the package was being copied
+        public_file.unlink(missing_ok=True)
+        raise JobFailed("The add-on was deleted while it was being published.", "dashboard")
+    return addon["addon_id"]
 
 
 def _wants_json() -> bool:
@@ -510,15 +521,22 @@ def _form_failure(message: str, template: str = "addon_form.html", **ctx: Any) -
 
 @app.template_filter("filesize")
 def filesize_filter(value: Any) -> str:
+    """Human-readable size without decimals (binary units, the project's established convention).
+    A nonzero size is never displayed as 0 MiB/GiB: the unit keeps shrinking until the rounded value is at least 1.
+    The underlying numeric value is unchanged anywhere the exact byte count matters (sorting, catalog, validation)."""
     try:
         n = float(value)
     except (TypeError, ValueError):
-        return "?"
-    for unit in ("bytes", "KiB", "MiB", "GiB"):
-        if n < 1024 or unit == "GiB":
-            return f"{int(n)} bytes" if unit == "bytes" else f"{n:.1f} {unit}"
-        n /= 1024
-    return f"{n:.1f} GiB"
+        return "—"
+    if n < 0:
+        return "—"
+    for size, unit in ((1024, "B"), (1024 ** 2, "KiB"), (1024 ** 3, "MiB"), (1024 ** 4, "GiB"), (1024 ** 5, "TiB")):
+        if n < size or unit == "TiB":
+            shown = int(n // (size // 1024)) if unit != "B" else int(n)
+            if n > 0 and shown == 0:
+                continue                     # round up into a smaller unit instead of showing 0 MiB
+            return f"{shown} {unit}" if n > 0 or unit == "B" else "0 B"
+    return "—"
 
 
 def ensure_dirs() -> None:
@@ -639,6 +657,8 @@ def init_db() -> None:
         conn.execute("ALTER TABLE addons ADD COLUMN batch_item_id INTEGER")
     # one draft per batch item, enforced by the database, so a retry or a crash cannot create a second one
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_addons_batch_item ON addons(batch_item_id) WHERE batch_item_id IS NOT NULL")
+    # submit keys of confirmed batch actions (publish); prevents reload-repeat from running a batch twice
+    conn.execute("CREATE TABLE IF NOT EXISTS batch_keys (key TEXT PRIMARY KEY, job_id TEXT NOT NULL, created_at REAL)")
     batchstore.init_schema(conn)
     jobs.init_schema(conn)
     quaddicted_module.init_schema(conn)
@@ -950,16 +970,78 @@ def require_auth() -> None:
         raise Forbidden()
 
 
+STATUS_FILTERS = ("", "published", "draft")
+SORT_FIELDS = ("", "title", "author", "package_size", "created_at", "updated_at", "status", "addon_id")
+COLLECTION_PAGE_SIZES = (10, 25, 50, 100)        # bounded choices for ?page_size
+COLLECTION_PAGE_SIZE_DEFAULT = 25              # default shown on the collection page
+SORT_KEYS = {
+    "": ("created_at", "id"),
+    "title": ("LOWER(title)", "id"),
+    "addon_id": ("LOWER(addon_id)", "id"),
+    "author": ("LOWER(author)", "LOWER(title)", "id"),
+    "package_size": ("package_size", "LOWER(title)", "id"),
+    "created_at": ("created_at", "id"),
+    "updated_at": ("updated_at", "id"),
+    "status": ("published", "LOWER(title)", "id"),
+}
+
+
+def _collection_query(search: str, status: str, sort: str, direction: str):
+    """Build the SQL for the collection view: filter the full set, sort with a stable secondary key (id), then paginate.
+    Returns (select_sql_with_placeholder_limit_offset, count_sql, where_params). Bound limit/offset is appended by the caller."""
+    descending = direction == "desc"
+    where, params = [], []
+    if search:
+        needle = f"%{search.strip()[:100]}%"
+        where.append("(title LIKE ? OR addon_id LIKE ? OR gamedir LIKE ? OR author LIKE ? OR COALESCE(description, '') LIKE ?)")
+        params += [needle] * 5
+    if status in STATUS_FILTERS[1:]:
+        where.append(("published = 1" if status == "published" else "draft = 1"))
+    keys = ", ".join(k + (" DESC" if descending else "") for k in SORT_KEYS.get(sort, SORT_KEYS[""]))
+    where_clause = ("WHERE " + " AND ".join(where)) if where else ""
+    order_clause = f"ORDER BY {keys}"
+    return (f"SELECT * FROM addons {where_clause} {order_clause} LIMIT ? OFFSET ?",
+            f"SELECT COUNT(*) FROM addons {where_clause}", params)
+
+
 @app.route("/dashboard")
 def dashboard() -> Any:
     require_auth()
+    search = (request.args.get("q") or "").strip()[:150]
+    status = request.args.get("status") if request.args.get("status") in STATUS_FILTERS else ""
+    sort = request.args.get("sort") if request.args.get("sort") in SORT_FIELDS else ""
+    direction = request.args.get("dir") if request.args.get("dir") in ("asc", "desc") else ""
+    try:
+        raw_page = int(request.args.get("page") or "1")
+    except ValueError:
+        raw_page = 1
+    try:
+        page_size = int(request.args.get("page_size") or COLLECTION_PAGE_SIZE_DEFAULT)
+    except ValueError:
+        page_size = COLLECTION_PAGE_SIZE_DEFAULT
+    if page_size not in COLLECTION_PAGE_SIZES:
+        page_size = COLLECTION_PAGE_SIZE_DEFAULT
+    select_sql, count_sql, params = _collection_query(search, status, sort, direction)
     conn = get_db()
-    addons = conn.execute("SELECT * FROM addons ORDER BY created_at DESC").fetchall()
-    pending = conn.execute("SELECT token, kind, source_name, form_json, created_at, plan_json IS NOT NULL AS has_plan FROM imports WHERE review = 1 ORDER BY created_at DESC").fetchall()
-    conn.close()
+    try:
+        total_rows = conn.execute(count_sql, params).fetchone()[0]
+        total_pages = max(1, -(-total_rows // page_size))      # ceil division (a unary minus on the numerator turns floor into ceiling; a space -(-a) // b would be wrong)
+        page = max(1, min(raw_page, total_pages))
+        offset = (page - 1) * page_size
+        addons = conn.execute(select_sql, (*params, page_size, offset)).fetchall()
+        pending = conn.execute("SELECT token, kind, source_name, form_json, created_at, plan_json IS NOT NULL AS has_plan FROM imports WHERE review = 1 ORDER BY created_at DESC").fetchall()
+    finally:
+        conn.close()
+    range_start = 0 if total_rows == 0 else (offset + 1)
+    range_end = offset + len(addons)
     pending_imports = [{"token": r["token"], "name": r["source_name"], "kind": r["kind"], "title": json.loads(r["form_json"]).get("title", ""),
                         "age_minutes": int((time.time() - r["created_at"]) / 60)} for r in pending]
-    return render_template("dashboard.html", addons=addons, active_jobs=jobs.active(), pending_imports=pending_imports)
+    view = {"addons": addons, "active_jobs": jobs.active(), "pending_imports": pending_imports,
+            "q": search, "status_filter": status, "sort": sort, "dir": direction,
+            "page": page, "page_size": page_size, "total_rows": total_rows, "total_pages": total_pages,
+            "range_start": range_start, "range_end": range_end,
+            "page_sizes": COLLECTION_PAGE_SIZES, "page_size_default": COLLECTION_PAGE_SIZE_DEFAULT}
+    return render_template("dashboard.html", **view)
 
 
 def _read_addon_form(*, defaults: dict[str, Any] | None = None) -> dict[str, str]:
@@ -1326,6 +1408,195 @@ def job_cancel(job_id: str) -> Any:
     return redirect(url_for("job_page", job_id=job_id))
 
 
+def _unpublish_record(addon_pk: int) -> tuple[str, str]:
+    """Mark one record back to draft and remove its public copy. Returns (outcome, addon_id). Shared by single and batch routes."""
+    with db_txn() as conn:
+        addon = conn.execute("SELECT * FROM addons WHERE id = ?", (addon_pk,)).fetchone()
+        if not addon:
+            return "missing", ""
+        conn.execute("UPDATE addons SET published = 0, draft = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (addon_pk,))
+    (Path(app.config["PUBLIC_ROOT"]) / "addons" / f"{addon['addon_id']}.pak").unlink(missing_ok=True)
+    return ("unpublished" if addon["published"] else "noop"), addon["addon_id"]
+
+
+def _delete_record(addon_pk: int) -> tuple[str, str]:
+    """Remove one record with its public copy, its package file, and its kept source copy. Reused by the single and batch routes."""
+    with db_txn() as conn:
+        addon = conn.execute("SELECT * FROM addons WHERE id = ?", (addon_pk,)).fetchone()
+        if not addon:
+            return "missing", ""
+        public_file = Path(app.config["PUBLIC_ROOT"]) / "addons" / f"{addon['addon_id']}.pak"
+        if public_file.exists():
+            public_file.unlink(missing_ok=True)
+        package_file = Path(addon["package_path"])
+        if package_file.exists():
+            package_file.unlink(missing_ok=True)
+        if addon["source_path"]:
+            kept_dir = Path(addon["source_path"]).parent
+            if kept_dir.parent == Path(app.config["PERSIST_ROOT"]) / "sources":
+                shutil.rmtree(kept_dir, ignore_errors=True)          # only the app-owned copy is removed; originals are never touched
+        conn.execute("DELETE FROM addons WHERE id = ?", (addon_pk,))
+    return "deleted", addon["addon_id"]
+
+
+def _batch_publish_job(addon_pks: list[int], progress: Progress) -> JobOutcome:
+    """One job that publishes every selected add-on independently and regenerates the catalog exactly once at the end."""
+    results: list[str] = []
+    ok = failed = 0
+    for i, pk in enumerate(addon_pks):
+        progress("Publishing %d of %d" % (i + 1, len(addon_pks)), 0, 0)
+        try:
+            name = _publish_one(pk, progress)
+            ok += 1
+        except (JobFailed, ValueError, OSError) as exc:
+            failed += 1
+            results.append(str(exc)[:200])
+    generate_catalog()
+    if failed:
+        return JobOutcome(f"Batch publish: {ok} done, {failed} failed. Details: " + " | ".join(results[:10]), "warning", "dashboard")
+    return JobOutcome(f"Batch publish finished: {ok} add-on(s) published; catalog regenerated.", "success", "dashboard")
+
+
+def _view_query_strings(request) -> dict[str, str]:
+    """The current collection view (search/status/sort/page/page_size), kept across the batch flow so the
+    admin returns to the same view."""
+    out = {}
+    for name in ("q", "status", "sort", "dir", "page", "page_size"):
+        value = request.args.get(name) or request.form.get(name) or ""
+        if name == "q":
+            value = value.strip()[:150]
+        out[name] = value
+    return out
+
+
+BATCH_ACTIONS = ("delete", "unpublish", "publish")
+BATCH_ACTION_MAX = 200                         # bound on selected items per batch action
+
+
+@app.route("/addons/batch", methods=["POST"])
+def collection_batch_preview() -> Any:
+    """Stage 1 of a batch action: a server-rendered confirmation page. Nothing is mutated here."""
+    require_auth()
+    pks = _clean_selection(request.form.getlist("selected_pk"))
+    action = request.form.get("action", "")
+    rows: list[dict[str, Any]] = []
+    conn = get_db()
+    try:
+        for pk in pks:
+            row = conn.execute("SELECT * FROM addons WHERE id = ?", (pk,)).fetchone()
+            if row is None:
+                rows.append({"pk": pk, "title": f"#{pk}", "problem": "The record no longer exists and will be skipped."})
+                continue
+            item = {"pk": pk, "title": row["title"] or row["addon_id"], "addon_id": row["addon_id"], "published": bool(row["published"])}
+            if action == "publish":
+                if row["published"]:
+                    item["problem"] = "Already published; will be skipped."
+                elif not Path(row["package_path"]).exists():
+                    item["problem"] = "The package file is missing; publishing it would fail."
+            elif action == "unpublish" and not row["published"]:
+                item["problem"] = "Already a draft; will be skipped."
+            rows.append(item)
+    finally:
+        conn.close()
+    if not rows:
+        flash("Select at least one add-on for this action.", "error")
+        return redirect(url_for("dashboard"))
+    view_qs = _view_query_strings(request)
+    affected_public = sum(1 for r in rows if r.get("published"))
+    eligible = [r for r in rows if not r.get("problem")]
+    if not eligible:
+        flash("No selected add-on can be affected by this action. Nothing was changed.", "warning")
+        return render_template("collection_batch_confirm.html", rows=rows, action=None, affected_public=affected_public,
+                               eligible_count=0, eligible_titles=[], all_titles=[r["title"] for r in rows], view_qs=view_qs)
+    return render_template("collection_batch_confirm.html", rows=rows, action=action, affected_public=affected_public,
+                           eligible_count=len(eligible), eligible_titles=[r["title"] for r in eligible],
+                           all_titles=[r["title"] for r in rows], submit_key=uuid.uuid4().hex, view_qs=view_qs)
+
+
+def _clean_selection(raw_values: list[str]) -> list[int]:
+    """Validated selection: positive integers only, in order, without duplicates. Empty strings are dropped."""
+    out: list[int] = []
+    seen: set[int] = set()
+    for raw in raw_values:
+        try:
+            pk = int(str(raw).strip())
+        except (TypeError, ValueError):
+            continue
+        if pk > 0 and pk not in seen:
+            seen.add(pk)
+            out.append(pk)
+    return out
+
+
+@app.route("/addons/batch/execute", methods=["POST"])
+def collection_batch_execute() -> Any:
+    """Stage 2: the confirmed execution. Independent per-item outcomes; catalog regenerated exactly once."""
+    require_auth()
+    action = request.form.get("action", "")
+    pks = _clean_selection(request.form.getlist("selected_pk"))
+    submit_key = request.form.get("submit_key") or None
+    if action not in BATCH_ACTIONS or not pks:
+        flash("Nothing to do: the selection was empty or the action is unknown. Nothing was changed.", "error")
+        return redirect(url_for("dashboard"))
+    if len(pks) > BATCH_ACTION_MAX:
+        flash(f"At most {BATCH_ACTION_MAX} add-ons can be affected in one action; {len(pks)} were selected. Nothing was changed.", "error")
+        return redirect(url_for("dashboard"))
+    if action == "publish":
+        # Double submissions (a reload of the confirm page) return the original job instead of starting a second batch.
+        if submit_key:
+            conn = get_db()
+            row = conn.execute("SELECT job_id FROM batch_keys WHERE key = ?", ("batch:" + submit_key,)).fetchone()
+            conn.close()
+            if row:
+                return redirect(url_for("job_page", job_id=row["job_id"]))
+        job_id = jobs.submit("batch-publish", f"Bulk publish {len(pks)} add-on(s)", lambda progress: _batch_publish_job(pks, progress))
+        if submit_key:
+            with db_txn() as conn:
+                conn.execute("INSERT INTO batch_keys (key, job_id, created_at) VALUES (?, ?, ?)", ("batch:" + submit_key, job_id, time.time()))
+                conn.execute("DELETE FROM batch_keys WHERE created_at < ?", (time.time() - 6 * 3600,))
+        return _job_response(job_id)
+    totals: dict[str, int] = {}
+    for pk in pks:
+        outcome, _name = (_unpublish_record(pk) if action == "unpublish" else _delete_record(pk))
+        totals[outcome] = totals.get(outcome, 0) + 1
+    generate_catalog()
+    parts = []
+    changed = totals.get("deleted", 0) + totals.get("unpublished", 0)
+    if changed:
+        parts.append(f"{changed} add-on(s) affected")
+    if totals.get("noop"):
+        parts.append(f"{totals['noop']} skipped (already in that state)")
+    if totals.get("missing"):
+        parts.append(f"{totals['missing']} record(s) were already gone")
+    summary = f"Batch {action}: " + (", ".join(parts) or "nothing to change") + "."
+    summary += " The public catalog was regenerated." if changed else " The catalog is unchanged."
+    flash(summary, "success")
+    keep = {k: v for k, v in _view_query_strings(request).items() if v}
+    # clamp page after the change so a deletion on the last page does not land the user on a 404
+    page = int(keep.pop("page", "1") or "1")
+    page_size = int(keep.pop("page_size", str(COLLECTION_PAGE_SIZE_DEFAULT)) or str(COLLECTION_PAGE_SIZE_DEFAULT))
+    if page_size not in COLLECTION_PAGE_SIZES:
+        page_size = COLLECTION_PAGE_SIZE_DEFAULT
+    total_after = get_db().execute("SELECT COUNT(*) FROM addons").fetchone()[0] if False else 0
+    conn = get_db()
+    try:
+        # re-run the current filter to find the new total — keeps the page count consistent with the view
+        from flask import request as _req
+        with conn:
+            search = keep.get("q", "")
+            status = keep.get("status", "")
+            sort = keep.get("sort", "")
+            direction = keep.get("dir", "")
+            _select_sql, count_sql, params = _collection_query(search, status, sort, direction)
+            total_after = conn.execute(count_sql, params).fetchone()[0]
+    finally:
+        conn.close()
+    total_pages = max(1, -(-total_after // page_size))       # ceil division, same convention as the dashboard route
+    if page > total_pages:
+        page = total_pages
+    return redirect(url_for("dashboard", page=page, page_size=page_size, **keep))
+
+
 @app.route("/addons/<int:addon_id>/publish", methods=["POST"])
 def publish_addon(addon_id: int) -> Any:
     require_auth()
@@ -1342,30 +1613,23 @@ def publish_addon(addon_id: int) -> Any:
 @app.route("/addons/<int:addon_id>/unpublish", methods=["POST"])
 def unpublish_addon(addon_id: int) -> Any:
     require_auth()
-    with db_txn() as conn:
-        conn.execute("UPDATE addons SET published = 0, draft = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (addon_id,))
+    outcome, _ = _unpublish_record(addon_id)
     generate_catalog()
-    flash("Add-on unpublished; it is no longer in the public catalog.", "success")
+    if outcome == "unpublished":
+        flash("Add-on unpublished; it is no longer in the public catalog.", "success")
+    elif outcome == "noop":
+        flash("The add-on is already a draft.", "info")
+    else:
+        raise NotFound()
     return redirect(url_for("dashboard"))
 
 
 @app.route("/addons/<int:addon_id>/delete", methods=["POST"])
 def delete_addon(addon_id: int) -> Any:
     require_auth()
-    with db_txn() as conn:
-        addon = conn.execute("SELECT * FROM addons WHERE id = ?", (addon_id,)).fetchone()
-        if addon:
-            public_file = Path(app.config["PUBLIC_ROOT"]) / "addons" / f"{addon['addon_id']}.pak"
-            if public_file.exists():
-                public_file.unlink(missing_ok=True)
-            package_file = Path(addon["package_path"])
-            if package_file.exists():
-                package_file.unlink(missing_ok=True)
-            if addon["source_path"]:
-                kept_dir = Path(addon["source_path"]).parent
-                if kept_dir.parent == Path(app.config["PERSIST_ROOT"]) / "sources":
-                    shutil.rmtree(kept_dir, ignore_errors=True)
-            conn.execute("DELETE FROM addons WHERE id = ?", (addon_id,))
+    outcome, _ = _delete_record(addon_id)
+    if outcome == "missing":
+        raise NotFound()
     generate_catalog()
     flash("Add-on deleted.", "success")
     return redirect(url_for("dashboard"))

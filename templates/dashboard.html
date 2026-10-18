@@ -38,25 +38,81 @@
 
 <div class="card">
   <h2>Collection</h2>
-  <table>
-    <thead>
-      <tr>
-        <th>Title</th>
-        <th>ID</th>
-        <th>Dir</th>
-        <th>Status</th>
-        <th>Size</th>
-        <th>Actions</th>
-      </tr>
-    </thead>
-    <tbody>
+  <form method="get" action="{{ url_for('dashboard') }}" class="inline" style="flex-wrap:wrap;gap:8px">
+    <label style="flex:2;min-width:200px">Search (title, ID, directory, author)&thinsp;
+      <input name="q" value="{{ q }}" placeholder="e.g. retrojam"></label>
+    <label style="flex:0 1 auto">Status&thinsp;
+      <select name="status" style="width:auto">
+        <option value="">Any</option>
+        <option value="published" {% if status_filter == 'published' %}selected{% endif %}>Published</option>
+        <option value="draft" {% if status_filter == 'draft' %}selected{% endif %}>Draft</option>
+      </select></label>
+    <label style="flex:0 1 auto">Sort by&thinsp;
+      <select name="sort" style="width:auto">
+        <option value="" {% if not sort %}selected{% endif %}>Newest first</option>
+        {% for value, label in [('title','Title'),('author','Author'),('addon_id','ID'),('package_size','Size'),('created_at','Created'),('updated_at','Updated'),('status','Status')] %}
+        <option value="{{ value }}" {% if sort == value %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select></label>
+    <label style="flex:0 1 auto">Order&thinsp;
+      <select name="dir" style="width:auto">
+        <option value="asc" {% if dir == 'asc' %}selected{% endif %}>Ascending</option>
+        <option value="desc" {% if dir == 'desc' %}selected{% endif %}>Descending</option>
+      </select></label>
+    <label style="flex:0 1 auto">Per page&thinsp;
+      <select name="page_size" style="width:auto">
+        {% for n in page_sizes %}
+        <option value="{{ n }}" {% if page_size == n %}selected{% endif %}>{{ n }}</option>
+        {% endfor %}
+      </select></label>
+    <button type="submit" style="width:auto;align-self:flex-end">Apply</button>
+    <a style="align-self:flex-end" class="small muted" href="{{ url_for('dashboard') }}">Clear filters</a>
+  </form>
+
+  {% set has_filters = q or status_filter or sort or dir %}
+  {% if not addons and total_rows == 0 and not has_filters %}
+  <p>No add-ons yet. Upload one to get started.</p>
+  {% elif not addons %}
+  <p>No add-ons match this search or filter. <a href="{{ url_for('dashboard') }}">Clear filters</a> to see all {{ total_rows }}.</p>
+  {% else %}
+  <p class="small muted">Showing {{ range_start }}–{{ range_end }} of {{ total_rows }} (page {{ page }} of {{ total_pages }})</p>
+  <form method="post" action="{{ url_for('collection_batch_preview') }}" id="collection-form" data-once>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="q" value="{{ q or '' }}">
+    <input type="hidden" name="status" value="{{ status_filter or '' }}">
+    <input type="hidden" name="sort" value="{{ sort or '' }}">
+    <input type="hidden" name="dir" value="{{ dir or '' }}">
+    <input type="hidden" name="page" value="{{ page }}">
+    <input type="hidden" name="page_size" value="{{ page_size }}">
+    <div id="batch-bar" class="sev info" style="display:none;align-items:center;gap:10px">
+      <strong id="sel-count">0 selected</strong>
+      <button type="submit" name="action" value="publish" class="small">Publish selected</button>
+      <button type="submit" name="action" value="unpublish" class="small">Unpublish selected</button>
+      <button type="submit" name="action" value="delete" class="danger small">Delete selected…</button>
+      <span class="small muted">A confirmation page follows; nothing is changed there.</span>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th><input type="checkbox" id="sel-all" aria-label="Select or clear all add-ons in this view"></th>
+          <th>Title</th>
+          <th>ID</th>
+          <th>Dir</th>
+          <th>Status</th>
+          <th>Size</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
       {% for addon in addons %}
       <tr>
+        <td><input type="checkbox" name="selected_pk" value="{{ addon.id }}" class="pick" aria-label="Select {{ addon.title }}"></td>
         <td>{{ addon.title }}</td>
         <td>{{ addon.addon_id }}</td>
         <td>{{ addon.gamedir }}</td>
         <td>{% if addon.published %}Published{% else %}Draft{% endif %}</td>
-        <td>{% if addon.package_size %}{{ addon.package_size }} bytes{% endif %}</td>
+        <td><span {% if addon.package_size is not none %}title="{{ addon.package_size }} bytes"{% endif %}>
+          {% if addon.package_size is not none %}{{ addon.package_size|filesize }}{% else %}—{% endif %}</span></td>
         <td>
           <a href="{{ url_for('addon_detail', addon_id=addon.id) }}">View</a>
           {% if addon.published %}
@@ -72,10 +128,22 @@
           {% endif %}
         </td>
       </tr>
-      {% else %}
-      <tr><td colspan="6">No add-ons yet.</td></tr>
       {% endfor %}
-    </tbody>
-  </table>
+      </tbody>
+    </table>
+    <p class="small muted">Selection applies to the add-ons on this page (a fresh list replaces the previous selection).
+      A confirmation page follows before anything is changed; use Clear to start over.</p>
+    <div class="inline" style="margin-top:8px;flex-wrap:wrap;gap:6px">
+      {% if total_pages > 1 %}
+        <a class="small" href="{{ url_for('dashboard', page=1, page_size=page_size, q=q, status=status_filter, sort=sort, dir=dir) }}">« First</a>
+        {% if page > 1 %}<a class="small" href="{{ url_for('dashboard', page=page-1, page_size=page_size, q=q, status=status_filter, sort=sort, dir=dir) }}">‹ Previous</a>{% else %}<span class="small muted">‹ Previous</span>{% endif %}
+        <span class="small">Page {{ page }} of {{ total_pages }}</span>
+        {% if page < total_pages %}<a class="small" href="{{ url_for('dashboard', page=page+1, page_size=page_size, q=q, status=status_filter, sort=sort, dir=dir) }}">Next ›</a>{% else %}<span class="small muted">Next ›</span>{% endif %}
+        <a class="small" href="{{ url_for('dashboard', page=total_pages, page_size=page_size, q=q, status=status_filter, sort=sort, dir=dir) }}">Last »</a>
+      {% endif %}
+    </div>
+  </form>
+  {% endif %}
 </div>
+<script src="{{ url_for('static', filename='collection.js') }}"></script>
 {% endblock %}

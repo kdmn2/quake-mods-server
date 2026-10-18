@@ -19,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends unzip && rm -rf
 COPY app.py ./app.py
 COPY tools ./tools
 COPY templates ./templates
+COPY static ./static
 
 RUN useradd --create-home --shell /bin/bash appuser && \
     mkdir -p /appdata /public /uploads && \

@@ -1,0 +1,55 @@
+{% extends 'base.html' %}
+{% block content %}
+<div class="card">
+  {% if not action %}
+  <h2>Batch action</h2>
+  <div class="sev warning">No add-on of the selection would change. Nothing was modified.
+    <a href="{{ url_for('dashboard') }}">Back to the collection</a></div>
+  {% else %}
+  <h2>Confirm batch action: {{ {'delete': 'Delete', 'unpublish': 'Unpublish', 'publish': 'Publish'}[action] }}</h2>
+  <p>{{ eligible_count }} of {{ rows|length }} selected add-on(s) will be affected.
+    {% if affected_public %}<strong>{{ affected_public }} published add-on(s) are included — their public downloads will be affected.</strong>{% endif %}</p>
+
+  <div class="sev {{ 'warning' if action == 'delete' else 'info' }}">
+    {% if action == 'delete' %}
+      <strong>Permanently delete.</strong> Each record, its package file and its public download will be removed. This cannot be undone.
+      {% if affected_public %}The public catalog will no longer list the affected add-ons, and their download files are removed.{% endif %}
+    {% elif action == 'unpublish' %}
+      Each selected add-on becomes a draft: it is removed from the public catalog and its public download is withdrawn.
+      The package files are kept; publishing again will restore public access.
+    {% else %}
+      Each selected draft will be validated (the package must still exist and match its stored hash) and published; one catalog update follows. Nothing is published without this confirmation.
+    {% endif %}
+  </div>
+
+  <details open>
+    <summary>Selection ({{ rows|length }})</summary>
+    <div class="small" style="max-height:180px;overflow:auto">
+      <table class="table-sm">
+        {% for r in rows %}
+        <tr><td class="mono">{{ r.addon_id or r.pk }}</td><td>{{ r.title }}</td>
+          <td>{% if r.get('published') %}Published{% else %}Draft{% endif %}</td>
+          <td>{% if r.problem %}<span class="error">{{ r.problem }}</span>{% else %}Will be {{ {'delete': 'deleted', 'unpublish': 'unpublished', 'publish': 'published'}[action] }}{% endif %}</td></tr>
+        {% endfor %}
+      </table>
+    </div>
+  </details>
+
+  <form method="post" action="{{ url_for('collection_batch_execute') }}" data-once style="margin-top:14px">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="action" value="{{ action }}">
+    <input type="hidden" name="submit_key" value="{{ submit_key }}">
+    <input type="hidden" name="q" value="{{ view_qs.q or '' }}">
+    <input type="hidden" name="status" value="{{ view_qs.status or '' }}">
+    <input type="hidden" name="sort" value="{{ view_qs.sort or '' }}">
+    <input type="hidden" name="dir" value="{{ view_qs.dir or '' }}">
+    <input type="hidden" name="page" value="{{ view_qs.page or '' }}">
+    <input type="hidden" name="page_size" value="{{ view_qs.page_size or '' }}">
+    {% for r in rows %}<input type="hidden" name="selected_pk" value="{{ r.pk }}">{% endfor %}
+    <button type="submit" {% if action == 'delete' %}class="danger"{% endif %}>
+      {% if action == 'delete' %}Yes, permanently delete {{ eligible_count }} add-on(s){% elif action == 'unpublish' %}Yes, unpublish {{ eligible_count }} add-on(s){% else %}Yes, publish {{ eligible_count }} add-on(s){% endif %}</button>
+    <a href="{{ url_for('dashboard') }}" style="margin-left:12px">Cancel — leave everything as it is</a>
+  </form>
+  {% endif %}
+</div>
+{% endblock %}
